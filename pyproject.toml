@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videorebuild"
+version = "0.2.0"
+description = "Image-first fragmented MP4 recovery and sample-table-guided media reconstruction"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "VideoRebuild contributors"}]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Video",
+]
+
+[project.scripts]
+videorebuild = "videorebuild.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
