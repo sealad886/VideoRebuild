@@ -120,7 +120,7 @@ def parser() -> argparse.ArgumentParser:
             q.add_argument('--max-groups', type=positive_int, default=200_000, help='Maximum extent targets per deep-search batch')
             q.add_argument('--max-hits', type=positive_int, default=32, help='Maximum byte-distinct locations per extent')
             q.add_argument('--max-assemblies', type=positive_int, default=64, help='Maximum complete extent combinations per recording')
-            q.add_argument('--max-anchor-checks', type=positive_int, default=2_000_000, help='Maximum structural anchor checks per deep-search batch')
+            q.add_argument('--max-anchor-checks', type=positive_int, default=2_000_000, help='Separate limits for NAL-chain checks and structural anchor checks per deep-search batch')
             q.add_argument('--limit', type=positive_int, help='Process this many new/invalidated metadata records; omit to process all')
             q.add_argument('--retry', action='store_true', help='Retry nonmatched results under unchanged search settings')
     return p

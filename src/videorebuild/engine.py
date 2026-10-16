@@ -502,20 +502,32 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     pattern = re.compile(fr'(?=\x00[\x00-\x{high:02x}][\s\S]{{2}})(?!\x00{{4}})'.encode('ascii'))
 
     def totals(sid: int, block_base: int, data: bytes, start: int):
+        nonlocal nal_checks, global_limited, stop_reason
         pos = start
         total = 0
         source_size = pool.sources[sid]['size']
-        for _ in range(64):
-            if pos + 6 > source_size:
+        # Match the ordinary sample validator's NAL-count ceiling. A smaller
+        # search-only ceiling silently loses otherwise eligible access units.
+        for _ in range(65536):
+            if nal_checks >= opt.max_anchor_checks:
+                global_limited = True
+                stop_reason = 'nal_check_budget'
+                return
+            nal_checks += 1
+            if pos + 5 > source_size:
                 return
             local = pos - block_base
-            head = data[local:local+6] if 0 <= local and local+6 <= len(data) else pool.read(sid, pos, 6)
+            head_size = min(6, source_size-pos)
+            head = (data[local:local+head_size]
+                    if 0 <= local and local+head_size <= len(data)
+                    else pool.read(sid, pos, head_size))
             n = int.from_bytes(head[:4], 'big')
             if n < 1 or total+4+n > maximum_sample or pos+4+n > source_size:
                 return
-            first, second = head[4], head[5]
+            first = head[4]
             avc = not (first & 128) and 1 <= (first & 31) <= 23
-            hevc = n >= 2 and not (first & 128) and ((first >> 1) & 63) <= 40 and (second & 7)
+            hevc = (n >= 2 and len(head) >= 6 and not (first & 128) and
+                    ((first >> 1) & 63) <= 40 and (head[5] & 7))
             if not (avc or hevc):
                 return
             total += n+4
@@ -526,7 +538,9 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     visited = set()
     capped = set()
     checks = 0
+    nal_checks = 0
     global_limited = False
+    stop_reason = None
     last_log = time.monotonic()
     LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchors), len(pool.sources))
     for sid, source in pool.sources.items():
@@ -550,6 +564,7 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                         checks += 1
                         if checks > opt.max_anchor_checks:
                             global_limited = True
+                            stop_reason = 'anchor_check_budget'
                             break
                         mapping = group.mapping(sid, start)
                         if not check_samples(group.movie, mapping, pool, quick=True, chunks=group.chunks):
@@ -585,6 +600,7 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         limited = global_limited or any(g.key in capped for g in gs)
         details = {'extents': len(gs), 'located_extents': sum(n > 0 for n in counts),
                    'hit_counts': counts, 'anchor_checks': checks,
+                   'nal_checks': nal_checks, 'stop_reason': stop_reason,
                    'model': 'Each video chunk plus adjacent audio remains contiguous; no within-extent sector permutation.'}
         if any(n == 0 for n in counts):
             finish(case, movie, [], limited, 'scattered_extents', run_key, details)

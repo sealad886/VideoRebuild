@@ -11,6 +11,59 @@ from videorebuild.storage import ReaderPool
 
 
 class DeepSearchPerformanceTests(unittest.TestCase):
+    def assert_sample_located(self, data):
+        # Synthetic NAL framing proves search completeness, not codec decoding.
+        from videorebuild.bmff import Chunk, valid_sample
+        self.assertTrue(valid_sample(data, b'avc1', 4))
+        movie = SimpleNamespace(digest='synthetic',
+                                tracks=[SimpleNamespace(handler=b'vide', codec=b'avc1', nal_length=4)],
+                                chunks=[Chunk(0, 0, 0, (len(data),), 0)])
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'image.bin'
+            source.write_bytes(data)
+            stat = source.stat()
+            sources = {1: dict(path=str(source), size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+                               dev=stat.st_dev, ino=stat.st_ino)}
+            with ReaderPool(sources) as pool, \
+                    patch.object(engine, 'attempt', return_value={'status': 'rejected'}) as attempt, \
+                    patch.object(engine, 'finish'):
+                engine.deep_search(SimpleNamespace(), [movie], pool, {}, engine.Options(), 'synthetic')
+            self.assertEqual(attempt.call_count, 1)
+            self.assertEqual(attempt.call_args.args[2], {(0, 0): (1, 0)})
+
+    def test_multi_nal_sample_above_sixty_four_nals_is_located(self):
+        self.assert_sample_located(bytes.fromhex('0000000209f0')*64 +
+                                   bytes.fromhex('000000026588'))
+
+    def test_one_byte_avc_nal_at_source_end_is_located(self):
+        self.assert_sample_located(bytes.fromhex('0000000209f00000000165'))
+
+    def test_dense_nal_chain_stops_at_budget_with_search_limited(self):
+        from unittest.mock import Mock
+        from videorebuild.bmff import Chunk
+        data = bytes.fromhex('0000000209f0')*64 + bytes.fromhex('000000026588')
+        movie = SimpleNamespace(digest='synthetic',
+                                tracks=[SimpleNamespace(handler=b'vide', codec=b'avc1', nal_length=4)],
+                                chunks=[Chunk(0, 0, 0, (len(data),), 0)])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'reconstructed').mkdir()
+            source = root/'image.bin'
+            source.write_bytes(data)
+            stat = source.stat()
+            sources = {1: dict(path=str(source), size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+                               dev=stat.st_dev, ino=stat.st_ino)}
+            case = SimpleNamespace(root=root, result=Mock())
+            with ReaderPool(sources) as pool, patch.object(engine, 'attempt') as attempt:
+                engine.deep_search(case, [movie], pool, {},
+                                   engine.Options(max_anchor_checks=3), 'synthetic')
+            attempt.assert_not_called()
+            self.assertEqual(case.result.call_args.args[1], 'search_limited')
+            detail = case.result.call_args.args[2]
+            self.assertEqual(detail['nal_checks'], 3)
+            self.assertEqual(detail['anchor_checks'], 0)
+            self.assertEqual(detail['stop_reason'], 'nal_check_budget')
+
     def test_zero_filled_gap_does_not_generate_nal_candidates(self):
         movie = SimpleNamespace(digest='synthetic')
         group = SimpleNamespace(key=('synthetic', 0), anchors=lambda: [(1024, 0)])
