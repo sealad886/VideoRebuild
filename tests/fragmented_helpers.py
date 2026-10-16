@@ -29,14 +29,16 @@ def single_fragment(seq, track, sample, payload, tfdt=None):
     return m+make_box(b'mdat',payload)
 
 
-def generate(path: Path, codec='hevc'):
+def generate(path: Path, codec='hevc', *, bframes=0, negative_cts=False, seconds=1):
     args=['ffmpeg','-hide_banner','-v','error','-nostdin','-y',
-          '-f','lavfi','-i','testsrc2=size=128x96:rate=10:duration=1',
-          '-f','lavfi','-i','sine=frequency=440:sample_rate=8000:duration=1',
-          '-c:v','libx265' if codec=='hevc' else 'libx264','-threads','1','-bf','0','-g','10']
-    if codec=='hevc': args+=['-x265-params','pools=none:frame-threads=1:bframes=0:keyint=10:log-level=error','-tag:v','hvc1']
+          '-f','lavfi','-i',f'testsrc2=size=128x96:rate=10:duration={seconds}',
+          '-f','lavfi','-i',f'sine=frequency=440:sample_rate=8000:duration={seconds}',
+          '-c:v','libx265' if codec=='hevc' else 'libx264','-threads','1','-bf',str(bframes),'-g','10']
+    if codec=='hevc': args+=['-x265-params',f'pools=none:frame-threads=1:bframes={bframes}:keyint=10:log-level=error','-tag:v','hvc1']
+    movflags='empty_moov+default_base_moof+frag_keyframe'
+    if negative_cts: movflags+='+negative_cts_offsets'
     args+=['-c:a','aac','-b:a','24k','-video_track_timescale','90000',
-           '-movflags','empty_moov+default_base_moof+frag_keyframe',str(path)]
+           '-movflags',movflags,str(path)]
     subprocess.run(args,check=True,timeout=45,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     data=path.read_bytes(); init_size=box_at(data,box_at(data,0).end).end
     p=walk_prefix(data,init_size)

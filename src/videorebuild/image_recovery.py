@@ -11,6 +11,7 @@ import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict
+from fractions import Fraction
 import fcntl
 import hashlib
 import html
@@ -202,17 +203,24 @@ def _safe_subdir(root: Path, name: str) -> Path:
 
 
 def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: float) -> dict:
-    """Independent packet-byte hashes, packet/frame counts, and strict decoding."""
+    """Independent packet hashes/timing, packet/frame counts, and strict decoding."""
     base = ['-v', 'error', '-threads', '1', '-f', 'mov', '-protocol_whitelist', 'file', '-enable_drefs', '0']
     expected = defaultdict(list)
+    samples = defaultdict(list)
+    clocks = dict(prefix.starts)
+    shifts = defaultdict(int)
     view = memoryview(data)
     for f in prefix.fragments:
         for s in f.samples:
             expected[s.track_id].append(hashlib.sha256(view[s.offset:s.offset+s.size]).hexdigest())
+            samples[s.track_id].append(s)
+            # MOV demuxing normalizes negative composition offsets by adding
+            # the largest negative offset's magnitude to every PTS in a track.
+            shifts[s.track_id] = max(shifts[s.track_id], -s.composition_offset)
     probe = run_tool([tools['ffprobe']['path'], *base, '-count_frames', '-count_packets',
                       '-show_streams', '-show_packets', '-show_data_hash', 'sha256',
-                      '-show_entries', 'stream=index,id,codec_name,nb_read_frames,nb_read_packets:packet=stream_index,data_hash',
-                      '-of', 'json', str(candidate)], timeout, output_limit=32*1024*1024)
+                      '-show_entries', 'stream=index,id,codec_name,time_base,nb_read_frames,nb_read_packets:packet=stream_index,data_hash,dts,pts,duration',
+                      '-of', 'json', str(candidate)], timeout, output_limit=64*1024*1024)
     detail = {'ok': False, 'probe': probe, 'expected_packets': {str(k):len(v) for k,v in expected.items()}}
     if any((probe['returncode'], probe['timeout'], probe['stderr'].strip(), probe['stdout_truncated'])):
         detail['reason'] = 'probe_or_decode_failed'
@@ -222,6 +230,7 @@ def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: 
         streams = obj['streams']
         if len(streams) != len(prefix.initialization.tracks): raise ValueError('track_count_mismatch')
         indices = {}
+        scales = {}
         for s in streams:
             tid = int(str(s['id']), 0)
             if tid not in expected or tid in indices.values(): raise ValueError('track_id_mismatch')
@@ -231,15 +240,27 @@ def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: 
             if int(s['nb_read_packets']) != len(expected[tid]) or int(s['nb_read_frames']) != len(expected[tid]):
                 raise ValueError('packet_or_decoded_frame_count_mismatch')
             indices[s['index']] = tid
+            scales[tid] = Fraction(s['time_base']) * t.timescale
         actual = defaultdict(list)
         for packet in obj.get('packets', []):
-            actual[indices[packet['stream_index']]].append(packet['data_hash'].split(':',1)[1].lower())
+            tid = indices[packet['stream_index']]
+            index = len(actual[tid])
+            if index >= len(samples[tid]): raise ValueError('packet_or_decoded_frame_count_mismatch')
+            sample = samples[tid][index]
+            dts = clocks[tid]
+            wanted = (dts, dts+sample.composition_offset+shifts[tid], sample.duration)
+            if tuple(int(packet[k])*scales[tid] for k in ('dts', 'pts', 'duration')) != wanted:
+                raise ValueError('packet_timing_mismatch')
+            clocks[tid] += sample.duration
+            actual[tid].append(packet['data_hash'].split(':',1)[1].lower())
         if dict(actual) != dict(expected): raise ValueError('encoded_packet_hash_mismatch')
-    except (ValueError, KeyError, TypeError) as e:
+    except (ValueError, KeyError, TypeError, ZeroDivisionError) as e:
         detail['reason'] = str(e)
         return detail
     # The hashes above are now summarized; don't duplicate huge JSON in a report.
-    detail['probe']['stdout'] = json.dumps({'streams': streams, 'packet_sha256_comparison': 'exact_match'})
+    detail['probe']['stdout'] = json.dumps({'streams': streams, 'packet_sha256_comparison': 'exact_match',
+                                          'packet_timing_comparison': 'exact_match',
+                                          'pts_normalization_ticks': dict(shifts)})
     decode = run_tool([tools['ffmpeg']['path'], '-hide_banner', '-nostdin', '-xerror',
                        *base, '-err_detect', 'explode', '-i', str(candidate),
                        '-map', '0:v', '-map', '0:a?', '-threads', '1', '-filter_threads', '1',

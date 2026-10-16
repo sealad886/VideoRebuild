@@ -1,4 +1,5 @@
 from collections import Counter
+from dataclasses import replace
 import contextlib
 import io
 import json
@@ -108,6 +109,47 @@ class FragmentedTests(unittest.TestCase):
     def test_explicit_tfdt_decode_and_encoded_hashes(self):
         f=self.root/'clip.mp4'; f.write_bytes(self.timed); p=walk_prefix(self.timed,self.init_size)
         self.assertTrue(validate_prefix(f,self.timed,p,self.tools,30)['ok'])
+    def test_validator_rejects_incorrect_parsed_timing(self):
+        # Bytes still decode and hash identically; timing is an independent gate.
+        f=self.root/'clip.mp4'; f.write_bytes(self.data)
+        for field in ('duration','composition_offset'):
+            with self.subTest(field=field):
+                p=walk_prefix(self.data,self.init_size)
+                fragment=p.fragments[0]; sample=fragment.samples[0]
+                wrong=replace(sample,**{field:getattr(sample,field)+1})
+                p.fragments[0]=replace(fragment,samples=(wrong,)+fragment.samples[1:])
+                checked=validate_prefix(f,self.data,p,self.tools,30)
+                self.assertFalse(checked['ok'],checked)
+                self.assertEqual(checked['reason'],'packet_timing_mismatch')
+        p=walk_prefix(self.data,self.init_size); p.starts[1]+=1
+        self.assertEqual(validate_prefix(f,self.data,p,self.tools,30)['reason'],'packet_timing_mismatch')
+
+    def test_bframe_timing_with_signed_and_unsigned_composition_offsets(self):
+        for codec in ('avc','hevc'):
+            for negative in (False,True):
+                with self.subTest(codec=codec,negative=negative):
+                    f=self.root/f'{codec}-{negative}.mp4'
+                    data,p=generate(f,codec,bframes=2,negative_cts=negative,seconds=3)
+                    self.assertGreaterEqual(len(p.fragments),3)
+                    offsets=[s.composition_offset for frag in p.fragments for s in frag.samples if s.track_id==1]
+                    self.assertGreater(max(offsets),0)
+                    if negative: self.assertLess(min(offsets),0)
+                    checked=validate_prefix(f,data,p,self.tools,30)
+                    self.assertTrue(checked['ok'],checked)
+
+    def test_nonzero_per_track_tfdt_preserves_packet_timing(self):
+        data=bytearray(self.timed)
+        # Offset each track independently while preserving all durations.
+        starts={1:90000,2:16000}
+        for fragment in walk_prefix(self.timed,self.init_size).fragments:
+            at=data.index(b'tfdt',fragment.start,fragment.end)+8
+            tid=fragment.samples[0].track_id
+            struct.pack_into('>Q',data,at,fragment.decode_times[tid]+starts[tid])
+        p=walk_prefix(data,self.init_size)
+        self.assertEqual(p.starts,starts)
+        f=self.root/'nonzero.mp4'; f.write_bytes(data)
+        checked=validate_prefix(f,data,p,self.tools,30)
+        self.assertTrue(checked['ok'],checked)
     def test_avc_decode(self):
         f=self.root/'clip.mp4'; f.write_bytes(self.avc); p=walk_prefix(self.avc,self.avc_init)
         self.assertTrue(validate_prefix(f,self.avc,p,self.tools,30)['ok'])
