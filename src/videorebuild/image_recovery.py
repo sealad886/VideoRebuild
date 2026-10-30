@@ -1,62 +1,30 @@
-"""Read-only, report-anchored fMP4 recovery from a regular raw image.
+"""Fragmented-MP4 recovery through the canonical case and logical byte reader.
 
-Recovered header hashes are configuration identities, NOT recording identities.
-The database therefore keys jobs by source offset, even when every header is
-identical. A job follows adjacent, structurally verified fragments only. It stops
-at discontinuities and never pairs files by their names or global sequence IDs.
+Each initialization location is a separate job. Later sections remain separate
+clips with explicit timing and provenance; no unavailable media is inferred.
 """
 from __future__ import annotations
 
-import argparse
-from collections import Counter, defaultdict
-from contextlib import contextmanager
+from collections import defaultdict
 from dataclasses import asdict
 from fractions import Fraction
-import fcntl
 import hashlib
-import html
 import json
 import logging
-import math
 import os
-from pathlib import Path, PurePosixPath
-import re
-import sqlite3
+from pathlib import Path
+import shutil
 import stat
 import struct
-import sys
-import time
 import uuid
-import xml.etree.ElementTree as ET
 
 from . import __version__
 from .bmff import FormatError
-from .fragmented import MAX_INIT, walk_prefix
+from .fragmented import MAX_INIT, MAX_MOOF, parse_fragment, parse_initialization, walk_prefix
 from .storage import SafetyError, file_sha256, write_json
-from .validate import doctor, run_tool
+from .validate import run_tool
 
 LOG = logging.getLogger(__name__)
-
-
-def positive(value: str) -> int:
-    n = int(value)
-    if n <= 0: raise argparse.ArgumentTypeError('must be positive')
-    return n
-
-
-def add_parser(subs) -> None:
-    q = subs.add_parser('recover-fragmented', help='Recover fMP4 prefixes from original-image bytes using PhotoRec report anchors')
-    q.add_argument('--image', type=Path, required=True, help='Regular raw image used for the PhotoRec report; never a device node')
-    q.add_argument('--root', type=Path, required=True, help='Parent of recup_dir.* folders with the original recovered files')
-    q.add_argument('--report', type=Path, help='PhotoRec XML (default: ROOT/recup_dir.1/report.xml)')
-    q.add_argument('--case', type=Path, required=True, help='New case folder outside the recovery root; same case resumes completed jobs')
-    group = q.add_mutually_exclusive_group()
-    group.add_argument('--limit', type=positive, default=50, help='Maximum new header locations to process (default: 50)')
-    group.add_argument('--all', action='store_true', help='Process all remaining header locations')
-    q.add_argument('--max-record-bytes', type=positive, default=16*1024*1024, help='Per-header source-window limit, default 16777216')
-    q.add_argument('--timeout', type=float, default=120, help='Seconds per FFmpeg/ffprobe process; default 120')
-    q.add_argument('--diagnostic-windows', type=int, default=4, help='Retain up to this many blocked source windows, 0 disables (default: 4)')
-    q.add_argument('--diagnostic-window-bytes', type=positive, default=1024*1024, help='Maximum bytes per blocked source window (default: 1048576)')
 
 
 def signature(p: Path) -> dict:
@@ -92,100 +60,6 @@ def descendants(e, name):
 def text(e, name):
     found = descendants(e, name)
     return found[0].text if found else None
-
-
-def import_report(db: sqlite3.Connection, report: Path) -> dict:
-    """Stream XML once; retain only small MP4 anchors, not 346k full elements."""
-    seen = selected = 0
-    info = None
-    stack = []
-    db.execute('BEGIN')
-    try:
-        db.execute('DELETE FROM anchors')
-        with report.open('rb') as f:
-            for event, e in ET.iterparse(XMLReader(f), events=('start', 'end')):
-                if event == 'start':
-                    stack.append(e)
-                    if len(stack) > 64: raise SafetyError('XML nesting limit exceeded')
-                    continue
-                typ = local(e.tag)
-                if typ == 'source':
-                    info = {'reported_image_path': text(e, 'image_filename'),
-                            'image_size': int(text(e, 'image_size') or -1),
-                            'sector_size': int(text(e, 'sectorsize') or -1),
-                            'block_size': int(text(e, 'block_size') or -1)}
-                    if info['image_size'] <= 0 or info['sector_size'] <= 0:
-                        raise SafetyError('Missing source geometry in PhotoRec XML')
-                elif typ == 'fileobject':
-                    seen += 1
-                    name = text(e, 'filename') or ''
-                    size = int(text(e, 'filesize') or -1)
-                    parts = PurePosixPath(name).parts
-                    if name.lower().endswith('.mp4') and 16 <= size <= MAX_INIT:
-                        # PhotoRec writes bare names for files beside report.xml,
-                        # then qualified paths after moving to later recup dirs.
-                        # Derive only the report's explicit directory; never
-                        # search other folders or infer a location from a name.
-                        if len(parts) == 1:
-                            parts = (report.parent.name, parts[0])
-                        if len(parts) < 2 or not re.fullmatch(r'recup_dir\.\d+', parts[-2]):
-                            raise SafetyError(f'Cannot safely map report filename: {name}')
-                        if not re.fullmatch(r'[A-Za-z0-9_.-]+\.mp4', parts[-1], re.I):
-                            raise SafetyError(f'Unsupported report basename: {name}')
-                        runs = []
-                        for r in descendants(e, 'byte_run'):
-                            a = r.attrib
-                            runs.append({'offset': int(a.get('offset', a.get('file_offset', -1))),
-                                         'img_offset': int(a.get('img_offset', -1)), 'len': int(a.get('len', -1))})
-                        runs.sort(key=lambda r: r['offset'])
-                        covered = 0
-                        for r in runs:
-                            if r['offset'] != covered or r['img_offset'] < 0 or r['len'] <= 0:
-                                raise SafetyError(f'Invalid byte-run mapping for {name}')
-                            covered += r['len']
-                        if not runs or covered < size or len(runs) > 64:
-                            raise SafetyError(f'Incomplete/excessive byte-run mapping for {name}')
-                        rel = '/'.join(parts[-2:])
-                        db.execute('INSERT INTO anchors(offset,path,size,runs) VALUES(?,?,?,?)',
-                                   (runs[0]['img_offset'], rel, size, json.dumps(runs)))
-                        selected += 1
-                    if seen % 50000 == 0: LOG.info('Imported %d XML records; %d header candidates', seen, selected)
-                # Keep each source/fileobject intact until its end, then detach it.
-                if typ in ('fileobject', 'source', 'creator', 'metadata'):
-                    if len(stack) >= 2: stack[-2].remove(e)
-                    e.clear()
-                stack.pop()
-        if info is None: raise SafetyError('PhotoRec XML has no source description')
-        info.update(fileobjects_seen=seen, header_locations=selected)
-        if not selected: raise SafetyError('No small MP4 header locations in the report')
-        db.execute('INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)', ('report_info', json.dumps(info)))
-        db.commit()
-        return info
-    except BaseException:
-        db.rollback()
-        raise
-
-
-@contextmanager
-def locked_case(root: Path):
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lp = root/'.fragmented.lock'
-    fd = os.open(lp, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-    try:
-        if os.fstat(fd).st_nlink != 1: raise SafetyError('Case lock has multiple hard links')
-        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as e: raise SafetyError('Another process is using this fragmented case') from e
-        yield
-    finally:
-        os.close(fd)
-
-
-def _safe_subdir(root: Path, name: str) -> Path:
-    d = root/name
-    if d.is_symlink(): raise SafetyError(f'Case directory is a symlink: {d}')
-    d.mkdir(exist_ok=True)
-    if not d.is_dir(): raise SafetyError(f'Not a directory: {d}')
-    return d
 
 
 def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: float) -> dict:
@@ -257,238 +131,307 @@ def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: 
     return detail
 
 
-def export_report(db, root: Path, binding: dict, info: dict) -> dict:
-    counts = dict(db.execute('SELECT status,COUNT(*) FROM results GROUP BY status').fetchall())
-    total = db.execute('SELECT COUNT(*) FROM anchors').fetchone()[0]
-    done = sum(counts.values())
-    reasons = dict(db.execute('SELECT reason,COUNT(*) FROM results GROUP BY reason ORDER BY COUNT(*) DESC LIMIT 30').fetchall())
-    summary = {'tool': 'VideoRebuild', 'version': __version__, 'backend': 'report_anchored_fragmented_mp4',
-               'header_locations': total, 'processed': done, 'pending': total-done,
-               'status_counts': counts, 'stop_reasons': reasons,
-               'source_image_bytes': info['image_size'], 'sector_size': info['sector_size'],
-               'block_size': info['block_size'], 'run_tools': binding['tools'],
-               'warnings': ['Outputs are decode-checked contiguous prefixes, not assertions of complete historical recordings.',
-                            'No arbitrary filesystem-fragment reordering or cross-recording joining is performed.',
-                            'Repeated initialization hashes and fragment sequence IDs do not establish recording identity.',
-                            'Absent tfdt is supported only by per-track duration accumulation along an uninterrupted sequence.',
-                            'Source identity uses stored file attributes, sampled image bytes, and exact recovered-header comparisons; not a full-image forensic hash.',
-                            'Blocked source windows may contain private video/audio. Review before sharing.']}
-    reports = root/'reports'
-    write_json(reports/'summary.json', summary)
-    # Stream complete results instead of accumulating hundreds of thousands in RAM.
-    tmp = reports/('results-'+uuid.uuid4().hex+'.jsonl.tmp')
-    with tmp.open('x', encoding='utf-8') as out:
-        for off, status, reason, location in db.execute('SELECT offset,status,reason,detail_path FROM results ORDER BY offset'):
-            out.write(json.dumps({'image_offset': off, 'status': status, 'reason': reason, 'detail_path': location})+'\n')
-    os.replace(tmp, reports/'results.jsonl')
-    rows=[]
-    for off, status, reason, detail in db.execute('SELECT offset,status,reason,detail_path FROM results ORDER BY updated DESC LIMIT 100'):
-        rows.append('<tr><td>'+str(off)+'</td><td>'+html.escape(status)+'</td><td>'+html.escape(reason)+
-                    '</td><td><a href="../'+html.escape(detail,quote=True)+'">details</a></td></tr>')
-    page='''<!doctype html><html lang="en"><meta charset="utf-8"><title>VideoRebuild fragmented recovery</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:40px auto;padding:0 20px;line-height:1.5}td,th{padding:10px;border-bottom:1px solid #ccc;text-align:left}pre{white-space:pre-wrap}table{width:100%}</style>
-<h1>Fragmented MP4 recovery</h1><p><strong>Decoded prefix does not mean complete original recording.</strong> Output names identify original-image byte offsets, not dates.</p><pre>'''+html.escape(json.dumps(summary,indent=2))+'''</pre><h2>Latest 100 results</h2><table><tr><th>Image byte offset</th><th>Status</th><th>Stop reason</th><th>Evidence</th></tr>'''+''.join(rows)+'''</table><p>Complete index: <a href="results.jsonl">results.jsonl</a>. Playable candidates: ../recovered/.</p></html>'''
-    p=reports/'index.html'
-    if p.is_symlink() or (p.exists() and p.stat().st_nlink != 1): raise SafetyError('Unsafe HTML report path')
-    p.write_text(page,encoding='utf-8')
-    return summary
+def verify_completed(case) -> None:
+    """Verify committed publications and their evidence before doing new work."""
+    for job in case.get_jobs('fragmented'):
+        detail = job['detail']
+        if not detail.get('outputs'):
+            continue
+        historical = bool(detail.get('historical_validation'))
+        evidence_root = case.root / ('attempts' if historical else 'work')
+        output_root = case.root / ('recovered' if historical else 'reconstructed')
+        evidence = case.root / detail.get('detail_path', '')
+        if (evidence.is_symlink() or not evidence.is_file() or
+                not evidence.resolve().is_relative_to(evidence_root) or
+                file_sha256(evidence) != detail.get('evidence_sha256')):
+            raise SafetyError(f'Missing or changed fragmented validation evidence: {evidence}')
+        for item in detail.get('output_evidence', []):
+            output = case.root / item['path']
+            if (output.is_symlink() or not output.is_file() or
+                    not output.resolve().is_relative_to(output_root) or
+                    output.stat().st_size != item['size'] or file_sha256(output) != item['sha256']):
+                raise SafetyError(f'Missing or changed fragmented publication: {output}')
+        if len(detail.get('output_evidence', [])) != len(detail['outputs']):
+            raise SafetyError('Incomplete fragmented publication evidence')
 
 
-def run(args) -> int:
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        raise SafetyError('--timeout must be finite and positive')
-    if not 0 <= args.diagnostic_windows <= 100 or args.diagnostic_window_bytes > 16*1024*1024:
-        raise SafetyError('Diagnostic limits: 0..100 windows; at most 16 MiB each')
-    if not 1024 <= args.max_record_bytes <= 256*1024*1024:
-        raise SafetyError('--max-record-bytes must be between 1024 and 268435456')
-    image, recovered = args.image.expanduser().resolve(), args.root.expanduser().resolve()
-    if args.case.expanduser().is_symlink(): raise SafetyError('Case root must not be a symlink')
-    root = args.case.expanduser().resolve()
-    report = (args.report or recovered/'recup_dir.1/report.xml').expanduser().resolve()
-    if not recovered.is_dir(): raise SafetyError(f'Recovery root does not exist: {recovered}')
-    if root == recovered or root in recovered.parents or recovered in root.parents:
-        raise SafetyError('Case and recovered-source folders must not contain each other')
-    if root == image or root in image.parents or root == report or root in report.parents:
-        raise SafetyError('Case must not contain an input file')
-    img_sig, xml_sig = signature(image), signature(report)
-    if img_sig['size'] == 0: raise SafetyError('Source image is empty')
-    tools = doctor()
-    with image.open('rb') as f:
-        h = hashlib.sha256()
-        for at in sorted({0, max(0,img_sig['size']//2-524288), max(0,img_sig['size']-1048576)}):
-            f.seek(at); h.update(at.to_bytes(8,'big')); h.update(f.read(1048576))
-    binding={'version': __version__, 'image':img_sig, 'image_sample_sha256':h.hexdigest(),
-             'report':xml_sig, 'report_sha256':file_sha256(report), 'root':str(recovered),
-             'max_record_bytes':args.max_record_bytes, 'timeout':args.timeout, 'tools':tools}
-    if signature(image) != img_sig or signature(report) != xml_sig:
-        raise SafetyError('An input changed during preflight')
-    with locked_case(root):
-        metadata = root/'fragmented-case.json'
-        if metadata.is_symlink(): raise SafetyError('Case metadata symlink rejected')
-        if metadata.exists():
-            old=json.loads(metadata.read_text())
-            if old != binding:
-                raise SafetyError('Source identity, tool version, or recovery settings changed. Use a new case; existing results are not silently reused.')
+def _initializations(case, pool):
+    """Stream distinct initialization locations from the shared source catalogue."""
+    has_anchors = case.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='verified_anchors'").fetchone()
+    for sid, source in sorted(pool.sources.items()):
+        constrained = bool(has_anchors and case.db.execute(
+            'SELECT 1 FROM verified_anchors WHERE source_id=? LIMIT 1', (sid,)).fetchone())
+        if constrained:
+            rows = case.db.execute('SELECT offset FROM verified_anchors WHERE source_id=? ORDER BY offset', (sid,))
         else:
-            unknown=[p.name for p in root.iterdir() if p.name!='.fragmented.lock']
-            if unknown: raise SafetyError(f'New fragmented case must be empty; found {unknown[:5]}')
-            write_json(metadata,binding)
-        for name in ('reports','attempts','recovered','blocked-windows'):
-            _safe_subdir(root,name)
-        logpath=root/'fragmented.log'
-        if logpath.is_symlink() or (logpath.exists() and logpath.stat().st_nlink != 1):
-            raise SafetyError('Unsafe log path')
-        handler=logging.FileHandler(logpath,encoding='utf-8')
-        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-        LOG.addHandler(handler)
-        dbpath=root/'fragmented.sqlite3'
-        if dbpath.is_symlink() or (dbpath.exists() and dbpath.stat().st_nlink != 1):
-            raise SafetyError('Unsafe database path')
-        db=sqlite3.connect(dbpath)
-        info=None
-        verified_outputs=False
-        exported=False
-        try:
-            db.executescript('''CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS anchors(offset INTEGER PRIMARY KEY,path TEXT NOT NULL,size INTEGER NOT NULL,runs TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS results(offset INTEGER PRIMARY KEY,status TEXT NOT NULL,reason TEXT NOT NULL,detail_path TEXT NOT NULL,updated REAL NOT NULL);''')
-            r=db.execute("SELECT value FROM metadata WHERE key='report_info'").fetchone()
-            info=json.loads(r[0]) if r else import_report(db,report)
-            if info['image_size'] != img_sig['size']:
-                raise SafetyError(f'Image size {img_sig["size"]} does not match report {info["image_size"]}; offset rebasing is not guessed')
-            if db.execute('SELECT MAX(offset+size) FROM anchors').fetchone()[0] > img_sig['size']:
-                raise SafetyError('Report anchor lies beyond image end')
-            if signature(report)!=xml_sig: raise SafetyError('Report changed during import')
-            # A committed success is reusable only while its published bytes
-            # still match the validation evidence. Check before processing any
-            # new locations; preserve conflicting output for investigation.
-            for offset, detail_path in db.execute("SELECT offset,detail_path FROM results WHERE status='decoded_prefix'"):
-                evidence=root/detail_path
-                if (evidence.is_symlink() or not evidence.is_file() or
-                        not evidence.resolve().is_relative_to(root/'attempts')):
-                    raise SafetyError(f'Missing or unsafe completed-prefix evidence at offset {offset}')
-                saved=json.loads(evidence.read_text(encoding='utf-8'))
-                if not isinstance(saved,dict):
-                    raise SafetyError(f'Invalid completed-prefix evidence at offset {offset}')
-                expected_size=saved.get('output_bytes')
-                expected_hash=saved.get('candidate_sha256')
-                if (not isinstance(expected_size,int) or expected_size<=0 or
-                        not isinstance(expected_hash,str) or not re.fullmatch(r'[0-9a-f]{64}',expected_hash)):
-                    raise SafetyError(f'Incomplete completed-prefix evidence at offset {offset}')
-                output=root/'recovered'/f'offset-{offset:014d}-prefix.mp4'
-                if (output.is_symlink() or not output.is_file() or
-                        output.stat().st_size!=expected_size or file_sha256(output)!=expected_hash):
-                    raise SafetyError(f'Missing or changed completed prefix: {output}')
-            verified_outputs=True
-            remaining = None if args.all else args.limit
-            done_now=0
-            windows=len(list((root/'blocked-windows').glob('*.bin')))
-            sql='''SELECT a.offset,a.path,a.size,a.runs,
- (SELECT MIN(b.offset) FROM anchors b WHERE b.offset>a.offset) AS following
- FROM anchors a LEFT JOIN results r ON a.offset=r.offset WHERE a.offset>? AND r.offset IS NULL ORDER BY a.offset'''
-            last_offset = -1
-            with image.open('rb') as source:
-                while remaining is None or done_now<remaining:
-                    row=db.execute(sql+' LIMIT 1',(last_offset,)).fetchone()
-                    if row is None: break
-                    offset,rel,size,runs_json,following=row
-                    last_offset=offset
-                    if signature(image)!=img_sig: raise SafetyError('Source image changed during recovery; stopping')
-                    recovered_file=recovered/rel
-                    if recovered_file.is_symlink() or not recovered_file.is_file() or recovered_file.resolve().parent != (recovered/Path(rel).parent).resolve():
-                        raise SafetyError(f'Missing or unsafe recovered header: {recovered_file}')
-                    if recovered_file.resolve().is_relative_to(recovered) is False:
-                        raise SafetyError('Recovered file escapes source root')
-                    hs=signature(recovered_file)
-                    if hs['size'] != size: raise SafetyError(f'Recovered header size changed: {rel}')
-                    header=recovered_file.read_bytes()
-                    if signature(recovered_file)!=hs: raise SafetyError(f'Recovered header changed during read: {rel}')
-                    runs=json.loads(runs_json)
-                    # Verify XML mapping without replacing any missing image bytes.
-                    mapped=bytearray()
-                    for r in runs:
-                        n=min(r['len'],size-r['offset'])
-                        if n<=0: break
-                        source.seek(r['img_offset']); part=source.read(n)
-                        if len(part)!=n: raise SafetyError('Short image read during anchor verification')
-                        mapped.extend(part)
-                    if bytes(mapped)!=header:
-                        raise SafetyError(f'Image does not reproduce the recovered header at offset {offset}; wrong image or changed data')
-                    distance=(following-offset) if following is not None else img_sig['size']-offset
-                    window_size=min(distance,args.max_record_bytes,img_sig['size']-offset)
-                    source.seek(offset); data=source.read(window_size)
-                    if len(data)!=window_size: raise SafetyError('Short image read; not treated as zero data')
-                    attempt=root/'attempts'/f'{offset:014d}-{uuid.uuid4().hex[:8]}'
-                    attempt.mkdir()
-                    detail={'image_offset':offset,'recovered_header':rel,'initialization_sha256':hashlib.sha256(header).hexdigest(),
-                            'source_window_bytes':len(data),'source_window_sha256':hashlib.sha256(data).hexdigest(),
-                            'next_header_image_offset':following,'report_byte_runs':runs,'outputs':[]}
-                    status='blocked'; reason='not_attempted'
-                    try:
-                        if data[:size]!=header:
-                            raise FormatError('initialization_not_physically_contiguous; filesystem_reassembly_required')
-                        prefix=walk_prefix(data,size)
-                        reason=prefix.stop_reason
-                        detail.update(stop_reason=reason,stop_image_offset=offset+prefix.stop_offset,
-                                      fragment_count=len(prefix.fragments),sample_counts=prefix.counts,
-                                      tracks={str(k):asdict(v) for k,v in prefix.initialization.tracks.items()},
-                                      durations_seconds={str(k):(v-prefix.starts[k])/prefix.initialization.tracks[k].timescale for k,v in prefix.clocks.items()},
-                                      first_sequence=prefix.fragments[0].sequence if prefix.fragments else None,
-                                      last_sequence=prefix.fragments[-1].sequence if prefix.fragments else None,
-                                      tfdt_present=sum(v is not None for f in prefix.fragments for v in f.decode_times.values()),
-                                      tfdt_absent=sum(v is None for f in prefix.fragments for v in f.decode_times.values()),
-                                      timing_note='Per-track cumulative durations where tfdt is absent; not wall-clock dates.')
-                        eligibility=prefix.eligibility_error()
-                        if eligibility:
-                            detail['eligibility_error']=eligibility
-                        else:
-                            candidate=attempt/'candidate.mp4'
-                            with candidate.open('xb') as f:
-                                f.write(memoryview(data)[:prefix.end]); f.flush(); os.fsync(f.fileno())
-                            detail['candidate_sha256']=file_sha256(candidate)
-                            checked=validate_prefix(candidate,data,prefix,tools,args.timeout)
-                            detail['validation']=checked
-                            if checked['ok']:
-                                output=root/'recovered'/f'offset-{offset:014d}-prefix.mp4'
-                                if output.is_symlink():
-                                    raise SafetyError(f'Output is a symlink: {output}')
-                                if output.exists():
-                                    # Recover the commit-after-publish crash window only when bytes agree.
-                                    if not output.is_file() or file_sha256(output) != detail['candidate_sha256']:
-                                        raise SafetyError(f'Conflicting existing output: {output}')
-                                else:
-                                    # Output is an independent copy of the exact original prefix.
-                                    with output.open('xb') as out:
-                                        out.write(memoryview(data)[:prefix.end]); out.flush(); os.fsync(out.fileno())
-                                status='decoded_prefix'
-                                detail['outputs']=[str(output.relative_to(root))]
-                                detail['output_bytes']=prefix.end
-                                detail['source_range']={'offset':offset,'length':prefix.end}
-                            else:
-                                status='decode_failed'; reason=checked['reason']
-                    except (FormatError, struct.error) as e:
-                        reason=str(e); detail['format_error']=reason
-                    if signature(image)!=img_sig:
-                        raise SafetyError('Source image changed during candidate validation; result not committed')
-                    if status!='decoded_prefix' and windows<args.diagnostic_windows:
-                        count=min(args.diagnostic_window_bytes,img_sig['size']-offset)
-                        source.seek(offset); raw=source.read(count)
-                        if len(raw)!=count: raise SafetyError('Short diagnostic image read')
-                        dest=root/'blocked-windows'/f'offset-{offset:014d}-{uuid.uuid4().hex[:8]}.bin'
-                        with dest.open('xb') as f: f.write(raw)
-                        write_json(dest.with_suffix('.json'),{'image_offset':offset,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),
-                                                           'reason':reason,'privacy':'Raw source bytes may contain private video/audio.'})
-                        detail['diagnostic_window']=str(dest.relative_to(root)); windows+=1
-                    detail['status']=status; detail['reason']=reason
-                    dp=attempt/'result.json'; write_json(dp,detail)
-                    db.execute('INSERT INTO results VALUES(?,?,?,?,?)',(offset,status,reason,str(dp.relative_to(root)),time.time()))
-                    db.commit(); done_now+=1
-                    LOG.info('offset=%d status=%s fragments=%s reason=%s',offset,status,detail.get('fragment_count',0),reason)
-            summary=export_report(db,root,binding,info)
-            exported=True
-            print(json.dumps(summary,indent=2)); print(f'Report: {root / "reports/index.html"}')
-            return 0 if summary['status_counts'].get('decoded_prefix',0) else 3
-        finally:
-            if info is not None and verified_outputs and not exported:
-                export_report(db,root,binding,info)
-            db.close(); LOG.removeHandler(handler); handler.close()
+            rows = case.db.execute("SELECT offset FROM atoms WHERE source_id=? AND kind='ftyp' ORDER BY offset", (sid,))
+        previous = next(rows, None)
+        while previous is not None:
+            current = int(previous[0])
+            following = next(rows, None)
+            boundary = int(following[0]) if following is not None else source['size']
+            previous = following
+            try:
+                head = pool.read(sid, current, min(16, boundary-current))
+                # box_at deliberately checks lengths; use the small header only to
+                # bound the subsequent source read, never to accept a whole box.
+                ftyp_size = int.from_bytes(head[:4], 'big')
+                if ftyp_size == 1:
+                    ftyp_size = int.from_bytes(head[8:16], 'big')
+                if head[4:8] != b'ftyp' or not 8 <= ftyp_size <= 4096:
+                    continue
+                moov_head = pool.read(sid, current+ftyp_size, min(16, boundary-current-ftyp_size))
+                moov_size = int.from_bytes(moov_head[:4], 'big')
+                if moov_size == 1:
+                    moov_size = int.from_bytes(moov_head[8:16], 'big')
+                size = ftyp_size+moov_size
+                if moov_head[4:8] != b'moov' or not ftyp_size+8 <= size <= MAX_INIT or current+size > boundary:
+                    continue
+                data = pool.read(sid, current, size)
+                init = parse_initialization(data)
+            except (FormatError, struct.error):
+                # Ordinary MP4 metadata remains owned by the sample-table strategy.
+                continue
+            if current+size == boundary and source['kind'] != 'image':
+                continue  # A header is evidence for discovery, not a media job.
+            yield sid, source, current, boundary, init
+
+
+def _restart_is_idr(fragment, init) -> bool:
+    first = {}
+    for sample in fragment.samples:
+        first.setdefault(sample.track_id, sample)
+    videos = [track for track in init.tracks.values() if track.handler == 'vide']
+    for track in videos:
+        sample = first.get(track.track_id)
+        idrs = {5} if track.codec in ('avc1', 'avc3') else {19, 20}
+        if sample is None or sample.flags & 0x10000 or not idrs.intersection(sample.nal_types):
+            return False
+    return bool(videos)
+
+
+def _restart_has_timing(prefix) -> bool:
+    first = {}
+    for fragment in prefix.fragments:
+        for tid, base in fragment.decode_times.items():
+            first.setdefault(tid, base)
+    return all(first.get(tid) is not None for tid in prefix.initialization.tracks)
+
+
+def _candidate_starts(case, sid: int, start: int, end: int):
+    yield start
+    for row in case.db.execute("SELECT offset FROM atoms WHERE source_id=? AND kind='moof' AND offset>? AND offset<? ORDER BY offset", (sid, start, end)):
+        yield int(row[0])
+
+
+def check_options(options) -> None:
+    """Validate fragmented recovery policy before any case or output mutation."""
+    if not 1024 <= options.max_record_bytes <= 256*1024*1024:
+        raise SafetyError('--max-record-bytes must be between 1024 and 268435456')
+    if not 1 <= options.max_segments <= 1024:
+        raise SafetyError('--max-segments must be between 1 and 1024')
+
+
+def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool = False) -> int:
+    """Recover bounded fMP4 sections through the canonical read and job owners.
+
+    An initialization's first section retains prefix semantics. Restart sections
+    need independent IDR starts and explicit per-track decode times. They remain
+    separate files and never bridge unavailable bytes or unexplained boundaries.
+    """
+    max_bytes = options.max_record_bytes
+    max_segments = options.max_segments
+    timeout = options.timeout
+    check_options(options)
+    case.bind('fragmented_settings', {'version': __version__, 'max_record_bytes': max_bytes,
+                                    'max_segments': max_segments, 'timeout': timeout, 'tools': tools})
+    verify_completed(case)
+    processed = 0
+    for sid, source, offset, boundary, init in _initializations(case, pool):
+        key = f'{sid}:{offset}'
+        old = case.job('fragmented', key)
+        if old is not None and (not retry or old['detail'].get('outputs')):
+            continue
+        if limit is not None and processed >= limit:
+            break
+        end = min(boundary, offset+max_bytes)
+        init_end = offset+len(init.data)
+        if end <= init_end:
+            case.result(key, 'search_limited', {'source_id': sid, 'logical_offset': offset,
+                        'reason': 'record_window_excludes_media', 'outputs': []}, kind='fragmented')
+            processed += 1
+            continue
+        pool.check(sid)
+        attempt = case.root / 'work' / ('fragment-'+uuid.uuid4().hex)
+        attempt.mkdir()
+        association = ('raw_image_candidate' if source['kind'] == 'image' else
+                       'filesystem_metadata' if source['kind'] == 'logical' else 'recovered_file')
+        detail = {'source_id': sid, 'logical_offset': offset, 'initialization_sha256': init.sha256,
+                  'association': association, 'window_end': end, 'next_initialization': boundary,
+                  'tracks': {str(k): asdict(v) for k, v in init.tracks.items()},
+                  'outputs': [], 'output_evidence': [], 'segments': [], 'gaps': [],
+                  'timing_note': 'Decode times are media ticks, not wall-clock dates.'}
+        read_budget = 2*(end-offset)
+        read_bytes = 0
+
+        class ReadBudgetExceeded(Exception):
+            pass
+
+        def read_section(at: int, size: int) -> bytes:
+            nonlocal read_bytes
+            if size < 0:
+                raise FormatError('negative_section_read')
+            if read_bytes+size > read_budget:
+                raise ReadBudgetExceeded
+            read_bytes += size
+            return pool.read(sid, at, size)
+
+        # Intervals describe availability, without shifting logical coordinates.
+        intervals = iter(pool.available_ranges(sid, init_end, end))
+        interval = next(intervals, None)
+        consumed = init_end
+        considered = 0
+        for start in _candidate_starts(case, sid, init_end, end):
+            if start < consumed:
+                continue
+            while interval is not None and interval[0]+interval[1] <= start:
+                interval = next(intervals, None)
+            if interval is None:
+                break
+            if start < interval[0]:
+                detail['gaps'].append({'start': start, 'end': interval[0], 'reason': 'unavailable_source_bytes'})
+                continue
+            if considered >= max_segments:
+                detail['limit_reason'] = 'segment_attempt_budget'
+                break
+            # Count malformed and non-IDR starts before any prefilter read.
+            considered += 1
+            pair_data = b''
+            readable_end = min(end, interval[0]+interval[1])
+            later = start != init_end
+            if later:
+                # Reject non-random-access starts using one bounded pair before
+                # parsing an entire section or launching external decoders.
+                try:
+                    header = read_section(start, min(16, readable_end-start))
+                    moof_size = int.from_bytes(header[:4], 'big')
+                    if moof_size == 1:
+                        moof_size = int.from_bytes(header[8:16], 'big')
+                    if header[4:8] != b'moof' or not 8 <= moof_size <= MAX_MOOF:
+                        continue
+                    mdat_head = read_section(start+moof_size, min(16, readable_end-start-moof_size))
+                    mdat_size = int.from_bytes(mdat_head[:4], 'big')
+                    if mdat_size == 1:
+                        mdat_size = int.from_bytes(mdat_head[8:16], 'big')
+                    length = moof_size+mdat_size
+                    if not moof_size+8 <= length <= readable_end-start:
+                        continue
+                    pair_data = read_section(start, length)
+                    first = parse_fragment(pair_data, 0, init)
+                    if not _restart_is_idr(first, init):
+                        continue
+                except ReadBudgetExceeded:
+                    detail['limit_reason'] = 'segment_read_byte_budget'
+                    break
+                except (FormatError, struct.error):
+                    continue
+            try:
+                payload = pair_data+read_section(start+len(pair_data), readable_end-start-len(pair_data))
+            except ReadBudgetExceeded:
+                detail['limit_reason'] = 'segment_read_byte_budget'
+                break
+            data = init.data+payload
+            prefix = walk_prefix(data, len(init.data), allow_later_start=later)
+            if (not later and not prefix.fragments and
+                    prefix.stop_reason.startswith('missing_initial_fragments_sequence_starts_at_')):
+                # A logical file may begin at a surviving later fragment. Keep
+                # the same restart checks and label; never call it a prefix.
+                later = True
+                prefix = walk_prefix(data, len(init.data), allow_later_start=True)
+            segment = {'logical_start': start, 'logical_end': start+prefix.end-len(init.data),
+                       'stop_reason': prefix.stop_reason, 'fragment_count': len(prefix.fragments),
+                       'sample_counts': prefix.counts, 'later_section': later,
+                       'source_ranges': pool.provenance(sid, offset, len(init.data)),
+                       'starts': prefix.starts}
+            error = prefix.eligibility_error()
+            if not error and later and not _restart_has_timing(prefix):
+                error = 'missing_restart_track_timing'
+            if error:
+                segment.update(status='blocked', reason=error)
+                detail['segments'].append(segment)
+                continue
+            retained = data[:prefix.end]
+            source_length = prefix.end-len(init.data)
+            segment['source_ranges'] += pool.provenance(sid, start, source_length)
+            if len(retained) > options.max_output_bytes:
+                segment.update(status='search_limited', reason='output_size_budget')
+                detail['segments'].append(segment)
+                continue
+            if shutil.disk_usage(case.root).free < len(retained)*2+1024*1024:
+                raise SafetyError('Insufficient free space for fragmented candidate and publication')
+            candidate = attempt / f'section-{start}.mp4'
+            with candidate.open('xb') as stream:
+                stream.write(retained)
+                stream.flush()
+                os.fsync(stream.fileno())
+            checked = validate_prefix(candidate, data, prefix, tools, timeout)
+            # Exact packet comparison needs a bounded large probe response, but
+            # failed responses must not accumulate that response per section.
+            for command in ('probe', 'decode'):
+                evidence = checked.get(command, {})
+                for channel in ('stdout', 'stderr'):
+                    value = evidence.get(channel, '')
+                    if len(value) > 65536:
+                        evidence[channel] = value[:65536]
+                        evidence[channel+'_retained_truncated'] = True
+            segment['validation'] = checked
+            if not checked['ok']:
+                segment.update(status='decode_failed', reason=checked['reason'])
+                detail['segments'].append(segment)
+                continue
+            output = case.root / 'reconstructed' / f'fragment-{sid}-{offset}-{start}.mp4'
+            digest = hashlib.sha256(retained).hexdigest()
+            if output.exists() or output.is_symlink():
+                if output.is_symlink() or not output.is_file() or file_sha256(output) != digest:
+                    raise SafetyError(f'Conflicting existing fragmented output: {output}')
+            else:
+                with output.open('xb') as stream:
+                    stream.write(retained)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            relative = str(output.relative_to(case.root))
+            segment.update(status='decoded_segment' if later else 'decoded_prefix',
+                           reason='packet_hashes_timing_and_decode_passed', output=relative,
+                           first_sequence=prefix.fragments[0].sequence,
+                           last_sequence=prefix.fragments[-1].sequence,
+                           durations_seconds={str(tid): (clock-prefix.starts[tid])/init.tracks[tid].timescale
+                                              for tid, clock in prefix.clocks.items()})
+            if start > consumed:
+                detail['gaps'].append({'start': consumed, 'end': start,
+                                       'reason': 'not_exported_between_sections'})
+            detail['outputs'].append(relative)
+            detail['output_evidence'].append({'path': relative, 'size': len(retained), 'sha256': digest})
+            detail['segments'].append(segment)
+            consumed = max(consumed, segment['logical_end'])
+        pool.check(sid)
+        detail['candidate_starts_considered'] = considered
+        detail['media_read_bytes_charged'] = read_bytes
+        detail['media_read_byte_budget'] = read_budget
+        if detail.get('limit_reason'):
+            status = 'search_limited'
+        elif detail['outputs']:
+            status = 'decoded_segments' if any(s['later_section'] and s['status'] == 'decoded_segment' for s in detail['segments']) else 'decoded_prefix'
+        elif any(s['status'] == 'decode_failed' for s in detail['segments']):
+            status = 'decode_failed'
+        else:
+            status = 'blocked'
+        detail['reason'] = detail.get('limit_reason') or (detail['segments'][-1].get('reason', detail['segments'][-1]['stop_reason']) if detail['segments'] else 'no_eligible_rescued_media')
+        detail['status'] = status
+        evidence = attempt / 'result.json'
+        detail['detail_path'] = str(evidence.relative_to(case.root))
+        write_json(evidence, detail)
+        detail['evidence_sha256'] = file_sha256(evidence)
+        case.result(key, status, detail, kind='fragmented')
+        processed += 1
+        LOG.info('Fragmented source=%s offset=%d status=%s outputs=%d', sid, offset, status, len(detail['outputs']))
+    return processed

@@ -1,6 +1,6 @@
-# Legacy sample-table reconstruction models
+# Ordinary sample-table reconstruction models
 
-This page describes `run`/`recover`. Version 0.2.0 separately adds `recover-fragmented`; see [FRAGMENTED.md](FRAGMENTED.md).
+The canonical `run`/`recover` workflow selects ordinary and fragmented strategies under one shared case; see [FRAGMENTED.md](FRAGMENTED.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Ordinary MP4/MOV
 
@@ -12,13 +12,13 @@ The whole-payload model assumes the first referenced sample begins at the candid
 
 ## Scattered extents
 
-Deep recovery does not require surviving `mdat` headers. A complete, contiguous `moov` still must exist somewhere among the indexed sources.
+Deep recovery does not require surviving `mdat` headers. A complete, logically readable `moov` must exist among the indexed sources. An explicit filesystem extent map can span physical discontinuities.
 
 A deep extent is a video chunk plus the subsequent audio chunks before the next video chunk. Any leading audio chunks are assigned to the first video extent. The original relative offsets of chunks within an extent are preserved while matching. Therefore:
 
 - A recording can be assembled from many out-of-order extents, even across many recovered files.
 - Video and associated audio must still be physically contiguous according to this grouping.
-- A filesystem fragment boundary inside the group is not solved.
+- A filesystem fragment boundary inside the group requires an explicit logical extent map; blind matching does not infer it.
 - One long video-only MP4 chunk remains one extent even if it contains many frames. Deep search is not frame-by-frame reconstruction inside that chunk.
 
 Candidate anchors use selected sample sizes and 4-byte NAL prefixes. The search accumulates up to 65,536 NAL units per chain, matching the ordinary sample validator's bound, then validates every video sample against the sample-table boundaries. A terminal one-byte AVC NAL is supported; HEVC requires its two-byte header. Candidate sample anchors are selected from the first eight and last four samples of each video chunk, with sizes from 8 bytes to less than 16 MiB. `--max-anchor-checks` separately bounds both target associations and total NAL-chain checks. Exhaustion stops the scan with `search_limited`; result details distinguish `nal_check_budget` and `anchor_check_budget` and retain both counters. These search limits are part of the documented model, not evidence that other layouts cannot be recovered.
@@ -33,7 +33,7 @@ Byte-identical extent hits are deduplicated to one representative physical locat
 |---|---|
 | No surviving usable `moov` | No reconstruction from media alone; source/atom counts are still reported. |
 | Truncated, split, or compressed metadata | No inferred metadata or guessed sample tables. |
-| Fragmented MP4 (`moof`, `mvex`, `trun`) | Rejected by this legacy backend. Use the separately implemented `recover-fragmented` backend with the source image. |
+| Fragmented MP4 (`moof`, `mvex`, `trun`) | Handled by the fragmented strategy of canonical `run`/`recover`; see FRAGMENTED.md. |
 | Encrypted tracks / CENC auxiliary offsets | Rejected. |
 | External data references | Rejected before FFmpeg. |
 | Unsupported codec or auxiliary track | Whole metadata record rejected, rather than silently dropping the track. |

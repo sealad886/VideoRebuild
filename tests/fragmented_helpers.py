@@ -29,12 +29,15 @@ def single_fragment(seq, track, sample, payload, tfdt=None):
     return m+make_box(b'mdat',payload)
 
 
-def generate(path: Path, codec='hevc', *, bframes=0, negative_cts=False, seconds=1):
+def generate(path: Path, codec='hevc', *, bframes=0, negative_cts=False, seconds=1, closed_gop=False):
     args=['ffmpeg','-hide_banner','-v','error','-nostdin','-y',
           '-f','lavfi','-i',f'testsrc2=size=128x96:rate=10:duration={seconds}',
           '-f','lavfi','-i',f'sine=frequency=440:sample_rate=8000:duration={seconds}',
           '-c:v','libx265' if codec=='hevc' else 'libx264','-threads','1','-bf',str(bframes),'-g','10']
-    if codec=='hevc': args+=['-x265-params',f'pools=none:frame-threads=1:bframes={bframes}:keyint=10:log-level=error','-tag:v','hvc1']
+    if codec=='hevc':
+        parameters=f'pools=none:frame-threads=1:bframes={bframes}:keyint=10:log-level=error'
+        if closed_gop: parameters+=':open-gop=0'
+        args+=['-x265-params',parameters,'-tag:v','hvc1']
     movflags='empty_moov+default_base_moof+frag_keyframe'
     if negative_cts: movflags+='+negative_cts_offsets'
     args+=['-c:a','aac','-b:a','24k','-video_track_timescale','90000',

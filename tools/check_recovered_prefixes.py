@@ -13,68 +13,88 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
-from videorebuild.fragmented import box_at, walk_prefix
+from videorebuild.fragmented import walk_prefix
 from videorebuild.image_recovery import signature, validate_prefix
-from videorebuild.storage import SafetyError, create_private_json, file_sha256
+from videorebuild.storage import Case, ReaderPool, SafetyError, create_private_json, file_sha256
 from videorebuild.validate import doctor
 
 
 def audit(case: Path, image: Path) -> dict:
+    """Sample canonical publications through their original logical source map."""
     started = time.monotonic()
     tools = doctor()
     image_before = signature(image)
-    db = sqlite3.connect((case/'fragmented.sqlite3').resolve().as_uri()+'?mode=ro', uri=True)
+    db = sqlite3.connect((case/'case.sqlite3').resolve().as_uri()+'?mode=ro', uri=True)
+    db.row_factory = sqlite3.Row
     try:
-        counts = dict(db.execute('SELECT status,COUNT(*) FROM results GROUP BY status'))
-        count = counts.get('decoded_prefix', 0)
+        owner = Case(case)
+        owner.db = db  # Read-only catalogue access; do not enter a writer case.
+        physical = owner.physical_sources()
+        if not any(Path(row['path']).resolve() == image.resolve() for row in physical.values()):
+            raise SafetyError('Supplied image is not a source of this case')
+        counts = dict(db.execute("SELECT status,COUNT(*) FROM jobs WHERE kind='fragmented' GROUP BY status"))
+        condition = "kind='fragmented' AND status IN ('decoded_prefix','decoded_segments')"
+        count = db.execute('SELECT COUNT(*) FROM jobs WHERE '+condition).fetchone()[0]
         selected = sorted({i * (count-1)//8 for i in range(9)}) if count else []
-        rows = [db.execute("SELECT offset,detail_path FROM results WHERE status='decoded_prefix' ORDER BY offset LIMIT 1 OFFSET ?", (index,)).fetchone()
-                for index in selected]
+        results = []
+        with ReaderPool(owner.sources(), physical_sources=physical) as pool:
+            for index in selected:
+                row = db.execute('SELECT detail FROM jobs WHERE '+condition+' ORDER BY key LIMIT 1 OFFSET ?', (index,)).fetchone()
+                saved = json.loads(row['detail'])
+                if saved.get('historical_validation'):
+                    continue
+                sid, offset = saved['source_id'], saved['logical_offset']
+                # Sample one section per selected initialization. The report
+                # states this scope; other sections are not silently certified.
+                segment = next(item for item in saved['segments'] if item.get('output'))
+                output_name = segment['output']
+                expected = next(item for item in saved['output_evidence'] if item['path'] == output_name)
+                length = expected['size']
+                if not isinstance(length, int) or not 0 < length <= 256*1024*1024:
+                    raise ValueError('Saved section exceeds audit size budget')
+                ftyp_head = pool.read(sid, offset, 16)
+                ftyp_size = int.from_bytes(ftyp_head[:4], 'big')
+                if ftyp_size == 1:
+                    ftyp_size = int.from_bytes(ftyp_head[8:16], 'big')
+                if ftyp_head[4:8] != b'ftyp' or not 8 <= ftyp_size <= 4096:
+                    raise SafetyError('Invalid initialization in source')
+                moov_head = pool.read(sid, offset+ftyp_size, 16)
+                moov_size = int.from_bytes(moov_head[:4], 'big')
+                if moov_size == 1:
+                    moov_size = int.from_bytes(moov_head[8:16], 'big')
+                init_size = ftyp_size+moov_size
+                if moov_head[4:8] != b'moov' or not ftyp_size+8 <= init_size <= min(length,1024*1024):
+                    raise SafetyError('Invalid bounded initialization size')
+                data = pool.read(sid, offset, init_size)+pool.read(sid, segment['logical_start'],
+                    segment['logical_end']-segment['logical_start'])
+                prefix = walk_prefix(data, init_size, allow_later_start=segment['later_section'])
+                output = case/output_name
+                if not output.resolve().is_relative_to(case.resolve()/'reconstructed') or output.is_symlink():
+                    raise SafetyError('Unsafe publication path in case')
+                result = {'image_offset': offset, 'source_id': sid, 'bytes': length,
+                          'source_sha256': hashlib.sha256(data).hexdigest(), 'saved_sha256': expected['sha256'],
+                          'parsed_end': prefix.end, 'fragment_count': len(prefix.fragments),
+                          'sample_counts': prefix.counts, 'eligibility_error': prefix.eligibility_error()}
+                try:
+                    output_before = signature(output)
+                    checked = validate_prefix(output, data, prefix, tools, 120)
+                    result.update(published_sha256=file_sha256(output), validation_ok=checked['ok'],
+                                  validation_reason=checked['reason'], output_unchanged=signature(output)==output_before)
+                    result['ok'] = (result['source_sha256']==result['published_sha256']==result['saved_sha256']
+                                    and prefix.end==length and result['eligibility_error'] is None
+                                    and checked['ok'] and result['output_unchanged'])
+                except FileNotFoundError:
+                    result.update(published_sha256=None,validation_ok=False,validation_reason='missing_publication',
+                                  output_unchanged=False,ok=False)
+                results.append(result)
     finally:
         db.close()
-    results = []
-    with image.open('rb') as source:
-        for offset, detail_path in rows:
-            saved = json.loads((case/detail_path).read_text())
-            length = saved['output_bytes']
-            if not isinstance(length, int) or not 0 < length <= 256*1024*1024:
-                raise ValueError('Saved prefix length must be between 1 byte and 256 MiB')
-            output = case/'recovered'/f'offset-{offset:014d}-prefix.mp4'
-            source.seek(offset)
-            data = source.read(length)
-            if len(data) != length:
-                raise ValueError('Short source-image read')
-            init_size = box_at(data, box_at(data, 0).end).end
-            prefix = walk_prefix(data, init_size)
-            row = {
-                'image_offset': offset, 'bytes': length,
-                'source_sha256': hashlib.sha256(data).hexdigest(),
-                'saved_sha256': saved['candidate_sha256'],
-                'parsed_end': prefix.end, 'fragment_count': len(prefix.fragments),
-                'sample_counts': prefix.counts, 'eligibility_error': prefix.eligibility_error(),
-            }
-            try:
-                output_before = signature(output)
-                checked = validate_prefix(output, data, prefix, tools, 120)
-                row.update(published_sha256=file_sha256(output), validation_ok=checked['ok'],
-                           validation_reason=checked['reason'],
-                           output_unchanged=signature(output) == output_before)
-                row['ok'] = (row['source_sha256'] == row['published_sha256'] == row['saved_sha256']
-                             and prefix.end == length and row['eligibility_error'] is None
-                             and checked['ok'] and row['output_unchanged'])
-            except FileNotFoundError:
-                # A committed successful prefix may disappear before or during
-                # this audit. That is a failed sample, not a setup failure.
-                row.update(published_sha256=None, validation_ok=False,
-                           validation_reason='missing_publication', output_unchanged=False, ok=False)
-            results.append(row)
-            print(f"{len(results)}/{len(selected)} offset={offset} bytes={length} ok={row['ok']}", flush=True)
     result = {'tools': tools, 'image_signature': image_before, 'case_status_counts': counts,
-              'selection': 'Up to nine evenly spaced successful rows by offset, including first and last',
-              'results': results, 'image_unchanged': signature(image) == image_before,
+              'selection': 'First successful section of up to nine evenly spaced initialization jobs',
+              'results': results, 'image_unchanged': signature(image)==image_before,
               'elapsed_seconds': time.monotonic()-started,
-              'scope': 'Sampled existing publications only; no whole-case or historical-identity claim'}
-    result['ok'] = bool(results) and all(r['ok'] for r in results) and result['image_unchanged']
+              'scope': 'Sampled existing publications only; no whole-case, all-sections or historical-identity claim'}
+    result['ok'] = bool(results) and all(row['ok'] for row in results) and result['image_unchanged']
     return result
 
 

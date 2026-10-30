@@ -25,7 +25,7 @@ from typing import Iterable
 
 from . import __version__
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
-from .storage import Case, ReaderPool, SafetyError, file_sha256, iter_blocks, json_text, write_json
+from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
 from .validate import doctor, validate
 
 LOG = logging.getLogger(__name__)
@@ -68,12 +68,20 @@ def validate_ranges(movie: Movie, mapping: Mapping, pool: ReaderPool) -> None:
     if set(mapping) != expected:
         raise FormatError('incomplete chunk assignment')
     ranges = sorted(source_ranges(movie, mapping))
+    physical = []
     for sid, off, n in ranges:
         if sid not in pool.sources or off < 0 or off+n > pool.sources[sid]['size']:
             raise FormatError('chunk outside source')
+        for extent in pool.provenance(sid,off,n):
+            row = pool.physical[extent['source_id']]
+            physical.append((row['dev'],row['ino'],extent['source_offset'],extent['length']))
     for a, b in zip(ranges, ranges[1:]):
         if a[0] == b[0] and a[1]+a[2] > b[1]:
             raise FormatError('source byte ranges reused or overlapped')
+    physical.sort()
+    for a,b in zip(physical,physical[1:]):
+        if a[:2] == b[:2] and a[2]+a[3] > b[2]:
+            raise FormatError('physical source bytes reused or overlapped')
 
 
 def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool = False,
@@ -191,7 +199,8 @@ def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
                             'source_id': sid, 'source_path': source['path'], 'source_offset': off,
                             'source_sha256_at_scan': source['sha256'], 'size': c.size,
                             'output_offset': new_offsets[(c.track, c.index)],
-                            'sha256': chunk_hash.hexdigest()})
+                            'sha256': chunk_hash.hexdigest(),
+                            'physical_extents':pool.provenance(sid,off,c.size)})
         output.flush()
         os.fsync(output.fileno())
     return {'sha256': h.hexdigest(), 'media_sha256': media_hash.hexdigest(), 'bytes': size,
@@ -206,7 +215,8 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
                            (movie.digest, md)).fetchone()
     if prev:
         old = json.loads(prev['detail'])
-        same_tools = old.get('tools') == tools and old.get('timeout') == opt.timeout
+        same_tools = (not old.get('historical_validation') and old.get('tools') == tools and
+                      old.get('timeout') == opt.timeout)
         if same_tools and old.get('status') == 'valid':
             p = case.root / old['path']
             if not p.is_file() or p.is_symlink() or file_sha256(p) != old['sha256']:
@@ -338,7 +348,7 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
                                  WHERE a.movie_digest=? AND s.complete=1''', (movie.digest,)).fetchall()
     for location in locations:
         sid, moff = location['source_id'], location['offset']
-        if pool.sources[sid]['kind'] == 'file':
+        if pool.sources[sid]['kind'] in ('file','logical'):
             origins.append((sid, 0))
         # The nearest preceding ftyp is a location hypothesis, never proof.
         row = case.db.execute('SELECT offset FROM atoms WHERE source_id=? AND kind="ftyp" AND offset<=? ORDER BY offset DESC LIMIT 1',
@@ -498,9 +508,12 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                 return
             local = pos - block_base
             head_size = min(6, source_size-pos)
-            head = (data[local:local+head_size]
-                    if 0 <= local and local+head_size <= len(data)
-                    else pool.read(sid, pos, head_size))
+            try:
+                head = (data[local:local+head_size]
+                        if 0 <= local and local+head_size <= len(data)
+                        else pool.read(sid, pos, head_size))
+            except FormatError:
+                return
             n = int.from_bytes(head[:4], 'big')
             if n < 1 or total+4+n > maximum_sample or pos+4+n > source_size:
                 return
@@ -525,7 +538,7 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchors), len(pool.sources))
     for sid, source in pool.sources.items():
         pool.check(sid)
-        for base, data, owned in iter_blocks(Path(source['path']), overlap=16):
+        for base, data, owned in pool.iter_blocks(sid,overlap=16):
             for match in pattern.finditer(data):
                 at = match.start()
                 if at >= owned or at+4 > len(data):
@@ -611,16 +624,17 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
     if not sources:
         raise SafetyError('No completed source scans; run scan or run first')
     run_key = hashlib.sha256(json_text({'version': __version__, 'options': asdict(opt), 'tools': tools,
-                         'sources': [(sid, s['sha256'], s['path']) for sid, s in sorted(sources.items())]}).encode()).hexdigest()
+                         'sources': [(sid,s['sha256'],s['path'],s.get('extents'),s.get('binding'))
+                                     for sid,s in sorted(sources.items())]}).encode()).hexdigest()
     case.event('recovery_started', {'run_key': run_key, 'tools': tools, 'options': asdict(opt)})
     deferred = []
     processed = 0
     # Do not load all moov BLOBs into memory. A separate cursor streams them.
     rows = case.db.execute('''SELECT m.*,r.status AS old_status,r.detail AS old_detail FROM movies m
-          LEFT JOIN results r ON r.movie_digest=m.digest
+          LEFT JOIN jobs r ON r.kind='ordinary' AND r.key=m.digest
           WHERE EXISTS(SELECT 1 FROM atoms a JOIN sources s ON a.source_id=s.id
                        WHERE a.movie_digest=m.digest AND s.complete=1) ORDER BY m.digest''')
-    with ReaderPool(sources) as pool:
+    with ReaderPool(sources,physical_sources=case.physical_sources()) as pool:
         for sid in sources:
             pool.check(sid)
         for row in rows:
