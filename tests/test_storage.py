@@ -126,6 +126,24 @@ class StorageTests(unittest.TestCase):
                     create_private_json(target, {'partial': 1})
             self.assertEqual(target.read_bytes(), b'unrelated replacement')
 
+    def test_private_json_close_failure_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'report.json'
+            real_fdopen = os.fdopen
+
+            @contextlib.contextmanager
+            def fail_on_close(fd, *args, **kwargs):
+                with real_fdopen(fd, *args, **kwargs) as stream:
+                    yield stream
+                raise OSError('close failure')
+
+            with patch('videorebuild.storage.os.fdopen', side_effect=fail_on_close):
+                with self.assertRaises(OSError):
+                    create_private_json(target, {'partial': 1})
+            self.assertFalse(target.exists())
+            create_private_json(target, {'complete': True})
+            self.assertEqual(json.loads(target.read_text()), {'complete': True})
+
     def test_new_case_private_existing_case_permissions_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
