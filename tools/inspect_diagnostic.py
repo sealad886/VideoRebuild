@@ -8,6 +8,7 @@ import argparse
 from collections import Counter
 from dataclasses import asdict
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -16,7 +17,8 @@ import zipfile
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from videorebuild.fragmented import parse_initialization, inspect_embedded
-from videorebuild.image_recovery import descendants, text
+from videorebuild.image_recovery import XMLReader, descendants, text
+from videorebuild.storage import SafetyError, create_private_json, file_sha256
 
 
 def inspect(archive: Path) -> dict:
@@ -42,9 +44,7 @@ def inspect(archive: Path) -> dict:
         for n in names:
             if n.startswith('photorec/') and n.endswith('.xml'):
                 raw=z.read(n)
-                if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():
-                    raise ValueError('XML declarations rejected')
-                r=ET.fromstring(raw)
+                r=ET.parse(XMLReader(io.BytesIO(raw))).getroot()
                 for s in descendants(r,'source'):
                     source.append({'image_filename':text(s,'image_filename'),
                                    'image_size':int(text(s,'image_size')),
@@ -69,7 +69,7 @@ def inspect(archive: Path) -> dict:
                 rec['classification']='mdat_box' if data[4:8]==b'mdat' else 'other'
                 rec['embedded_by_initialization']={key:inspect_embedded(data,p) for key,p in profiles.items()}
             inventory.append(rec)
-        return {'archive_sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),
+        return {'archive_sha256':file_sha256(archive),
                 'verified_samples':len(samples),'verified_sample_bytes':sum(len(b) for _,b,_ in samples),
                 'collector_complete':m.get('complete'),'collector_errors':m.get('errors'),
                 'source':source,'initialization_profiles':{
@@ -86,11 +86,10 @@ def main():
     args=p.parse_args()
     try:
         result=inspect(args.archive)
-        with args.output.open('x',encoding='utf-8') as f:
-            json.dump(result,f,indent=2); f.write('\n')
+        create_private_json(args.output,result)
         print(f'Verified {result["verified_samples"]} samples. Report: {args.output}')
         return 0
-    except (OSError,ValueError,KeyError,zipfile.BadZipFile,ET.ParseError) as e:
+    except (OSError,ValueError,KeyError,SafetyError,zipfile.BadZipFile,ET.ParseError) as e:
         print(f'ERROR: {e}',file=sys.stderr); return 2
 
 if __name__=='__main__': raise SystemExit(main())

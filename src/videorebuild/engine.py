@@ -25,7 +25,7 @@ from typing import Iterable
 
 from . import __version__
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
-from .storage import Case, ReaderPool, SafetyError, iter_blocks, json_text
+from .storage import Case, ReaderPool, SafetyError, file_sha256, iter_blocks, json_text, write_json
 from .validate import doctor, validate
 
 LOG = logging.getLogger(__name__)
@@ -115,14 +115,6 @@ def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool 
     return True
 
 
-def _file_hash(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open('rb') as f:
-        while data := f.read(4*1024*1024):
-            h.update(data)
-    return h.hexdigest()
-
-
 def _link_unavailable(error: OSError) -> bool:
     return error.errno in {errno.EPERM, errno.EXDEV, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
 
@@ -149,18 +141,6 @@ def _publish_link_or_copy(source: Path, destination: Path) -> str:
             destination.unlink()
         raise
     return 'independent_copy'
-
-
-def _write_json(path: Path, value: object) -> None:
-    temp = path.with_suffix(path.suffix + '.tmp')
-    if temp.is_symlink() or path.is_symlink():
-        raise SafetyError('Refusing to write through a case-file symlink')
-    with temp.open('w', encoding='utf-8') as f:
-        json.dump(value, f, indent=2, sort_keys=True)
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp, path)
 
 
 def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
@@ -229,7 +209,7 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
         same_tools = old.get('tools') == tools and old.get('timeout') == opt.timeout
         if same_tools and old.get('status') == 'valid':
             p = case.root / old['path']
-            if not p.is_file() or p.is_symlink() or _file_hash(p) != old['sha256']:
+            if not p.is_file() or p.is_symlink() or file_sha256(p) != old['sha256']:
                 raise SafetyError(f'Previously validated candidate changed or disappeared: {p}')
             return old
         if same_tools and old.get('status') == 'rejected':
@@ -256,7 +236,7 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
             result['reason'] = checked['reason']
             if checked['ok']:
                 if target.exists():
-                    if target.is_symlink() or _file_hash(target) != proof['sha256']:
+                    if target.is_symlink() or file_sha256(target) != proof['sha256']:
                         raise SafetyError(f'Existing candidate does not match: {target}')
                     temp.unlink()
                 else:
@@ -265,7 +245,7 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
                         prior = json.loads(row['detail'])
                         if prior.get('sha256') == proof['sha256']:
                             p = case.root / prior['path']
-                            if p.is_file() and not p.is_symlink() and _file_hash(p) == proof['sha256']:
+                            if p.is_file() and not p.is_symlink() and file_sha256(p) == proof['sha256']:
                                 duplicate = p
                                 break
                     if duplicate:
@@ -281,7 +261,7 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
                         os.replace(temp, target)
                 result.update(status='valid', path=str(target.relative_to(case.root)),
                               sha256=proof['sha256'], media_sha256=proof['media_sha256'])
-                _write_json(target.with_suffix('.json'), {'version': __version__, 'stage': stage,
+                write_json(target.with_suffix('.json'), {'version': __version__, 'stage': stage,
                             'movie': movie.summary(), 'provenance': proof, 'validation': checked})
             elif checked.get('probe', {}).get('timeout') or checked.get('decode', {}).get('timeout'):
                 result['status'] = 'limited'
@@ -313,7 +293,7 @@ def _publish(case: Case, movie: Movie, successes: list[dict], status: str) -> li
         return []
     candidate = case.root / successes[0]['path']
     storage_mode = _publish_link_or_copy(candidate, final)
-    _write_json(sidecar, {'status': status, 'candidate': successes[0]['path'], 'storage_mode': storage_mode,
+    write_json(sidecar, {'status': status, 'candidate': successes[0]['path'], 'storage_mode': storage_mode,
                          'sha256': successes[0]['sha256'],
                          'meaning': 'One byte-distinct candidate passed within the completed search model; not proof of historical identity.'})
     return [str(final.relative_to(case.root))]
@@ -650,12 +630,12 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                     candidates = old_detail.get('candidates', [])
                     for c in candidates:
                         p = case.root / c['path']
-                        if not p.is_file() or p.is_symlink() or _file_hash(p) != c['sha256']:
+                        if not p.is_file() or p.is_symlink() or file_sha256(p) != c['sha256']:
                             raise SafetyError(f'Previously validated candidate changed or disappeared: {p}')
                     for output in old_detail.get('outputs', []):
                         p = case.root / output
                         if (not p.is_file() or p.is_symlink() or len(candidates) != 1 or
-                                _file_hash(p) != candidates[0]['sha256']):
+                                file_sha256(p) != candidates[0]['sha256']):
                             raise SafetyError(f'Published output changed or disappeared: {p}')
                     continue
             if limit is not None and processed >= limit:

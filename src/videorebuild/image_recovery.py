@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 from . import __version__
 from .bmff import FormatError
 from .fragmented import MAX_INIT, walk_prefix
-from .storage import SafetyError
+from .storage import SafetyError, file_sha256, write_json
 from .validate import doctor, run_tool
 
 LOG = logging.getLogger(__name__)
@@ -67,28 +67,14 @@ def signature(p: Path) -> dict:
             'ctime_ns': s.st_ctime_ns, 'inode': s.st_ino, 'device': s.st_dev}
 
 
-def sha_file(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open('rb') as f:
-        for b in iter(lambda: f.read(1024*1024), b''): h.update(b)
-    return h.hexdigest()
-
-
-def write_json(p: Path, obj) -> None:
-    if p.is_symlink(): raise SafetyError(f'Refusing symlink: {p}')
-    tmp = p.with_name(p.name+'.'+uuid.uuid4().hex+'.tmp')
-    with tmp.open('x', encoding='utf-8') as f:
-        json.dump(obj, f, indent=2, ensure_ascii=True)
-        f.write('\n'); f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, p)
-
-
 class XMLReader:
     """Bounded read chunks, reject declarations that could expand entities."""
     def __init__(self, f): self.f, self.tail = f, b''
     def read(self, n=-1):
         b = self.f.read(65536 if n < 0 else min(n, 65536))
-        check = (self.tail+b).upper()
+        # Inspect ASCII declaration tokens through UTF-16 NUL padding, while
+        # preserving the original bytes for ElementTree's encoding detection.
+        check = (self.tail+b).replace(b'\x00', b'').upper()
         if b'<!DOCTYPE' in check or b'<!ENTITY' in check:
             raise SafetyError('DTD/entity declarations are not accepted in PhotoRec XML')
         self.tail = check[-32:]
@@ -332,7 +318,7 @@ def run(args) -> int:
         for at in sorted({0, max(0,img_sig['size']//2-524288), max(0,img_sig['size']-1048576)}):
             f.seek(at); h.update(at.to_bytes(8,'big')); h.update(f.read(1048576))
     binding={'version': __version__, 'image':img_sig, 'image_sample_sha256':h.hexdigest(),
-             'report':xml_sig, 'report_sha256':sha_file(report), 'root':str(recovered),
+             'report':xml_sig, 'report_sha256':file_sha256(report), 'root':str(recovered),
              'max_record_bytes':args.max_record_bytes, 'timeout':args.timeout, 'tools':tools}
     if signature(image) != img_sig or signature(report) != xml_sig:
         raise SafetyError('An input changed during preflight')
@@ -391,7 +377,7 @@ CREATE TABLE IF NOT EXISTS results(offset INTEGER PRIMARY KEY,status TEXT NOT NU
                     raise SafetyError(f'Incomplete completed-prefix evidence at offset {offset}')
                 output=root/'recovered'/f'offset-{offset:014d}-prefix.mp4'
                 if (output.is_symlink() or not output.is_file() or
-                        output.stat().st_size!=expected_size or sha_file(output)!=expected_hash):
+                        output.stat().st_size!=expected_size or file_sha256(output)!=expected_hash):
                     raise SafetyError(f'Missing or changed completed prefix: {output}')
             verified_outputs=True
             remaining = None if args.all else args.limit
@@ -459,7 +445,7 @@ CREATE TABLE IF NOT EXISTS results(offset INTEGER PRIMARY KEY,status TEXT NOT NU
                             candidate=attempt/'candidate.mp4'
                             with candidate.open('xb') as f:
                                 f.write(memoryview(data)[:prefix.end]); f.flush(); os.fsync(f.fileno())
-                            detail['candidate_sha256']=sha_file(candidate)
+                            detail['candidate_sha256']=file_sha256(candidate)
                             checked=validate_prefix(candidate,data,prefix,tools,args.timeout)
                             detail['validation']=checked
                             if checked['ok']:
@@ -468,7 +454,7 @@ CREATE TABLE IF NOT EXISTS results(offset INTEGER PRIMARY KEY,status TEXT NOT NU
                                     raise SafetyError(f'Output is a symlink: {output}')
                                 if output.exists():
                                     # Recover the commit-after-publish crash window only when bytes agree.
-                                    if not output.is_file() or sha_file(output) != detail['candidate_sha256']:
+                                    if not output.is_file() or file_sha256(output) != detail['candidate_sha256']:
                                         raise SafetyError(f'Conflicting existing output: {output}')
                                 else:
                                     # Output is an independent copy of the exact original prefix.

@@ -7,7 +7,7 @@ name = "videorebuild"
 version = "0.2.0"
 description = "Image-first fragmented MP4 recovery and sample-table-guided media reconstruction"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = "MIT"
 authors = [{name = "VideoRebuild contributors"}]
 dependencies = []
