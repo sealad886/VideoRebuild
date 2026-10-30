@@ -13,6 +13,37 @@ from videorebuild.cli import main
 
 
 class RecoveredPrefixAuditTests(unittest.TestCase):
+    def test_missing_publication_is_reported_and_other_samples_are_audited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, prefix = generate(root/'generated.mp4', 'avc')
+            movie = repacketize(data, prefix)
+            recovery, image, locations = write_case_inputs(root, [movie, movie], len(prefix.initialization.data))
+            case = root/'case'
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                status = main(['recover-fragmented', '--image', str(image), '--root', str(recovery),
+                               '--case', str(case), '--diagnostic-windows', '0'])
+            self.assertEqual(status, 0)
+            missing = case/'recovered'/f'offset-{locations[0][0]:014d}-prefix.mp4'
+            missing.unlink()
+            before = {path: path.read_bytes() for path in case.rglob('*') if path.is_file()}
+            source_before = image.read_bytes()
+            report = root/'missing.json'
+            tool = Path(__file__).resolve().parents[1]/'tools/check_recovered_prefixes.py'
+            completed = subprocess.run([sys.executable, str(tool), str(case), str(image), str(report)],
+                                       capture_output=True, text=True, timeout=45)
+            self.assertEqual(completed.returncode, 1, completed.stdout+completed.stderr)
+            result = json.loads(report.read_text())
+            self.assertFalse(result['ok'])
+            rows = {row['image_offset']: row for row in result['results']}
+            self.assertEqual(set(rows), {offset for offset, _ in locations})
+            self.assertFalse(rows[locations[0][0]]['ok'])
+            self.assertTrue(rows[locations[1][0]]['ok'])
+            self.assertFalse(missing.exists())
+            self.assertEqual(image.read_bytes(), source_before)
+            for path, original in before.items():
+                self.assertEqual(path.read_bytes(), original, str(path))
+
     def test_audit_preserves_inputs_and_reports_changed_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

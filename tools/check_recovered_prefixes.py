@@ -40,27 +40,33 @@ def audit(case: Path, image: Path) -> dict:
             if not isinstance(length, int) or not 0 < length <= 256*1024*1024:
                 raise ValueError('Saved prefix length must be between 1 byte and 256 MiB')
             output = case/'recovered'/f'offset-{offset:014d}-prefix.mp4'
-            output_before = signature(output)
             source.seek(offset)
             data = source.read(length)
             if len(data) != length:
                 raise ValueError('Short source-image read')
             init_size = box_at(data, box_at(data, 0).end).end
             prefix = walk_prefix(data, init_size)
-            checked = validate_prefix(output, data, prefix, tools, 120)
             row = {
                 'image_offset': offset, 'bytes': length,
                 'source_sha256': hashlib.sha256(data).hexdigest(),
-                'published_sha256': sha_file(output),
                 'saved_sha256': saved['candidate_sha256'],
                 'parsed_end': prefix.end, 'fragment_count': len(prefix.fragments),
                 'sample_counts': prefix.counts, 'eligibility_error': prefix.eligibility_error(),
-                'validation_ok': checked['ok'], 'validation_reason': checked['reason'],
-                'output_unchanged': signature(output) == output_before,
             }
-            row['ok'] = (row['source_sha256'] == row['published_sha256'] == row['saved_sha256']
-                         and prefix.end == length and row['eligibility_error'] is None
-                         and checked['ok'] and row['output_unchanged'])
+            try:
+                output_before = signature(output)
+                checked = validate_prefix(output, data, prefix, tools, 120)
+                row.update(published_sha256=sha_file(output), validation_ok=checked['ok'],
+                           validation_reason=checked['reason'],
+                           output_unchanged=signature(output) == output_before)
+                row['ok'] = (row['source_sha256'] == row['published_sha256'] == row['saved_sha256']
+                             and prefix.end == length and row['eligibility_error'] is None
+                             and checked['ok'] and row['output_unchanged'])
+            except FileNotFoundError:
+                # A committed successful prefix may disappear before or during
+                # this audit. That is a failed sample, not a setup failure.
+                row.update(published_sha256=None, validation_ok=False,
+                           validation_reason='missing_publication', output_unchanged=False, ok=False)
             results.append(row)
             print(f"{len(results)}/{len(selected)} offset={offset} bytes={length} ok={row['ok']}", flush=True)
     result = {'tools': tools, 'image_signature': image_before, 'case_status_counts': counts,
