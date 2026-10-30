@@ -60,6 +60,7 @@ Acceptance criteria:
 - Evidence folder: `test-results/audit-accuracy/`. No private media is stored
   there. `check_real_prefixes.py` reads existing publications and original-image
   ranges; it writes only hashes, offsets, counts and validation results.
+  Its portable successor is [the recovered-prefix audit tool](../tools/check_recovered_prefixes.py).
 - Graphify was queried before source investigation and refreshed after code
   changes; Codanna index identity was checked and consequential claims confirmed
   directly in source.
@@ -68,6 +69,19 @@ Primary references checked during the audit: [FFprobe options and packet data](h
 [FFmpeg 9.0.2 MOV implementation](https://github.com/FFmpeg/FFmpeg/blob/n9.0.2/libavformat/mov.c),
 and the [W3C ISO BMFF browser profile](https://www.w3.org/TR/mse-byte-stream-format-isobmff/).
 The browser profile is not treated as a universal local-file requirement.
+
+To repeat a bounded read-only sample audit with a new report outside the case:
+
+```bash
+python3 tools/check_recovered_prefixes.py CASE IMAGE OUTPUT.json
+```
+
+The tool selects up to nine successful prefixes and returns exit code 0 when
+all sampled checks pass, 1 on a mismatch, or 2 for input/tool errors. It does not
+resume recovery or modify the case. Generated-media tests cover unchanged source,
+publication and database bytes, plus rejection of a modified publication. Reports
+include local paths and must be inspected before sharing. The archived October
+16 evidence below describes the original helper and remains unchanged.
 
 ## Measurement and real-source methodology
 
