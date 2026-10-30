@@ -1,8 +1,26 @@
 # Executed validation — VideoRebuild 0.2.0
 
+## PR preparation — October 30, 2026
+
+Source and rebuilt zipapp each passed all 123 tests on macOS 27.2 arm64 with
+Python 3.13.18 and FFmpeg/ffprobe 9.0.2: 37.047 seconds for source and 36.715
+seconds for the zipapp. This includes the portable read-only audit helper,
+publication-corruption checks, independent runtime-version validation, and
+terminal video/audio sample-duration regressions. An isolated source-distribution
+build included this report and all four launchers while excluding injected local
+evidence. Launcher syntax and fragmented-launcher help checks also passed.
+
+Hosted baseline testing exposed an unsupported-runtime mismatch: FFmpeg 7.1.5
+can supply codec-derived packet duration instead of the container's duration.
+The current implementation therefore requires both FFmpeg and ffprobe 8+ and
+rejects older or unidentifiable releases during preflight. macOS CI and launcher
+guidance now select modern FFmpeg; the exact timing gate remains unchanged.
+These local results do not establish hosted CI parity or a new real-image audit.
+The historical measurements below retain their original scopes.
+
 ## Accuracy audit — October 16, 2026
 
-The latest recorded full-suite evidence covers 118 tests on macOS 27.2 arm64
+The October 16 full-suite evidence covers 118 tests on macOS 27.2 arm64
 with FFmpeg/ffprobe 9.0.2. Source execution passed on Python 3.11.17 and 3.13.16;
 the rebuilt standalone archive passed on Python 3.13.16. Installed-wheel results
 below belong to the earlier 102-test snapshot and are not current wheel parity.

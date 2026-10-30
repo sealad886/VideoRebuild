@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Use installed Homebrew versioned tools when present; never install or update silently.
+# Use installed Homebrew tools when present; never install or update silently.
 set -euo pipefail
 umask 077
 HERE="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON=''
 for PREFIX in /opt/homebrew /usr/local; do
-  if [[ -x "$PREFIX/opt/ffmpeg@7/bin/ffmpeg" && -x "$PREFIX/opt/ffmpeg@7/bin/ffprobe" ]]; then
-    export PATH="$PREFIX/opt/ffmpeg@7/bin:$PATH"
+  if [[ -x "$PREFIX/bin/brew" ]] && FFMPEG_PREFIX="$("$PREFIX/bin/brew" --prefix ffmpeg 2>/dev/null)"; then
+    if [[ -x "$FFMPEG_PREFIX/bin/ffmpeg" && -x "$FFMPEG_PREFIX/bin/ffprobe" ]]; then
+      export PATH="$FFMPEG_PREFIX/bin:$PATH"
+    fi
   fi
   if [[ -z "$PYTHON" && -x "$PREFIX/opt/python@3.13/bin/python3.13" ]]; then
     PYTHON="$PREFIX/opt/python@3.13/bin/python3.13"

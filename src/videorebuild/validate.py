@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -55,7 +56,17 @@ def doctor() -> dict:
         r = run_tool([exe, '-version'], 15)
         if r['returncode'] or r['timeout']:
             raise SafetyError(f'{name} -version failed: {r["stderr"]}')
-        result[name] = {'path': exe, 'version': r['stdout'].splitlines()[0]}
+        lines = r['stdout'].splitlines()
+        version = lines[0] if lines else ''
+        release = re.match(rf'^{name} version n?(\d+)\.\d+(?:\.\d+)*(?=[\s+~\-]|$)', version)
+        # Older MOV demuxers can report codec-derived packet durations rather
+        # than trun durations. Those cannot independently prove final-sample
+        # timing, which has no following DTS to cross-check.
+        if release is None:
+            raise SafetyError(f'Cannot identify {name} release version; FFmpeg and ffprobe 8.0 or newer are required')
+        if int(release[1]) < 8:
+            raise SafetyError(f'{name} is too old; FFmpeg and ffprobe 8.0 or newer are required for exact container packet timing')
+        result[name] = {'path': exe, 'version': version}
     return result
 
 

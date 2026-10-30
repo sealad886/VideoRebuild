@@ -1,6 +1,6 @@
 # VideoRebuild 0.2.0
 
-Local, MIT-licensed video recovery for macOS/Linux. Python 3.11+ and FFmpeg/ffprobe are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
+Local, MIT-licensed video recovery for macOS/Linux. Python 3.11+ and both FFmpeg and ffprobe 8+ are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
 
 ## The new path: fragmented MP4 from original-image bytes
 
@@ -17,7 +17,7 @@ python3 videorebuild.pyz doctor
 python3 videorebuild.pyz recover-fragmented --help
 ```
 
-On a Mac, `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and `ffmpeg@7` tools when present, then runs the fragmented backend with your arguments. Otherwise it uses Python and FFmpeg from PATH. It never installs or updates dependencies silently.
+On a Mac, install the runtime yourself with `brew install python@3.13 ffmpeg`. `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and unversioned `ffmpeg` tools when present, resolving Homebrew aliases through `brew --prefix ffmpeg`, then runs the fragmented backend with your arguments. Otherwise it uses Python and FFmpeg from PATH. Both `ffmpeg` and `ffprobe` must be version 8 or newer; `doctor` checks each executable. The launcher never installs or updates dependencies silently.
 
 ```bash
 bash ./run-fragmented-macos.command --help
@@ -59,7 +59,7 @@ This tool verifies sample hashes, parses initialization data, inventories embedd
 
 ## Tests and packaging
 
-Run from the project root with FFmpeg and ffprobe available:
+Run from the project root with both FFmpeg and ffprobe 8+ available:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
