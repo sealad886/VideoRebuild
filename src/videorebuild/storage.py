@@ -12,8 +12,9 @@ import re
 import sqlite3
 import stat
 import struct
+import tempfile
 import time
-from typing import Iterator
+from typing import Iterator, TextIO
 
 from .bmff import MAX_METADATA, FormatError, boxes, parse_movie
 
@@ -30,6 +31,58 @@ class SafetyError(RuntimeError):
 
 def json_text(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+
+
+@contextmanager
+def atomic_text(path: Path) -> Iterator[TextIO]:
+    if path.is_symlink():
+        raise SafetyError('Refusing to write through a case-file symlink')
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.', suffix='.tmp')
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+            yield f
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+        temp = None
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def write_json(path: Path, value: object) -> None:
+    with atomic_text(path) as f:
+        json.dump(value, f, indent=2, sort_keys=True, ensure_ascii=True)
+        f.write('\n')
+
+
+def create_private_json(path: Path, value: object) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    created = os.fstat(fd)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(value, f, indent=2, sort_keys=True, ensure_ascii=True)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                path.unlink(missing_ok=True)
+        raise
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as f:
+        while data := f.read(1024 * 1024):
+            digest.update(data)
+    return digest.hexdigest()
 
 
 def regular(path: Path) -> os.stat_result:
@@ -51,7 +104,7 @@ class Case:
 
     def __enter__(self) -> 'Case':
         import fcntl
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Advisory lock survives crashes without a stale-lock deletion operation.
         lockpath = self.root / '.lock'
         if lockpath.is_symlink():

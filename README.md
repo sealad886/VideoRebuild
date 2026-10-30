@@ -1,6 +1,6 @@
 # VideoRebuild 0.2.0
 
-Local, MIT-licensed video recovery for macOS/Linux. Python 3.11+ and FFmpeg/ffprobe are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
+Local, MIT-licensed video recovery for macOS/Linux. Python 3.13+ and both FFmpeg and ffprobe 8+ are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
 
 ## The new path: fragmented MP4 from original-image bytes
 
@@ -17,7 +17,7 @@ python3 videorebuild.pyz doctor
 python3 videorebuild.pyz recover-fragmented --help
 ```
 
-On a Mac, `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and `ffmpeg@7` tools when present, then runs the fragmented backend with your arguments. Otherwise it uses Python and FFmpeg from PATH. It never installs or updates dependencies silently.
+On a Mac, install the runtime yourself with `brew install python@3.13 ffmpeg`. `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and unversioned `ffmpeg` tools when present, resolving Homebrew aliases through `brew --prefix ffmpeg`, then runs the fragmented backend with your arguments. It retains the first complete FFmpeg/ffprobe pair accepted by `doctor`, checking `/opt/homebrew` before `/usr/local`; a later installation cannot override a supported pair. Unsupported or incomplete Homebrew pairs leave the original PATH fallback intact. Both `ffmpeg` and `ffprobe` must be version 8 or newer; `doctor` checks each executable. The launcher never installs or updates dependencies silently.
 
 ```bash
 bash ./run-fragmented-macos.command --help
@@ -59,7 +59,7 @@ This tool verifies sample hashes, parses initialization data, inventories embedd
 
 ## Tests and packaging
 
-Run from the project root with FFmpeg and ffprobe available:
+Run from the project root with both FFmpeg and ffprobe 8+ available:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -67,7 +67,7 @@ python3 tools/build_zipapp.py
 python3 videorebuild.pyz --version
 ```
 
-`TEST_REPORT.md` records what was actually executed. The current 102-test suite passes on macOS/Apple Silicon with Python 3.11 and 3.13, including execution against the installed wheel and standalone archive. Synthetic fixtures are generated locally, not downloaded. No private surveillance-media fixture is bundled. The source-image backend has not been tested against the user's entire recovery image. Its binary parser has been exercised against the real diagnostic samples separately.
+[`TEST_REPORT.md`](TEST_REPORT.md) records executed validation. The October 16 accuracy audit passed all 118 tests on macOS/Apple Silicon with Python 3.11 and 3.13 source checkouts and the Python 3.13 standalone archive. Installed-wheel execution covered an earlier 102-test snapshot. Nine sampled real recovered prefixes passed fresh original-image byte comparisons, packet hashes, timing checks, and full decoding; this does not validate the entire recovery image or establish complete historical recordings. Synthetic fixtures are generated locally, not downloaded, and no private surveillance-media fixture is bundled. See the [accuracy audit](docs/AUDIT_ACCURACY.md) for scope and limits.
 
 The standalone archive has no Python dependencies. The optional wheel build uses the pinned build requirement in `pyproject.toml`; it is not needed to run the zipapp. FFmpeg performs codec decoding; the Python code implements the narrow recovery/addressing rules.
 
@@ -81,4 +81,4 @@ python3 -m venv .venv
 .venv/bin/python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
 ```
 
-Use Python 3.11+ for these commands. The source archive includes all four Mac launchers; CI checks their syntax, starts the extracted fragmented launcher, and installs a wheel built from that archive. Local artifacts retain version 0.2.0; validation does not imply a new published release.
+Use Python 3.13+ for these commands. The source archive includes all four Mac launchers; CI checks their syntax, starts the extracted fragmented launcher, and installs a wheel built from that archive. Local artifacts retain version 0.2.0; validation does not imply a new published release.

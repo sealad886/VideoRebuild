@@ -16,8 +16,8 @@ from xml.etree.ElementTree import ParseError
 import time
 
 from . import __version__
-from .engine import Options, recover, _write_json
-from .storage import Case, SafetyError, scan
+from .engine import Options, recover
+from .storage import Case, SafetyError, atomic_text, scan, write_json
 from .validate import doctor
 
 LOG = logging.getLogger(__name__)
@@ -54,12 +54,10 @@ def report(case: Case) -> dict:
                     'A source without a usable moov cannot generate a recording reconstruction in this version.',
                     'Legacy backend does not assemble moof; use recover-fragmented with the original image.',
                     'Published files use case-internal hard links when available, otherwise independent copies. Never source links. Copy before editing.']}
-    _write_json(case.root / 'reports' / 'summary.json', overview)
-    _write_json(case.root / 'reports' / 'results.json', {'summary': overview, 'movies': items, 'sources': sources})
+    write_json(case.root / 'reports' / 'summary.json', overview)
+    write_json(case.root / 'reports' / 'results.json', {'summary': overview, 'movies': items, 'sources': sources})
     csvpath = case.root / 'reports' / 'results.csv'
-    if csvpath.is_symlink():
-        raise SafetyError('Report path is a symlink')
-    with csvpath.open('w', newline='', encoding='utf-8') as f:
+    with atomic_text(csvpath) as f:
         writer = csv.writer(f)
         writer.writerow(['movie_sha256', 'status', 'stage', 'tracks', 'chunks', 'media_bytes', 'outputs', 'reason'])
         for i in items:
@@ -89,9 +87,8 @@ It does not prove recording identity, timestamps, or that a camera never dropped
 <table><thead><tr><th>Metadata SHA-256</th><th>Status</th><th>Search</th><th>Decode-checked candidates</th><th>Reason</th></tr></thead><tbody>'''+''.join(rows)+'''</tbody></table>
 <p>Full details: <a href="results.json">JSON</a> · <a href="results.csv">CSV</a>.</p></html>'''
     target = case.root / 'reports' / 'index.html'
-    if target.is_symlink():
-        raise SafetyError('HTML report is a symlink')
-    target.write_text(page, encoding='utf-8')
+    with atomic_text(target) as f:
+        f.write(page)
     return overview
 
 

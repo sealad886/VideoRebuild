@@ -12,17 +12,17 @@ if command -v brew >/dev/null 2>&1; then
     if prefix="$(brew --prefix python@3.13 2>/dev/null)" && [ -d "$prefix/libexec/bin" ]; then
         export PATH="$prefix/libexec/bin:$PATH"
     fi
-    if prefix="$(brew --prefix ffmpeg@7 2>/dev/null)" && [ -d "$prefix/bin" ]; then
+    if prefix="$(brew --prefix ffmpeg 2>/dev/null)" && [ -d "$prefix/bin" ]; then
         export PATH="$prefix/bin:$PATH"
     fi
 fi
 for tool in python3 ffmpeg ffprobe osascript; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-        printf 'Missing %s. Install the runtime first: brew install python@3.13 ffmpeg@7\n' "$tool" >&2
+        printf 'Missing %s. Install the runtime first: brew install python@3.13 ffmpeg (FFmpeg and ffprobe 8+ required)\n' "$tool" >&2
         exit 2
     fi
 done
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else "Python 3.11 or newer is required")'
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,13) else "Python 3.13 or newer is required")'
 if [ ! -f "$ROOT/videorebuild.pyz" ]; then
     printf 'Missing videorebuild.pyz. From the project folder run: python3 tools/build_zipapp.py\n' >&2
     exit 2

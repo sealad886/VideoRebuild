@@ -13,9 +13,62 @@ from unittest.mock import patch
 from videorebuild.bmff import FormatError, make_box
 from videorebuild.cli import main
 from videorebuild.fragmented import box_at,parse_initialization,parse_fragment,walk_prefix,inspect_embedded
-from videorebuild.image_recovery import export_report,import_report,validate_prefix
+from videorebuild.image_recovery import XMLReader,export_report,import_report,validate_prefix
+from videorebuild.storage import SafetyError
 from videorebuild.validate import doctor
 from fragmented_helpers import generate,repacketize,write_case_inputs
+
+
+class XMLReportTests(unittest.TestCase):
+    encodings = (('utf-8', b'', 'utf-8'),
+                 ('utf-16-le', b'\xff\xfe', 'utf-16'),
+                 ('utf-16-be', b'\xfe\xff', 'utf-16'))
+    body = ('<dfxml><source><image_filename>synthetic.img</image_filename>'
+            '<image_size>1024</image_size><sectorsize>512</sectorsize></source>'
+            '<fileobject><filename>NAME</filename><filesize>16</filesize>'
+            '<byte_runs><byte_run offset="0" img_offset="0" len="16"/>'
+            '</byte_runs></fileobject></dfxml>')
+
+    def report_bytes(self, encoding, bom, declaration, dtd=''):
+        name = '&recovered;' if dtd else 'f00000016.mp4'
+        xml = f'<?xml version="1.0" encoding="{declaration}"?>'+dtd+self.body.replace('NAME', name)
+        return bom+xml.encode(encoding)
+
+    def test_report_encodings_preserve_anchor_and_reject_entities(self):
+        dtd = '<!DOCTYPE dfxml [<!ENTITY recovered "f00000016.mp4">]>'
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory)/'recup_dir.1'/'report.xml'
+            report.parent.mkdir()
+            for encoding, bom, declaration in self.encodings:
+                for declaration_text in ('', dtd):
+                    with self.subTest(encoding=encoding, dtd=bool(declaration_text)):
+                        report.write_bytes(self.report_bytes(encoding, bom, declaration, declaration_text))
+                        with contextlib.closing(sqlite3.connect(':memory:')) as db:
+                            db.executescript('CREATE TABLE anchors(offset INTEGER PRIMARY KEY,path TEXT,size INTEGER,runs TEXT);'
+                                             'CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);')
+                            if declaration_text:
+                                with self.assertRaises(SafetyError):
+                                    import_report(db, report)
+                                self.assertEqual(db.execute('SELECT COUNT(*) FROM anchors').fetchone()[0], 0)
+                            else:
+                                self.assertEqual(import_report(db, report)['header_locations'], 1)
+                                self.assertEqual(db.execute('SELECT offset,path,size FROM anchors').fetchone(),
+                                                 (0, 'recup_dir.1/f00000016.mp4', 16))
+
+    def test_reader_preserves_bytes_and_rejects_split_declarations(self):
+        for encoding, bom, declaration in self.encodings:
+            normal = self.report_bytes(encoding, bom, declaration)
+            for chunk_size in (1, 3, 64):
+                with self.subTest(encoding=encoding, chunk_size=chunk_size):
+                    reader = XMLReader(io.BytesIO(normal))
+                    self.assertEqual(b''.join(iter(lambda: reader.read(chunk_size), b'')), normal)
+                    for token in ('<!DOCTYPE dfxml>', '<!ENTITY recovered "filename">'):
+                        # Padding puts each token across reads, even for the largest chunk.
+                        padding = (63-len(bom))//len(' '.encode(encoding))
+                        raw = bom+(' '*padding+token).encode(encoding)
+                        reader = XMLReader(io.BytesIO(raw))
+                        with self.assertRaises(SafetyError):
+                            list(iter(lambda: reader.read(chunk_size), b''))
 
 
 class FragmentedTests(unittest.TestCase):
@@ -124,6 +177,21 @@ class FragmentedTests(unittest.TestCase):
         p=walk_prefix(self.data,self.init_size); p.starts[1]+=1
         self.assertEqual(validate_prefix(f,self.data,p,self.tools,30)['reason'],'packet_timing_mismatch')
 
+    def test_validator_rejects_incorrect_terminal_sample_duration(self):
+        # No subsequent DTS can expose the final sample's wrong duration.
+        f=self.root/'clip.mp4'; f.write_bytes(self.data)
+        for tid in self.init.tracks:
+            with self.subTest(track=tid):
+                p=walk_prefix(self.data,self.init_size)
+                fi,si=max((fi,si) for fi,frag in enumerate(p.fragments)
+                          for si,sample in enumerate(frag.samples) if sample.track_id==tid)
+                fragment=p.fragments[fi]; samples=list(fragment.samples)
+                samples[si]=replace(samples[si],duration=samples[si].duration+1)
+                p.fragments[fi]=replace(fragment,samples=tuple(samples))
+                checked=validate_prefix(f,self.data,p,self.tools,30)
+                self.assertFalse(checked['ok'],checked)
+                self.assertEqual(checked['reason'],'packet_timing_mismatch')
+
     def test_bframe_timing_with_signed_and_unsigned_composition_offsets(self):
         for codec in ('avc','hevc'):
             for negative in (False,True):
@@ -136,6 +204,16 @@ class FragmentedTests(unittest.TestCase):
                     if negative: self.assertLess(min(offsets),0)
                     checked=validate_prefix(f,data,p,self.tools,30)
                     self.assertTrue(checked['ok'],checked)
+                    # Reordered presentation must not hide the final decode
+                    # sample's duration: no next DTS exists to cross-check it.
+                    fi,si=max((fi,si) for fi,frag in enumerate(p.fragments)
+                              for si,sample in enumerate(frag.samples) if sample.track_id==1)
+                    fragment=p.fragments[fi]; samples=list(fragment.samples)
+                    samples[si]=replace(samples[si],duration=samples[si].duration+1)
+                    p.fragments[fi]=replace(fragment,samples=tuple(samples))
+                    checked=validate_prefix(f,data,p,self.tools,30)
+                    self.assertFalse(checked['ok'],checked)
+                    self.assertEqual(checked['reason'],'packet_timing_mismatch')
 
     def test_nonzero_per_track_tfdt_preserves_packet_timing(self):
         data=bytearray(self.timed)

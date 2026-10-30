@@ -4,7 +4,7 @@ This is the retained manual for the `scan`, `run`, `recover`, and `report` comma
 
 # VideoRebuild 0.1.0
 
-Local, open-source MP4 reconstruction for jumbled PhotoRec recoveries and raw disk images. MIT licensed. No cloud service, model, telemetry, or Python runtime dependency outside the standard library. FFmpeg and ffprobe are required external executables.
+Local, open-source MP4 reconstruction for jumbled PhotoRec recoveries and raw disk images. MIT licensed. No cloud service, model, telemetry, or Python runtime dependency outside the standard library. Both FFmpeg and ffprobe 8+ are required external executables for the current implementation of these commands.
 
 **This is a working first release, not a general-purpose forensic recovery product. It has been tested on generated H.264/HEVC recordings that were deliberately separated and scattered. It has not been tested against your camera or your recovery set. Read the support boundary before a large run.**
 
@@ -23,13 +23,13 @@ Every published result must satisfy structural checks, a full ffprobe count/deco
 
 ## Run on macOS
 
-The simplest distribution is the bundled `videorebuild.pyz`. It needs Python 3.11 or newer but does not need pip or a virtual environment.
+The simplest distribution is the bundled `videorebuild.pyz`. It needs Python 3.13 or newer but does not need pip or a virtual environment.
 
-The reference runtime for this release is Python 3.13 and FFmpeg 7.1.5. The following Homebrew major-version formulae avoid silently selecting a different FFmpeg major version. Patch versions can still change; `doctor` records the actual executables and versions.
+Use Python 3.13+ and both FFmpeg and ffprobe 8+. The Homebrew command below installs its current unversioned FFmpeg formula; `doctor` checks both executables against the minimum supported major version and records their actual versions. The launchers select installed tools without installing or updating dependencies.
 
 ```bash
-brew install python@3.13 ffmpeg@7
-export PATH="$(brew --prefix python@3.13)/libexec/bin:$(brew --prefix ffmpeg@7)/bin:$PATH"
+brew install python@3.13 ffmpeg
+export PATH="$(brew --prefix python@3.13)/libexec/bin:$(brew --prefix ffmpeg)/bin:$PATH"
 python3 videorebuild.pyz doctor
 ```
 

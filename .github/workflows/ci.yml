@@ -9,8 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ['3.11', '3.13']
+        os: [ubuntu-26.04, macos-latest]
+        python: ['3.13', '3.14']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -26,8 +26,8 @@ jobs:
       - name: Install FFmpeg (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ffmpeg@7
-          echo "$(brew --prefix ffmpeg@7)/bin" >> "$GITHUB_PATH"
+          brew install ffmpeg
+          echo "$(brew --prefix ffmpeg)/bin" >> "$GITHUB_PATH"
       - name: Runtime evidence
         run: |
           python --version
