@@ -191,6 +191,15 @@ A generated H.264/AAC MP4 was stored across noncontiguous FAT16 clusters inside 
 
 Requested Simplify Code and independent performance-centric Adversarial Audit passes completed before any main merge. All confirmed in-scope findings were fixed and independently rechecked; see [SHARED_RANGE_REVIEW.md](docs/SHARED_RANGE_REVIEW.md). Selected-stream setup is linear in relevant mappings; migration streams rows; source checks cache physical IDs; narrow availability uses binary search; malformed fragment candidates consume attempt and aggregate-read budgets. Synthetic performance results do not establish real-image throughput or recovery yield.
 
-Hosted CI is pending at this local checkpoint. Remote `main` is absent; the existing default is `codex/fragment-accuracy-audit`. Automatic approval review rejected creating remote main at the verified existing local main commit. Therefore no merge, tag or public release has occurred; source/artifact checks alone are not a release claim. A focused draft PR against the existing default branch is the review target until explicit main-creation approval resolves that gate.
+Hosted CI passed all four Linux/macOS Python 3.13/3.14 jobs for [PR #5](https://github.com/sealad886/VideoRebuild/pull/5) ([run](https://github.com/sealad886/VideoRebuild/actions/runs/41041942049)), and again after merge ([run](https://github.com/sealad886/VideoRebuild/actions/runs/41042309272)). The user explicitly authorized creating absent main and setting it as default; main was created from the previous published default head without losing history. PR #5 merged at `7adb2a1602d21772fe76a29eb36ad72c4e750825`. Signed tag `v0.3.0` and the [public GitHub release](https://github.com/sealad886/VideoRebuild/releases/tag/v0.3.0) were published. All downloaded asset SHA-256 hashes match local verified artifacts; downloaded zipapp version/doctor passed. Both fully merged task/audit branches were deleted locally/remotely after ancestry and unique-commit checks; main remains clean and tracks origin/main.
 
 No private image, recording or existing recovery case was processed. Original filesystem support/yield remains unverified. Optional fiwalk tests skip on hosts without the tool; configured Linux/macOS Python 3.13/3.14 CI coverage must be distinguished from executed results. Forced termination during final migration installation may require restoring the retained complete backup; ordinary exception rollback is tested. No PyPI publication is implied.
+
+
+Published release SHA-256:
+
+```text
+3676511c2961b8c6bd5e7191d31bb226ee2545b4747df9049c6c6e20eafa86d7  videorebuild.pyz
+751d93402b754267eccb58c598e3ed1a0d84ba8003a50c66b9fda8ff8cb6e207  videorebuild-0.3.0.tar.gz
+047b0ac29ef01ff33d3bccb20283246a981519df8b8a015f9d5170e46b230ee7  videorebuild-0.3.0-py3-none-any.whl
+```

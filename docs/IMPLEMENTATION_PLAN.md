@@ -1,6 +1,6 @@
 # Shared byte-range reconstruction — implementation and release plan
 
-Status: implementation in progress. Baseline: `9db774d` on `codex/fragment-accuracy-audit`; work branch: `codex/shared-byte-range`. The user authorized implementation and release, including merge into main only after Simplify Code and a performance-focused Adversarial Audit. No new worktree is authorized or required.
+Status: complete — implemented, independently reviewed, merged, released and cleaned up. Baseline: `9db774d` on `codex/fragment-accuracy-audit`; work branch was `codex/shared-byte-range` (deleted after verified merge). The user authorized implementation and release, including merge into main only after Simplify Code and a performance-focused Adversarial Audit. No new worktree is authorized or required.
 
 ## Accepted scope and invariants
 
@@ -31,7 +31,7 @@ The initial supported filesystem path imports real Sleuth Kit 4.14.0 fiwalk DFXM
 - [x] WI-2: implement indexed ranges, mapfile parsing, bounded DFXML import and contract tests (range owner); canonical Case/schema/read/scan and migration (storage owner); fragmented strategy and later-segment validation (fragmented owner).
 - [x] WI-3: integrate canonical CLI/workflow/report, launchers and documentation; exercise files-only, image/report, filesystem extents and mapped holes (root).
 - [x] WI-4: run complete regressions and source/zipapp/sdist/wheel checks; perform Simplify Code then independent performance-focused Adversarial Audit; resolve in-scope blocking findings and reverify (root and independent reviewers). Reviews, final source/zipapp/wheel suites and local artifact verification passed; hosted CI recorded separately.
-- [ ] WI-5: reconcile version and release artifacts, create reviewed PR, require actual CI results or report a blocker, merge into main, tag/publish immutable GitHub release, and verify downloaded release artifacts (root). **Active: remote main creation is blocked by automatic approval review; prepare focused draft PR against existing default branch without merging.**
+- [x] WI-5: reconcile version and release artifacts, create reviewed PR, require actual CI results or report a blocker, merge into main, tag/publish immutable GitHub release, and verify downloaded release artifacts (root). Completed: user explicitly authorized main creation/default setting; PR #5 merged at `7adb2a1602d21772fe76a29eb36ad72c4e750825`; signed `v0.3.0` published; downloaded assets and zipapp smoke checks passed; merged task/audit branches removed locally and remotely.
 
 Critical path: frozen ranges/Case APIs → integrated strategies → behavioral proof → simplification → adversarial performance review → final artifact checks → merge/release. Independent files have single owners. No private recovery image is used for stress or failure-injection checks.
 
@@ -53,8 +53,10 @@ Baseline executed locally: 147 tests passed with project Python 3.13.18 and FFmp
 
 ## Release and rollback
 
-Target 0.3.0: pre-1.0 minor release with intentional CLI/case-schema changes; do not declare 1.0 stability. Versions in pyproject/runtime/zipapp and package metadata must agree. Existing version 0.2.0 has no verified published GitHub release/tag in this checkout; retain that distinction. Publish a GitHub release with zipapp, source distribution, wheel, checksums and migration/limitations notes; no PyPI publication or deployment is assumed.
+Released 0.3.0: pre-1.0 minor release with intentional CLI/case-schema changes; do not declare 1.0 stability. Versions in pyproject/runtime/zipapp and package metadata must agree. The earlier 0.2.0 baseline had no verified published GitHub release/tag; 0.3.0 is now published at https://github.com/sealad886/VideoRebuild/releases/tag/v0.3.0. Publish a GitHub release with zipapp, source distribution, wheel, checksums and migration/limitations notes; no PyPI publication or deployment is assumed.
 
 Migration creates a verified local SQLite backup before replacing a case artifact. Old validation records retain their original evidence/version. Failed conversion leaves originals usable. Code rollback uses the prior commit/release with its original case or migration backup; never reuse a new-schema case with old code. Preserve original sources and historical outputs.
 
 Open risks: source filesystem unknown; filesystem metadata may be incomplete; mapfile/image alignment must be explicit; real-data yield and multi-platform performance need evidence. Release blockers include false associations, unavailable-byte consumption, source mutation, unbounded normal-path growth, failed migration preservation, failing required checks, unresolved review defects, or artifact/version mismatch.
+
+Final evidence: all four PR and post-merge Linux/macOS Python 3.13/3.14 jobs passed. Main is the default branch and local checkout; no new worktree was created. Release artifacts contain the review-time documentation snapshot; this closure record reports subsequent publication and cleanup.

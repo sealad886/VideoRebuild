@@ -52,3 +52,7 @@ Additional contracts cover files-only and physically noncontiguous fragmented so
 ## Bounded residuals
 
 No missing-initialization inference, proprietary filesystem parsing, wall-clock joining or generation of absent video bytes is included. Fiwalk integration tests skip when the optional tool is absent. Source checks are ordinary change detectors rather than a hostile-administrator defense. Forced termination during final migration database installation can require restoring the retained complete backup; ordinary exception rollback is tested. Total-case disk quota and automatic retention deletion remain outside this release.
+
+## Final disposition
+
+All confirmed findings are closed. The reviewed source passed 189 tests through source, standalone and installed-wheel execution; PR and post-merge hosted matrices passed. PR #5 merged to main, signed v0.3.0 was published, downloaded artifacts passed checksum/smoke verification, and merged task/audit branches were cleaned up. The original private image was not processed; recovery yield remains unqualified.
