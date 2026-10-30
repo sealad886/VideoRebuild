@@ -10,7 +10,7 @@ These primary sources informed the format handling and validation strategy. The 
 - [FFmpeg documentation](https://ffmpeg.org/ffmpeg.html): decoding, stream selection, and strict error handling.
 - [W3C: ISO BMFF byte-stream format](https://www.w3.org/TR/mse-byte-stream-format-isobmff/): initialization/media segments and the distinction between ordinary and fragmented MP4. The local fragmented backend implements its own narrower recovery contract, not the browser MSE profile.
 - [Homebrew FFmpeg](https://formulae.brew.sh/formula/ffmpeg): current unversioned formula and aliases used by the macOS installation commands. Both FFmpeg and ffprobe 8+ are required.
-- [Pinned setuptools build dependency](https://pypi.org/project/setuptools/82.0.1/): release and checksum provenance.
+- [Pinned setuptools build dependency](https://pypi.org/project/setuptools/84.1.0/): release and checksum provenance.
 
 Consulted September 29, 2026. Tool versions used for actual execution are recorded separately in the test report and in each recovery case.
 
@@ -32,3 +32,5 @@ downstream AAC parsing can then infer codec-frame duration instead of the
 container's sample duration. Version 8.0.1 sets packet duration from `tts_data`
 before handling composition offsets. This supports the FFmpeg/ffprobe 8+ runtime
 floor while preserving exact independent packet-timing validation.
+
+The October 30, 2026 build-dependency review checked the pinned setuptools 84.1.0 release against [PyPI release metadata](https://pypi.org/pypi/setuptools/84.1.0/json) and the [upstream changelog](https://setuptools.pypa.io/en/stable/history.html#v84-1-0). The release is not yanked and supports Python 3.10 or newer, which includes VideoRebuild’s Python 3.13+ environments. The wheel and source archive SHA-256 digests are pinned in `requirements-build.txt`; setuptools remains a build dependency only.
