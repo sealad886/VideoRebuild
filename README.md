@@ -17,7 +17,7 @@ python3 videorebuild.pyz doctor
 python3 videorebuild.pyz recover-fragmented --help
 ```
 
-On a Mac, install the runtime yourself with `brew install python@3.13 ffmpeg`. `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and unversioned `ffmpeg` tools when present, resolving Homebrew aliases through `brew --prefix ffmpeg`, then runs the fragmented backend with your arguments. Otherwise it uses Python and FFmpeg from PATH. Both `ffmpeg` and `ffprobe` must be version 8 or newer; `doctor` checks each executable. The launcher never installs or updates dependencies silently.
+On a Mac, install the runtime yourself with `brew install python@3.13 ffmpeg`. `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and unversioned `ffmpeg` tools when present, resolving Homebrew aliases through `brew --prefix ffmpeg`, then runs the fragmented backend with your arguments. It retains the first complete FFmpeg/ffprobe pair accepted by `doctor`, checking `/opt/homebrew` before `/usr/local`; a later installation cannot override a supported pair. Unsupported or incomplete Homebrew pairs leave the original PATH fallback intact. Both `ffmpeg` and `ffprobe` must be version 8 or newer; `doctor` checks each executable. The launcher never installs or updates dependencies silently.
 
 ```bash
 bash ./run-fragmented-macos.command --help

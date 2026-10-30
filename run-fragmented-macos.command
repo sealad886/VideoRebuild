@@ -5,11 +5,6 @@ umask 077
 HERE="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON=''
 for PREFIX in /opt/homebrew /usr/local; do
-  if [[ -x "$PREFIX/bin/brew" ]] && FFMPEG_PREFIX="$("$PREFIX/bin/brew" --prefix ffmpeg 2>/dev/null)"; then
-    if [[ -x "$FFMPEG_PREFIX/bin/ffmpeg" && -x "$FFMPEG_PREFIX/bin/ffprobe" ]]; then
-      export PATH="$FFMPEG_PREFIX/bin:$PATH"
-    fi
-  fi
   if [[ -z "$PYTHON" && -x "$PREFIX/opt/python@3.13/bin/python3.13" ]]; then
     PYTHON="$PREFIX/opt/python@3.13/bin/python3.13"
   fi
@@ -21,4 +16,14 @@ if [[ -z "$PYTHON" ]]; then
   fi
 fi
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "ERROR: Python 3.11+ is required")'
+for PREFIX in /opt/homebrew /usr/local; do
+  if [[ -x "$PREFIX/bin/brew" ]] && FFMPEG_PREFIX="$("$PREFIX/bin/brew" --prefix ffmpeg 2>/dev/null)"; then
+    if [[ -x "$FFMPEG_PREFIX/bin/ffmpeg" && -x "$FFMPEG_PREFIX/bin/ffprobe" ]] &&
+       PATH="$FFMPEG_PREFIX/bin:$PATH" "$PYTHON" "$HERE/videorebuild.pyz" doctor >/dev/null 2>&1; then
+      # Keep the first complete supported pair; failed probes leave PATH intact.
+      export PATH="$FFMPEG_PREFIX/bin:$PATH"
+      break
+    fi
+  fi
+done
 exec "$PYTHON" "$HERE/videorebuild.pyz" recover-fragmented "$@"
