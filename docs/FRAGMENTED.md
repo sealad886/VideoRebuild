@@ -1,5 +1,14 @@
 # Fragmented backend: scope and safety contract
 
+## Runtime
+
+Both FFmpeg and ffprobe must be version 8 or newer. `doctor` rejects either
+executable below this floor before recovery begins. FFmpeg 7.1.5 can report a
+codec-inferred packet duration instead of the MOV container's sample duration
+when composition-time entries are present; FFmpeg 8 records that duration in
+its packet timing data. The independent timing gate remains exact rather than
+accepting a guessed duration. See the [versioned source references](REFERENCES.md).
+
 ## Inputs and identity
 
 The authoritative media source is a regular raw disk-image file, opened read-only. PhotoRec `report.xml` supplies byte locations; recovered `.mp4` headers provide exact comparison bytes. XML byte-run lengths can include sector padding, so comparisons are clipped to the logical `filesize`. For example, a 1,174-byte header mapped over 1,536 bytes is compared using 1,174 bytes, not 1,536.

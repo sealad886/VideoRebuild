@@ -124,6 +124,21 @@ class FragmentedTests(unittest.TestCase):
         p=walk_prefix(self.data,self.init_size); p.starts[1]+=1
         self.assertEqual(validate_prefix(f,self.data,p,self.tools,30)['reason'],'packet_timing_mismatch')
 
+    def test_validator_rejects_incorrect_terminal_sample_duration(self):
+        # No subsequent DTS can expose the final sample's wrong duration.
+        f=self.root/'clip.mp4'; f.write_bytes(self.data)
+        for tid in self.init.tracks:
+            with self.subTest(track=tid):
+                p=walk_prefix(self.data,self.init_size)
+                fi,si=max((fi,si) for fi,frag in enumerate(p.fragments)
+                          for si,sample in enumerate(frag.samples) if sample.track_id==tid)
+                fragment=p.fragments[fi]; samples=list(fragment.samples)
+                samples[si]=replace(samples[si],duration=samples[si].duration+1)
+                p.fragments[fi]=replace(fragment,samples=tuple(samples))
+                checked=validate_prefix(f,self.data,p,self.tools,30)
+                self.assertFalse(checked['ok'],checked)
+                self.assertEqual(checked['reason'],'packet_timing_mismatch')
+
     def test_bframe_timing_with_signed_and_unsigned_composition_offsets(self):
         for codec in ('avc','hevc'):
             for negative in (False,True):
@@ -136,6 +151,16 @@ class FragmentedTests(unittest.TestCase):
                     if negative: self.assertLess(min(offsets),0)
                     checked=validate_prefix(f,data,p,self.tools,30)
                     self.assertTrue(checked['ok'],checked)
+                    # Reordered presentation must not hide the final decode
+                    # sample's duration: no next DTS exists to cross-check it.
+                    fi,si=max((fi,si) for fi,frag in enumerate(p.fragments)
+                              for si,sample in enumerate(frag.samples) if sample.track_id==1)
+                    fragment=p.fragments[fi]; samples=list(fragment.samples)
+                    samples[si]=replace(samples[si],duration=samples[si].duration+1)
+                    p.fragments[fi]=replace(fragment,samples=tuple(samples))
+                    checked=validate_prefix(f,data,p,self.tools,30)
+                    self.assertFalse(checked['ok'],checked)
+                    self.assertEqual(checked['reason'],'packet_timing_mismatch')
 
     def test_nonzero_per_track_tfdt_preserves_packet_timing(self):
         data=bytearray(self.timed)

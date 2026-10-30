@@ -184,3 +184,8 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+
+# Local validation evidence and historical checksum receipts may contain private
+# source paths. Keep them on the operator's machine, outside version control.
+/test-results/
+/SHA256SUMS.txt

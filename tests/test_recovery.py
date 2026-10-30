@@ -13,8 +13,38 @@ from videorebuild.bmff import boxes, parse_movie, rewrite_offsets, FormatError
 from videorebuild.cli import main, report
 from videorebuild.engine import Options, recover
 from videorebuild.storage import Case, ReaderPool, SafetyError, scan, scan_source
-from videorebuild.validate import run_tool
+from videorebuild.validate import doctor, run_tool
 from helpers import generate, movie_from, payload, scatter, sha, split
+
+
+class DoctorTests(unittest.TestCase):
+    def tool_versions(self, ffmpeg_version, ffprobe_version):
+        versions = {'ffmpeg': ffmpeg_version, 'ffprobe': ffprobe_version}
+        def version_result(args, timeout):
+            name = Path(args[0]).name
+            return {'returncode': 0, 'timeout': False, 'stderr': '',
+                    'stdout': f'{name} version {versions[name]} Copyright FFmpeg developers\n'}
+        with patch('videorebuild.validate.shutil.which', side_effect=lambda name: '/tools/'+name), \
+                patch('videorebuild.validate.run_tool', side_effect=version_result):
+            return doctor()
+
+    def test_supported_release_versions(self):
+        for version in ('8.0', '8.0.1-3ubuntu1', 'n8.0.1', '9.0.2', '9.0.2+local'):
+            with self.subTest(version=version):
+                tools = self.tool_versions(version, version)
+                self.assertEqual(set(tools), {'ffmpeg', 'ffprobe'})
+
+    def test_each_tool_requires_version_eight_or_newer(self):
+        for versions in (('7.1.5', '8.0.1'), ('8.0.1', '7.1.5')):
+            with self.subTest(versions=versions):
+                with self.assertRaises(SafetyError):
+                    self.tool_versions(*versions)
+
+    def test_unidentifiable_versions_fail_explicitly(self):
+        for version in ('N-123456-gabcdef', 'unknown', '', '8.invalid'):
+            with self.subTest(version=version):
+                with self.assertRaises(SafetyError):
+                    self.tool_versions(version, version)
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg/ffprobe required for integration tests')
