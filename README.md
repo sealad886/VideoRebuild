@@ -67,7 +67,7 @@ python3 tools/build_zipapp.py
 python3 videorebuild.pyz --version
 ```
 
-`TEST_REPORT.md` records what was actually executed. The current 102-test suite passes on macOS/Apple Silicon with Python 3.11 and 3.13, including execution against the installed wheel and standalone archive. Synthetic fixtures are generated locally, not downloaded. No private surveillance-media fixture is bundled. The source-image backend has not been tested against the user's entire recovery image. Its binary parser has been exercised against the real diagnostic samples separately.
+[`TEST_REPORT.md`](TEST_REPORT.md) records executed validation. The October 16 accuracy audit passed all 118 tests on macOS/Apple Silicon with Python 3.11 and 3.13 source checkouts and the Python 3.13 standalone archive. Installed-wheel execution covered an earlier 102-test snapshot. Nine sampled real recovered prefixes passed fresh original-image byte comparisons, packet hashes, timing checks, and full decoding; this does not validate the entire recovery image or establish complete historical recordings. Synthetic fixtures are generated locally, not downloaded, and no private surveillance-media fixture is bundled. See the [accuracy audit](docs/AUDIT_ACCURACY.md) for scope and limits.
 
 The standalone archive has no Python dependencies. The optional wheel build uses the pinned build requirement in `pyproject.toml`; it is not needed to run the zipapp. FFmpeg performs codec decoding; the Python code implements the narrow recovery/addressing rules.
 
