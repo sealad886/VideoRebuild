@@ -75,10 +75,14 @@ class WorkflowTests(unittest.TestCase):
             original=root/'original.mp4'
             generate(original,seconds=0.5)
             before=original.read_bytes()
-            for flag,value in [('--max-segments','1025'),('--max-record-bytes','1023'),
+            for flag,value in [('--max-segments','0'),('--max-record-bytes','1023'),
                                ('--max-record-bytes',str(256*1024*1024+1))]:
                 case=root/flag.removeprefix('--')/value
                 with self.subTest(flag=flag,value=value):
-                    self.assertEqual(self.invoke('run','--case',str(case),'--input',str(original),flag,value),2)
+                    try:
+                        status = self.invoke('run','--case',str(case),'--input',str(original),flag,value)
+                    except SystemExit as error:
+                        status = error.code
+                    self.assertEqual(status, 2)
                     self.assertFalse(case.exists())
                     self.assertEqual(original.read_bytes(),before)

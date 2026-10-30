@@ -53,9 +53,20 @@ For a PhotoRec run explicitly made in **Free / unallocated-space-only** mode, pr
 python3 videorebuild.pyz run --input /recovery/photorec-free --case /healthy/free-space-case
 ```
 
-This invocation does not scan an image and has no automatic image-scan fallback. The free-space provenance comes from the PhotoRec run’s selection, not from VideoRebuild inferring allocation from filenames. Keep this case separate from a case previously indexed with an unrestricted image.
+This invocation does not scan an image and has no automatic image-scan fallback. The free-space provenance comes from the PhotoRec run’s selection, not from VideoRebuild inferring allocation from filenames. For an already indexed image case, constrain reconstruction with an independently established allocation map as described below; the existing index need not be rebuilt.
 
 Supplying `--image` without `--extents` indexes available bytes across the image, including allocated space. A PhotoRec `--report` verifies header locations but does not restrict that scan to unallocated ranges. A ddrescue map records acquisition/readability, not filesystem allocation. Filesystem `--extents` follow the supplied logical-file mappings and likewise do not establish a free-space-only policy. Do not add these image paths to a free-space-only workflow without evidence that the accessed ranges are unallocated. PhotoRec documents its [unallocated-space-only selection](https://www.cgsecurity.org/testdisk_doc/photorec.html#carve-the-partition-or-unallocated-space-only).
+
+An existing image index can be reused with an image-bound unallocated-range policy:
+
+```bash
+python3 videorebuild.pyz recover --case /healthy/case --deep --retry \
+  --allocation-map /healthy/filesystem-unallocated.json
+```
+
+The policy is schema 1 JSON with `kind: "filesystem-unallocated"` and an `images` array. Each image entry binds its absolute `path`, `size` and previously indexed `sha256`, plus sorted, nonoverlapping `unallocated_ranges` expressed as `[image_byte_offset, length]`. Every indexed physical image must have an entry. Derive these ranges from the filesystem's allocation metadata, with the correct partition and cluster coordinates; gaps between files and ddrescue status are insufficient. The loader checks bindings and geometry, but cannot establish that a supplied bitmap is truthful. See [allocation scope](docs/ARCHITECTURE.md#filesystem-allocation-scope).
+
+This policy gates image reads during reconstruction, including metadata evidence, cached attempts and fragment windows. It intersects acquisition availability without changing source/index rows. Regular recovered files remain eligible; their free-space provenance still comes from their original recovery selection. Historical publications remain historical and are not retrospectively certified by a new policy. Allocated files can serve as independently extracted controls for reconstruction testing; this does not assume damaged filesystem metadata or authorize recovering allocated footage.
 
 ## Cases, limits and reports
 
@@ -67,7 +78,9 @@ python3 videorebuild.pyz recover --case /healthy/case --limit 50
 python3 videorebuild.pyz report --case /healthy/case
 ```
 
-Ordinary MP4 matching can use `--deep` for bounded scattered-sample searches. Fragmented recovery has a default 16-MiB initialization window (`--max-record-bytes`, maximum 256 MiB), a bounded candidate-start count including rejected starts (`--max-segments`, default 64), and per-process validation timeouts. A limit is a search limit, never proof that more media is absent. Recovery may write candidates and publications, so allow space beyond the final encoded media size. No total-case retention quota is provided.
+Ordinary MP4 matching can use `--deep` for scattered-sample searches. Candidate, trailing-padding, hit, assembly, anchor-check and fragmented-start cutoffs are disabled by default. Explicit `--max-candidates`, `--max-padding`, `--max-hits`, `--max-assemblies`, `--max-anchor-checks` and `--max-segments` remain optional search cutoffs; reaching one reports incomplete search rather than proving absence or uniqueness. A whole-payload cutoff does not prevent deep search when no valid candidate has been found. `--max-groups` controls batch capacity without omitting later recordings.
+
+Search hypotheses use private temporary SQLite storage and streaming traversal rather than unbounded in-memory hit combinations. Exhaustive enumeration within the supported model can still take substantial time and temporary disk space. Fragmented recovery searches indexed starts up to the next initialization or source boundary; each section retains a 16-MiB buffer ceiling (`--max-record-bytes`, maximum 256 MiB). Parser/sample bounds, output-size ceilings, disk-space guards and per-process validation timeouts remain enforced. Recovery may write candidates and publications, so allow space beyond the final encoded media size. No total-case retention quota is provided.
 
 Changing source identity, metadata/map binding, coordinate transform or validation settings can require a new case. Completed publications and their evidence are checked before reuse. Old cases require explicit backed-up conversion:
 

@@ -114,7 +114,7 @@ class DeepSearchPerformanceTests(unittest.TestCase):
                     patch.object(engine, 'groups_for', return_value=[group]), \
                     patch.object(engine, 'check_samples', return_value=True), \
                     patch.object(engine, '_group_hash', side_effect=fingerprint), \
-                    patch.object(engine, 'attempt', return_value={'status': 'valid'}), \
+                    patch.object(engine, 'attempt', return_value={'status': 'valid', 'media_sha256': 'synthetic'}), \
                     patch.object(engine, 'finish'):
                 engine.deep_search(SimpleNamespace(), [movie], pool, {}, engine.Options(), 'synthetic')
         self.assertEqual(starts, [0, 1])

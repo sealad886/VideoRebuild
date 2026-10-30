@@ -6,7 +6,7 @@ Canonical `run`/`recover` uses the shared Case, ReaderPool, settings, jobs and r
 
 With `--report`, PhotoRec XML supplies initialization locations and recovered headers provide comparison bytes. Report image size must match the source image. Byte-run sector padding is clipped to logical filesize. Header files must match the image mappings exactly. Bare filenames are resolved beside report.xml's recup_dir; qualified names use explicit recovery-folder/basename components. Filenames do not establish recording identity.
 
-Without PhotoRec, the shared bounded scan discovers ftyp/moov initialization candidates. Each initialization location remains a separate job, including equal header hashes. Windows stop at the next initialization or configured record limit. Repeated headers identify configuration, not unique recordings. Raw-image association is reported as a candidate; explicit logical files retain their filesystem/recovered-file evidence classification.
+Without PhotoRec, the shared bounded scan discovers ftyp/moov initialization candidates. Each initialization location remains a separate job, including equal header hashes. Search stops at the next initialization or source boundary. Each candidate section has a bounded buffer; later indexed starts remain eligible beyond earlier buffers. Repeated headers identify configuration, not unique recordings. Raw-image association is reported as a candidate; explicit logical files retain their filesystem/recovered-file evidence classification.
 
 Image/map/report identities and settings are bound to the case. This is not a full forensic custody ledger or protection against a hostile administrator preserving metadata. Consumed ranges and publications are hashed. Inputs remain read-only.
 
@@ -20,7 +20,7 @@ Every video's length-prefixed NAL layout is checked; 1-, 2- and 4-byte length fi
 
 Within a section, sequences must increment by one and explicit tfdt bases must match accumulated per-track durations. The original-prefix path requires initial sequence 0 or 1; without tfdt it accumulates each track from zero. A later independent section can begin at another sequence, but needs explicit restart decode timing for every declared track. Missing cross-track phase is blocked rather than guessed.
 
-Free/skip boxes between fragments are retained; intact mfra or new ftyp ends a section. An unsupported structure, clock discontinuity or unavailable range stops the current section. Candidate later moofs are independently assessed only within the bounded logical source/window; discovery does not silently join a gap or associate arbitrary orphans across recordings.
+Free/skip boxes between fragments are retained; intact mfra or new ftyp ends a section. An unsupported structure, clock discontinuity or unavailable range stops the current section. Candidate later moofs are independently assessed up to the next initialization or source boundary; discovery does not silently join a gap or associate arbitrary orphans across recordings.
 
 ## Outputs and validation
 
@@ -32,9 +32,9 @@ Manifests separately record acquisition status, association, logical/physical ra
 
 ## Resume, bounds and limits
 
-One shared case lock prevents concurrent writers. Initialization jobs checkpoint after their bounded attempt. Interruption retries uncommitted work; an existing output can be reused only if bytes agree exactly. Completed publications and validation evidence are verified before reuse. Historical migrated evidence retains its original validation scope.
+One shared case lock prevents concurrent writers. Initialization jobs checkpoint after their bounded attempt. Interruption retries uncommitted work; an existing output can be reused only if bytes agree exactly. Completed publications and validation evidence are verified before reuse. Historical migrated evidence retains its original validation scope. Search policy is bound separately from immutable initialization-buffer, tool, version and timeout settings. Expanding a previous finite start cutoff requires `--retry`; a legacy combined binding is backed up and migrated only when its immutable settings match. Retried limited jobs verify and preserve existing publications while searching additional starts.
 
-The record window defaults to 16 MiB and is capped at 256 MiB. Initialization is capped at 1 MiB; moof at 4 MiB. Each fragment and retained prefix have explicit sample budgets (200,000); samples are at most 64 MiB, and NAL counts are capped at 4,096 per sample. The candidate-start attempt limit, including rejected starts, defaults to 64 and is capped at 1,024. Aggregate candidate-media reads are capped at twice the bounded source-window length; prefilter bytes are reused during assembly. Budget stops retain validated clips and report search_limited. Subprocess timeouts and output-spooling bounds remain enforced. Hitting a limit is not proof that later media is absent.
+The per-section buffer defaults to 16 MiB and is capped at 256 MiB. This is not a cumulative read quota or a limit on how far later indexed starts may occur. Initialization is capped at 1 MiB; moof at 4 MiB. Each fragment and retained prefix have explicit sample budgets (200,000); samples are at most 64 MiB, and NAL counts are capped at 4,096 per sample. Candidate starts, including rejected starts, have no default count cutoff; `--max-segments` optionally sets one. Prefilter bytes are reused during assembly. Allocation and acquisition masks split available spans; a section never bridges an excluded span. Budget stops retain validated clips and report search_limited. Subprocess timeouts and output-spooling bounds remain enforced. Hitting a limit is not proof that later media is absent.
 
 Candidate plus publication can consume about twice retained encoded bytes, with additional evidence/log space. There is no total-case quota or automatic retention deletion. Use healthy output storage with capacity for attempted alternatives.
 

@@ -51,18 +51,20 @@ def parser() -> argparse.ArgumentParser:
             q.add_argument('--map-offset', type=int, default=0, help='Explicit image offset minus mapfile input offset in bytes')
         if name in ('recover', 'run'):
             q.add_argument('--deep', action='store_true', help='Search scattered sample-table extents when whole-payload matching fails')
-            q.add_argument('--max-candidates', type=positive_int, default=512, help='Maximum mdat candidates per metadata record (default: 512)')
-            q.add_argument('--max-padding', type=int, default=1024*1024, help='Maximum trailing mdat bytes beyond expected span (default: 1048576)')
+            if name == 'recover':
+                q.add_argument('--allocation-map', type=Path, help='Image-bound filesystem-unallocated JSON policy for an existing index; rejects allocated image reads without reindexing')
+            q.add_argument('--max-candidates', type=positive_int, help='Optional mdat candidate cutoff; default searches every eligible candidate')
+            q.add_argument('--max-padding', type=int, help='Optional trailing mdat-byte cutoff; default has no padding cutoff')
             q.add_argument('--timeout', type=float, default=300, help='Seconds per FFmpeg or ffprobe validation subprocess (default: 300)')
             q.add_argument('--max-output-bytes', type=positive_int, default=16*1024**3, help='Per-candidate output size ceiling; not a total-case quota')
-            q.add_argument('--max-groups', type=positive_int, default=200_000, help='Maximum extent targets per deep-search batch')
-            q.add_argument('--max-hits', type=positive_int, default=32, help='Maximum byte-distinct locations per extent')
-            q.add_argument('--max-assemblies', type=positive_int, default=64, help='Maximum complete extent combinations per recording')
-            q.add_argument('--max-anchor-checks', type=positive_int, default=2_000_000, help='Separate limits for NAL-chain checks and structural anchor checks per deep-search batch')
+            q.add_argument('--max-groups', type=positive_int, default=200_000, help='Extent-group batch capacity; batches do not truncate the search')
+            q.add_argument('--max-hits', type=positive_int, help='Optional byte-distinct location cutoff per extent; default uncapped')
+            q.add_argument('--max-assemblies', type=positive_int, help='Optional assembly cutoff per recording; default uncapped')
+            q.add_argument('--max-anchor-checks', type=positive_int, help='Optional NAL/anchor search cutoff per batch; default uncapped')
             q.add_argument('--limit', type=positive_int, help='Process this many new/invalidated metadata records; omit to process all')
             q.add_argument('--retry', action='store_true', help='Retry nonmatched results under unchanged search settings')
-            q.add_argument('--max-record-bytes', type=positive_int, default=16*1024*1024, help='Fragmented recording window ceiling, at most 256 MiB')
-            q.add_argument('--max-segments', type=positive_int, default=64, help='Maximum candidate starts examined per initialization, including rejected starts')
+            q.add_argument('--max-record-bytes', type=positive_int, default=16*1024*1024, help='Per-fragmented-section buffer ceiling, at most 256 MiB; later indexed starts are still searched')
+            q.add_argument('--max-segments', type=positive_int, help='Optional fragmented-start cutoff per initialization; default searches every indexed start')
     for command in subs.choices.values():
         command.add_argument('--no-progress', action='store_true', default=argparse.SUPPRESS,
                              help='Disable progress feedback; errors and warnings remain visible')

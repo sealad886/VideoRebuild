@@ -328,10 +328,12 @@ class Case:
 
 class ReaderPool:
     """Bounded read-only access to files and logical streams through one path."""
-    def __init__(self, sources: dict[int, dict], limit: int = 32, *, physical_sources=None):
+    def __init__(self, sources: dict[int, dict], limit: int = 32, *, physical_sources=None,
+                 allocation_scope=None):
         if limit < 1:
             raise ValueError('Reader handle limit must be positive')
         self.sources = sources
+        self.allocation_scope = allocation_scope
         self.physical = dict(physical_sources or {})
         self.physical.update({sid:r for sid,r in sources.items() if not r.get('extents')})
         self.limit = limit
@@ -391,7 +393,9 @@ class ReaderPool:
         if sid in self.handles:
             self.handles.move_to_end(sid)
             return self.handles[sid]
-        f = Path(self.physical[sid]['path']).open('rb')
+        # A buffered reader may fetch beyond the permitted extent even when
+        # read() requests only allowed bytes. Keep physical reads exact.
+        f = Path(self.physical[sid]['path']).open('rb', buffering=0)
         # Verify the opened inode too, not only the path checked before open().
         s = os.fstat(f.fileno())
         row = self.physical[sid]
@@ -407,15 +411,31 @@ class ReaderPool:
         if sid not in self.sources or offset < 0 or size < 0 or offset+size > self.sources[sid]['size']:
             raise FormatError('source range exceeds file bounds')
         if sid in self.extents:
-            yield from resolve_extents(self.extents[sid],offset,size)
+            parts = tuple(resolve_extents(self.extents[sid],offset,size))
         elif size:
-            yield Extent(offset,sid,offset,size)
+            parts = (Extent(offset,sid,offset,size),)
+        else:
+            parts = ()
+        # Check the entire request before any caller can consume its first bytes.
+        for e in parts:
+            if self.allocation_scope is not None and self.physical[e.source_id].get('kind') == 'image':
+                self.allocation_scope.require(e.source_id,e.source_offset,e.length)
+            if e.source_id in self.maps:
+                self.maps[e.source_id][0].require_rescued(e.source_offset,e.length)
+        yield from parts
+
+    def permits(self, sid: int, offset: int, size: int) -> bool:
+        """Check availability and allocation policy without opening media bytes."""
+        try:
+            tuple(self._ranges(sid,offset,size))
+        except FormatError:
+            return False
+        self.check(sid)
+        return True
 
     def read(self, sid: int, offset: int, size: int) -> bytes:
         parts = []
         for e in self._ranges(sid,offset,size):
-            if e.source_id in self.maps:
-                self.maps[e.source_id][0].require_rescued(e.source_offset,e.length)
             f = self.handle(e.source_id)
             f.seek(e.source_offset)
             data = f.read(e.length)
@@ -433,7 +453,6 @@ class ReaderPool:
             row = self.physical[e.source_id]
             self._check_identity(row)
             if e.source_id in self.maps:
-                self.maps[e.source_id][0].require_rescued(e.source_offset,e.length)
                 self._check_identity(self.maps[e.source_id][1])
             result.append(dict(logical_offset=e.logical_offset,source_id=e.source_id,
                                source_path=row['path'],source_offset=e.source_offset,length=e.length,
@@ -463,12 +482,19 @@ class ReaderPool:
             else:
                 spans = ((lo,hi-lo),)
             for offset,length in spans:
-                if pending is not None and pending[0]+pending[1] == offset:
-                    pending = (pending[0],pending[1]+length)
+                if self.allocation_scope is not None and self.physical[e.source_id].get('kind') == 'image':
+                    at = e.source_offset+offset-e.logical_offset
+                    allowed = ((e.logical_offset+position-e.source_offset, count)
+                               for position,count in self.allocation_scope.ranges(e.source_id,at,at+length))
                 else:
-                    if pending is not None:
-                        yield pending
-                    pending = (offset,length)
+                    allowed = ((offset,length),)
+                for position,count in allowed:
+                    if pending is not None and pending[0]+pending[1] == position:
+                        pending = (pending[0],pending[1]+count)
+                    else:
+                        if pending is not None:
+                            yield pending
+                        pending = (position,count)
         if pending is not None:
             yield pending
 

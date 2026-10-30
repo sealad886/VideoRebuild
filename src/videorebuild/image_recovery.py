@@ -195,7 +195,10 @@ def _initializations(case, pool, discovery_task):
             boundary = int(following[0]) if following is not None else source['size']
             previous = following
             try:
-                head = pool.read(sid, current, min(16, boundary-current))
+                head_size = min(16, boundary-current)
+                if not pool.permits(sid, current, head_size):
+                    continue
+                head = pool.read(sid, current, head_size)
                 # box_at deliberately checks lengths; use the small header only to
                 # bound the subsequent source read, never to accept a whole box.
                 ftyp_size = int.from_bytes(head[:4], 'big')
@@ -203,12 +206,18 @@ def _initializations(case, pool, discovery_task):
                     ftyp_size = int.from_bytes(head[8:16], 'big')
                 if head[4:8] != b'ftyp' or not 8 <= ftyp_size <= 4096:
                     continue
-                moov_head = pool.read(sid, current+ftyp_size, min(16, boundary-current-ftyp_size))
+                moov_at = current+ftyp_size
+                moov_head_size = min(16, boundary-moov_at)
+                if moov_head_size <= 0 or not pool.permits(sid, moov_at, moov_head_size):
+                    continue
+                moov_head = pool.read(sid, moov_at, moov_head_size)
                 moov_size = int.from_bytes(moov_head[:4], 'big')
                 if moov_size == 1:
                     moov_size = int.from_bytes(moov_head[8:16], 'big')
                 size = ftyp_size+moov_size
                 if moov_head[4:8] != b'moov' or not ftyp_size+8 <= size <= MAX_INIT or current+size > boundary:
+                    continue
+                if not pool.permits(sid, current, size):
                     continue
                 data = pool.read(sid, current, size)
                 init = parse_initialization(data)
@@ -251,8 +260,48 @@ def check_options(options) -> None:
     """Validate fragmented recovery policy before any case or output mutation."""
     if not 1024 <= options.max_record_bytes <= 256*1024*1024:
         raise SafetyError('--max-record-bytes must be between 1024 and 268435456')
-    if not 1 <= options.max_segments <= 1024:
-        raise SafetyError('--max-segments must be between 1 and 1024')
+    if options.max_segments is not None and (isinstance(options.max_segments, bool) or
+            not isinstance(options.max_segments, int) or options.max_segments <= 0):
+        raise SafetyError('--max-segments must be a positive integer when supplied')
+
+
+def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> bool:
+    """Keep evidence settings immutable; permit explicit search expansion on retry."""
+    immutable = {'version': __version__, 'max_record_bytes': options.max_record_bytes,
+                 'timeout': options.timeout, 'tools': tools}
+    policy = {'max_segments': options.max_segments, 'indexed_starts': 'through_next_initialization',
+              'allocation_scope': allocation_scope}
+    row = case.db.execute("SELECT value FROM settings WHERE name='fragmented_settings'").fetchone()
+    prior = json.loads(row[0]) if row else None
+    legacy = prior is not None and 'max_segments' in prior
+    old_policy_row = case.db.execute("SELECT value FROM settings WHERE name='fragmented_search_policy'").fetchone()
+    old_policy = json.loads(old_policy_row[0]) if old_policy_row else None
+    if legacy:
+        old_policy = {'max_segments': prior['max_segments'], 'indexed_starts': 'bounded_record_window'}
+        prior = {key: value for key, value in prior.items() if key != 'max_segments'}
+    if prior is not None and prior != immutable:
+        raise SafetyError('Case settings changed for fragmented_settings; use a new case')
+    changed = old_policy is not None and old_policy != policy
+    if changed:
+        old_limit = old_policy['max_segments']
+        expanded = (options.max_segments is None or
+                    old_limit is not None and options.max_segments >= old_limit)
+        if not retry or not expanded:
+            raise SafetyError('Fragmented search policy changed; expand it with --retry or use a new case')
+    if legacy or changed:
+        backup = case.root/'work'/('fragmented-settings-'+uuid.uuid4().hex+'.json')
+        write_json(backup, {'fragmented_settings': json.loads(row[0]),
+                            'fragmented_search_policy': old_policy})
+        case.db.execute('UPDATE settings SET value=? WHERE name=?',
+                        (json.dumps(immutable, sort_keys=True, separators=(',', ':')), 'fragmented_settings'))
+        case.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',
+                        ('fragmented_search_policy', json.dumps(policy, sort_keys=True, separators=(',', ':'))))
+        case.event('fragmented_search_policy_expanded', {'before': old_policy, 'after': policy,
+                                                       'backup': str(backup.relative_to(case.root))})
+    else:
+        case.bind('fragmented_settings', immutable)
+        case.bind('fragmented_search_policy', policy)
+    return changed
 
 
 def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool = False) -> int:
@@ -266,24 +315,43 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
     max_segments = options.max_segments
     timeout = options.timeout
     check_options(options)
-    case.bind('fragmented_settings', {'version': __version__, 'max_record_bytes': max_bytes,
-                                    'max_segments': max_segments, 'timeout': timeout, 'tools': tools})
     verify_completed(case)
+    allocation_scope = pool.allocation_scope.digest if pool.allocation_scope is not None else None
+    policy_changed = _bind_search_policy(case, tools, options, retry, allocation_scope)
+    search_policy = {'max_segments': max_segments, 'indexed_starts': 'through_next_initialization',
+                     'allocation_scope': allocation_scope}
+    if policy_changed:
+        for saved in case.get_jobs('fragmented'):
+            prior = saved['detail']
+            previous_scope = prior.get('search_policy', {}).get('allocation_scope')
+            if prior.get('outputs') and previous_scope != allocation_scope:
+                # The scope may exclude the initialization entirely, so retain
+                # this distinction even when discovery cannot revisit the job.
+                prior['historical_allocation_scope'] = previous_scope
+                prior['current_allocation_scope'] = allocation_scope
+                prior['historical_outputs'] = list(prior['outputs'])
+                for segment in prior.get('segments', []):
+                    segment.setdefault('allocation_scope', previous_scope)
+                case.result(saved['key'], saved['status'], prior, kind='fragmented')
     processed = 0
     with phase('Fragmented initialization locations examined', unit='candidates') as discovery_task, phase('Fragmented jobs visited', unit='jobs') as job_task:
         for sid, source, offset, boundary, init in _initializations(case, pool, discovery_task):
             job_task.advance()
             key = f'{sid}:{offset}'
             old = case.job('fragmented', key)
-            if old is not None and (not retry or old['detail'].get('outputs')):
+            job_policy_changed = (old is not None and not old['detail'].get('historical_validation') and
+                                  old['detail'].get('search_policy') != search_policy)
+            if old is not None and not (policy_changed or job_policy_changed or retry and
+                    (old['status'] == 'search_limited' or not old['detail'].get('outputs'))):
                 continue
             if limit is not None and processed >= limit:
                 break
-            end = min(boundary, offset+max_bytes)
+            end = boundary
             init_end = offset+len(init.data)
-            if end <= init_end:
+            if end <= init_end or max_bytes <= len(init.data):
                 case.result(key, 'search_limited', {'source_id': sid, 'logical_offset': offset,
-                            'reason': 'record_window_excludes_media', 'outputs': []}, kind='fragmented')
+                            'reason': 'record_window_excludes_media', 'outputs': [],
+                            'search_policy': search_policy}, kind='fragmented')
                 processed += 1
                 continue
             pool.check(sid)
@@ -292,24 +360,30 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             association = ('raw_image_candidate' if source['kind'] == 'image' else
                            'filesystem_metadata' if source['kind'] == 'logical' else 'recovered_file')
             detail = {'source_id': sid, 'logical_offset': offset, 'initialization_sha256': init.sha256,
-                      'association': association, 'window_end': end, 'next_initialization': boundary,
+                      'association': association, 'window_end': min(end, offset+max_bytes),
+                      'search_end': end, 'next_initialization': boundary,
                       'tracks': {str(k): asdict(v) for k, v in init.tracks.items()},
                       'outputs': [], 'output_evidence': [], 'segments': [], 'gaps': [],
                       'timing_note': 'Decode times are media ticks, not wall-clock dates.'}
-            read_budget = 2*(end-offset)
+            # Existing validated clips are immutable. Retry searches uncovered
+            # starts without replacing a previously published bounded section.
+            if old is not None and old['detail'].get('outputs'):
+                for name in ('outputs', 'output_evidence', 'segments', 'gaps'):
+                    detail[name] = list(old['detail'].get(name, []))
+                for name in ('historical_allocation_scope', 'current_allocation_scope', 'historical_outputs'):
+                    if name in old['detail']:
+                        detail[name] = old['detail'][name]
+            published = iter(sorted((segment['logical_start'], segment['logical_end'])
+                                   for segment in detail['segments'] if segment.get('output')))
+            published_range = next(published, None)
             read_bytes = 0
-
-            class ReadBudgetExceeded(Exception):
-                pass
 
             def read_section(at: int, size: int) -> bytes:
                 nonlocal read_bytes
-                if size < 0:
-                    raise FormatError('negative_section_read')
-                if read_bytes+size > read_budget:
-                    raise ReadBudgetExceeded
-                read_bytes += size
+                if size < 0 or size > max_bytes-len(init.data):
+                    raise FormatError('invalid_section_read_size')
                 raw = pool.read(sid, at, size)
+                read_bytes += size
                 section_task.heartbeat(read_bytes=read_bytes, starts_considered=considered)
                 return raw
 
@@ -320,6 +394,11 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             considered = 0
             with phase('Fragmented section starts considered', unit='candidates') as section_task:
                 for start in _candidate_starts(case, sid, init_end, end):
+                    while published_range is not None and published_range[1] <= start:
+                        published_range = next(published, None)
+                    if published_range is not None and published_range[0] <= start < published_range[1]:
+                        consumed = max(consumed, published_range[1])
+                        continue
                     if start < consumed:
                         continue
                     while interval is not None and interval[0]+interval[1] <= start:
@@ -329,14 +408,14 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     if start < interval[0]:
                         detail['gaps'].append({'start': start, 'end': interval[0], 'reason': 'unavailable_source_bytes'})
                         continue
-                    if considered >= max_segments:
+                    if max_segments is not None and considered >= max_segments:
                         detail['limit_reason'] = 'segment_attempt_budget'
                         break
                     # Count malformed and non-IDR starts before any prefilter read.
                     considered += 1
                     section_task.update(considered, read_bytes=read_bytes)
                     pair_data = b''
-                    readable_end = min(end, interval[0]+interval[1])
+                    readable_end = min(end, interval[0]+interval[1], start+max_bytes-len(init.data))
                     later = start != init_end
                     if later:
                         # Reject non-random-access starts using one bounded pair before
@@ -359,16 +438,9 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                             first = parse_fragment(pair_data, 0, init)
                             if not _restart_is_idr(first, init):
                                 continue
-                        except ReadBudgetExceeded:
-                            detail['limit_reason'] = 'segment_read_byte_budget'
-                            break
                         except (FormatError, struct.error):
                             continue
-                    try:
-                        payload = pair_data+read_section(start+len(pair_data), readable_end-start-len(pair_data))
-                    except ReadBudgetExceeded:
-                        detail['limit_reason'] = 'segment_read_byte_budget'
-                        break
+                    payload = pair_data+read_section(start+len(pair_data), readable_end-start-len(pair_data))
                     data = init.data+payload
                     prefix = walk_prefix(data, len(init.data), allow_later_start=later)
                     if (not later and not prefix.fragments and
@@ -380,6 +452,9 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     segment = {'logical_start': start, 'logical_end': start+prefix.end-len(init.data),
                                'stop_reason': prefix.stop_reason, 'fragment_count': len(prefix.fragments),
                                'sample_counts': prefix.counts, 'later_section': later,
+                               'allocation_scope': allocation_scope,
+                               'read_window_end': readable_end,
+                               'window_limited': readable_end < min(end, interval[0]+interval[1]),
                                'source_ranges': pool.provenance(sid, offset, len(init.data)),
                                'starts': prefix.starts}
                     error = prefix.eligibility_error()
@@ -449,7 +524,8 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             pool.check(sid)
             detail['candidate_starts_considered'] = considered
             detail['media_read_bytes_charged'] = read_bytes
-            detail['media_read_byte_budget'] = read_budget
+            detail['section_window_bytes'] = max_bytes
+            detail['search_policy'] = search_policy
             if detail.get('limit_reason'):
                 status = 'search_limited'
             elif detail['outputs']:

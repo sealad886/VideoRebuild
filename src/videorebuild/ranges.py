@@ -6,6 +6,8 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import hashlib
+import json
 import re
 import stat
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -20,6 +22,92 @@ _DFXML_NS = 'http://www.forensicswiki.org/wiki/Category:Digital_Forensics_XML'
 
 class UnavailableRange(FormatError):
     """Requested bytes are unmapped or not reported as rescued."""
+
+
+class AllocationScope:
+    """Validated unallocated physical image ranges, bound to indexed evidence."""
+    def __init__(self, ranges: Mapping[int, Sequence[tuple[int, int]]], digest: str):
+        self._ranges = {sid: tuple(values) for sid, values in ranges.items()}
+        self.digest = digest
+
+    def ranges(self, sid: int, start: int, end: int) -> Iterator[tuple[int, int]]:
+        if sid not in self._ranges:
+            raise UnavailableRange('image_missing_from_allocation_scope')
+        values = self._ranges[sid]
+        index = max(0, bisect_right(values, start, key=lambda item: item[0])-1)
+        while index < len(values):
+            offset, length = values[index]
+            if offset >= end:
+                break
+            lo, hi = max(start, offset), min(end, offset+length)
+            if hi > lo:
+                yield lo, hi-lo
+            index += 1
+
+    def require(self, sid: int, offset: int, length: int) -> None:
+        _integer(offset, 'read_offset')
+        _integer(length, 'read_length')
+        cursor = offset
+        for start, count in self.ranges(sid, offset, offset+length):
+            if start != cursor:
+                break
+            cursor += count
+        if cursor != offset+length:
+            raise UnavailableRange(f'image_range_not_unallocated_at_{cursor}')
+
+
+def load_allocation_scope(path: Path, physical_sources: Mapping[int, dict]) -> AllocationScope:
+    """Load explicit allocation evidence without reading or rehashing image bytes."""
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError, UnicodeError) as error:
+        raise FormatError('invalid_allocation_scope_json') from error
+    if (not isinstance(value, dict) or type(value.get('schema')) is not int or
+            value['schema'] != 1 or value.get('kind') != 'filesystem-unallocated' or
+            not isinstance(value.get('images'), list)):
+        raise FormatError('invalid_allocation_scope_schema')
+    images = {str(Path(row['path']).expanduser().resolve()): (sid, row)
+              for sid, row in physical_sources.items() if row.get('kind') == 'image'}
+    ranges = {}
+    canonical = []
+    for entry in value['images']:
+        if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+            raise FormatError('invalid_allocation_image')
+        supplied = Path(entry['path']).expanduser()
+        normalized = str(supplied.resolve())
+        if not supplied.is_absolute() or normalized not in images:
+            raise FormatError('allocation_image_not_indexed')
+        sid, row = images[normalized]
+        if sid in ranges:
+            raise FormatError('duplicate_allocation_image')
+        size = _integer(entry.get('size'), 'allocation_image_size')
+        digest = entry.get('sha256')
+        if (size != row['size'] or not isinstance(digest, str) or
+                re.fullmatch('[0-9a-f]{64}', digest) is None or digest != row.get('sha256')):
+            raise FormatError('allocation_image_binding_mismatch')
+        values = entry.get('unallocated_ranges')
+        if not isinstance(values, list):
+            raise FormatError('invalid_unallocated_ranges')
+        previous_end = 0
+        validated = []
+        for item in values:
+            if not isinstance(item, list) or len(item) != 2:
+                raise FormatError('invalid_unallocated_range')
+            offset = _integer(item[0], 'allocation_offset')
+            length = _integer(item[1], 'allocation_length', positive=True)
+            if offset < previous_end or offset+length > size:
+                raise FormatError('overlapping_or_out_of_bounds_unallocated_range')
+            previous_end = offset+length
+            validated.append((offset, length))
+        ranges[sid] = validated
+        canonical.append(dict(path=normalized, size=size, sha256=digest,
+                              unallocated_ranges=validated))
+    if set(ranges) != {sid for sid, _ in images.values()}:
+        raise FormatError('image_missing_from_allocation_scope')
+    encoded = json.dumps({'schema': 1, 'kind': 'filesystem-unallocated',
+                          'images': sorted(canonical, key=lambda item: item['path'])},
+                         sort_keys=True, separators=(',', ':')).encode()
+    return AllocationScope(ranges, hashlib.sha256(encoded).hexdigest())
 
 
 @dataclass(frozen=True)

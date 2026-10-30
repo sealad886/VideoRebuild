@@ -8,7 +8,7 @@ import re
 
 from .progress import phase
 from .engine import Options, recover
-from .ranges import Extent, iter_dfxml
+from .ranges import Extent, iter_dfxml, load_allocation_scope
 from .storage import Case, ReaderPool, SafetyError, file_sha256, input_files, regular, scan_logical
 from .validate import doctor
 
@@ -167,10 +167,15 @@ def intake(case: Case, args) -> None:
 def reconstruct(case: Case, args) -> None:
     from .image_recovery import recover_fragmented
     fields = {name: getattr(args, name) for name in Options.__dataclass_fields__}
+    policy_path = getattr(args, 'allocation_map', None)
+    allocation_scope = load_allocation_scope(policy_path, case.physical_sources()) if policy_path else None
+    if allocation_scope is not None:
+        case.event('recovery_allocation_scope', {'policy_sha256': allocation_scope.digest,
+                   'policy_path': str(policy_path.expanduser().resolve()), 'kind': 'filesystem-unallocated'})
     with phase('Reconstructing ordinary MP4 recordings', total=1, unit='strategies') as task:
-        recover(case, Options(**fields), args.limit, args.retry)
+        recover(case, Options(**fields), args.limit, args.retry, allocation_scope=allocation_scope)
         task.advance()
     tools = doctor()
-    with phase('Reconstructing fragmented MP4 recordings', total=1, unit='strategies') as task, ReaderPool(case.sources(), physical_sources=case.physical_sources()) as pool:
+    with phase('Reconstructing fragmented MP4 recordings', total=1, unit='strategies') as task, ReaderPool(case.sources(), physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool:
         recover_fragmented(case, pool, tools, args, args.limit, args.retry)
         task.advance()

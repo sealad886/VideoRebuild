@@ -488,7 +488,7 @@ class FragmentedTests(unittest.TestCase):
         self.assertFalse((self.root/'case/blocked-windows').exists())
         self.assertFalse(list((self.root/'case/reconstructed').glob('*.mp4')))
 
-    def test_malformed_restart_candidates_cannot_bypass_work_budgets(self):
+    def test_malformed_restart_candidates_respect_explicit_start_limit(self):
         from types import SimpleNamespace
         from fragmented_helpers import full
         from videorebuild.image_recovery import recover_fragmented
@@ -509,10 +509,10 @@ class FragmentedTests(unittest.TestCase):
                     scan_logical(case,case.register_source(image,'image'))
                     options=SimpleNamespace(max_record_bytes=16*1024*1024,max_segments=limit,timeout=1,max_output_bytes=16*1024*1024)
                     with ReaderPool(case.sources(),physical_sources=case.physical_sources()) as pool:
-                        original=pool.read; requested=0
+                        original=pool.read; largest=0
                         def observed(sid,offset,size):
-                            nonlocal requested
-                            requested+=size
+                            nonlocal largest
+                            largest=max(largest,size)
                             return original(sid,offset,size)
                         with patch.object(pool,'read',side_effect=observed),patch('videorebuild.image_recovery.validate_prefix') as validator:
                             recover_fragmented(case,pool,{},options)
@@ -521,10 +521,10 @@ class FragmentedTests(unittest.TestCase):
                     detail=job['detail']
                     self.assertEqual(job['status'],'search_limited')
                     self.assertLessEqual(detail['candidate_starts_considered'],limit)
-                    self.assertLessEqual(detail['media_read_bytes_charged'],detail['media_read_byte_budget'])
-                    self.assertLessEqual(requested,2*image.stat().st_size+len(init)+32)
+                    self.assertLessEqual(largest,options.max_record_bytes)
+                    self.assertGreater(detail['media_read_bytes_charged'],0)
                     self.assertFalse(detail['outputs'])
-                    self.assertIn(detail['limit_reason'],('segment_attempt_budget','segment_read_byte_budget'))
+                    self.assertEqual(detail['limit_reason'],'segment_attempt_budget')
 
     def test_search_limit_retains_already_validated_prefix(self):
         source=self.root/'source.mp4'
@@ -557,9 +557,9 @@ class FragmentedTests(unittest.TestCase):
         self.assertEqual(jobs[0]['status'],'search_limited')
         self.assertEqual(jobs[0]['detail']['reason'],'segment_attempt_budget')
 
-    def test_segment_budget_is_explicit(self):
+    def test_explicit_segment_limit_has_no_arbitrary_upper_ceiling(self):
         args,_,_,_=self.arguments()
-        self.assertEqual(self.cli(args+['--max-segments','1025']),2)
+        self.assertEqual(self.cli(args+['--max-segments','1025']),0)
 
 
 if __name__=='__main__': unittest.main()
