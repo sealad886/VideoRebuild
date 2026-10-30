@@ -99,6 +99,33 @@ class StorageTests(unittest.TestCase):
                     target.write_bytes(data)
                     self.assertEqual(file_sha256(target), hashlib.sha256(data).hexdigest())
 
+    def test_failed_private_json_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'report.json'
+            with self.assertRaises(TypeError):
+                create_private_json(target, {'partial': 1, 'unsupported': object()})
+            self.assertFalse(target.exists())
+            with patch('videorebuild.storage.os.fsync', side_effect=OSError('disk failure')):
+                with self.assertRaises(OSError):
+                    create_private_json(target, {'partial': 1})
+            self.assertFalse(target.exists())
+            create_private_json(target, {'complete': True})
+            self.assertEqual(json.loads(target.read_text()), {'complete': True})
+
+    def test_private_json_failure_preserves_replacement_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'report.json'
+
+            def replace_then_fail(fd):
+                target.unlink()
+                target.write_bytes(b'unrelated replacement')
+                raise OSError('disk failure')
+
+            with patch('videorebuild.storage.os.fsync', side_effect=replace_then_fail):
+                with self.assertRaises(OSError):
+                    create_private_json(target, {'partial': 1})
+            self.assertEqual(target.read_bytes(), b'unrelated replacement')
+
     def test_new_case_private_existing_case_permissions_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

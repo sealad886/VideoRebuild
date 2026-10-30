@@ -60,10 +60,21 @@ def write_json(path: Path, value: object) -> None:
 def create_private_json(path: Path, value: object) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(value, f, indent=2, sort_keys=True, ensure_ascii=True)
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
+        created = os.fstat(f.fileno())
+        try:
+            json.dump(value, f, indent=2, sort_keys=True, ensure_ascii=True)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        except BaseException:
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    path.unlink(missing_ok=True)
+            raise
 
 
 def file_sha256(path: Path) -> str:
