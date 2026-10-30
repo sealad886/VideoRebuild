@@ -35,3 +35,7 @@ Older schema/case layouts require explicit migration with a verified local SQLit
 ## Evidence and limitations
 
 Tests use generated media and disposable disk images, including noncontiguous mappings and unavailable ranges. Performance checks must distinguish interval lookup, mapping import, scan, validation subprocess and report costs. Passing synthetic fixtures does not establish original-image yield, all filesystem support, historical identity or wall-clock chronology. TEST_REPORT.md and the implementation plan record actual checks and unresolved gates.
+
+## Progress reporting
+
+`progress.py` owns command-scoped feedback shared by intake, scanning, recovery, validation, report generation, migration and tools. Library calls remain silent unless a reporting session is active. Phases report observed work with optional known totals; unknown discovery totals and opaque decoder waits never acquire artificial percentages. Updates are throttled, streamed on stderr, and mirrored into case logs without changing machine results. Terminal phase states distinguish return, failure and interruption. Progress does not alter transaction boundaries, source reads, reconstruction decisions or search limits. Source labels distinguish recovered-file processing from allocation-unfiltered image indexing; availability maps do not establish filesystem-free space.

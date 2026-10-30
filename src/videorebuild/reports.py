@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 import time
 
 from . import __version__
+from .progress import phase
 from .storage import Case, atomic_text, write_json
 
 
@@ -32,29 +33,35 @@ def report(case: Case) -> dict:
                 'warnings': ['Decoded media and byte preservation do not establish historical recording identity.',
                              'Unrescued and unmapped byte ranges are unavailable; absent acquisition evidence is unknown.',
                              'Later segments are separate clips; missing frames and wall-clock chronology are not inferred.']}
-    write_json(case.root/'reports'/'summary.json', overview)
-    with atomic_text(case.root/'reports'/'results.json') as stream:
+    with phase('Writing summary report', total=1, unit='files') as task:
+        write_json(case.root/'reports'/'summary.json', overview)
+        task.advance()
+    with phase('Writing JSON catalogue', total=overview['processed']+source[0], unit='records') as task, atomic_text(case.root/'reports'/'results.json') as stream:
         stream.write('{"summary":'+json.dumps(overview)+',"jobs":[')
         for index, job in enumerate(case.get_jobs()):
             if index:
                 stream.write(',')
             json.dump(job, stream)
+            task.advance()
         stream.write('],"sources":[')
         for index, row in enumerate(case.db.execute('SELECT * FROM sources ORDER BY id')):
             if index:
                 stream.write(',')
             json.dump(dict(row), stream)
+            task.advance()
         stream.write(']}\n')
-    with atomic_text(case.root/'reports'/'intake-issues.jsonl') as stream:
+    with phase('Writing intake issues', unit='records') as task, atomic_text(case.root/'reports'/'intake-issues.jsonl') as stream:
         for row in case.db.execute("SELECT detail FROM events WHERE kind='blocked_mapping' ORDER BY id"):
             stream.write(row['detail']+'\n')
-    with atomic_text(case.root/'reports'/'results.csv') as stream:
+            task.advance()
+    with phase('Writing CSV catalogue', total=overview['processed'], unit='jobs') as task, atomic_text(case.root/'reports'/'results.csv') as stream:
         writer = csv.writer(stream)
         writer.writerow(['kind', 'key', 'status', 'outputs', 'reason'])
         for job in case.get_jobs():
             writer.writerow([job['kind'], job['key'], job['status'], ';'.join(_outputs(job['detail'])),
                              job['detail'].get('reason', '')])
-    with atomic_text(case.root/'reports'/'index.html') as stream:
+            task.advance()
+    with phase('Writing HTML catalogue', total=overview['processed'], unit='jobs') as task, atomic_text(case.root/'reports'/'index.html') as stream:
         stream.write('<!doctype html><html lang="en"><meta charset="utf-8">'
                      '<meta name="viewport" content="width=device-width"><title>VideoRebuild case</title>'
                      '<style>body{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:1rem}'
@@ -70,5 +77,6 @@ def report(case: Case) -> dict:
             stream.write('<tr><td><code>'+html.escape(job['kind']+':'+job['key'])+'</code></td><td>'+
                          html.escape(job['status'])+'</td><td>'+links+'</td><td>'+
                          html.escape(str(detail.get('reason', '')))+'</td></tr>')
+            task.advance()
         stream.write('</tbody></table><p>See results.json for acquisition, association, validation and byte provenance.</p></html>\n')
     return overview

@@ -41,6 +41,22 @@ Fiwalk is optional external tooling, not a Python dependency. Its exit code alon
 
 A mapfile qualifies only mapped image bytes. `+` means reported rescued; other map states and uncovered regions are unavailable. Without a mapfile acquisition status is unknown. If acquisition used different input/output positions, supply `--map-offset DELTA`, where image position = mapfile position + DELTA. Never infer this transform from filenames or file contents.
 
+## Progress and recovery scope
+
+Commands and diagnostic tools report operation phases on stderr, including actual work counters, elapsed time, and throttled updates. Byte operations show throughput and an estimated remaining time when their total is known. Decoder waits report elapsed activity without an invented percentage. Finished, failed, and interrupted phases are distinct; finishing a phase does not mean every recording was recovered or historically identified. Progress is also recorded in a case’s `run.log`.
+
+Use `--no-progress` to suppress progress feedback; warnings and errors remain visible. The option works before or after a CLI subcommand and on the diagnostic/build tools. Stdout result formats and JSON report schemas are unchanged. Progress uses newline records even when redirected, with no terminal escape animation.
+
+For a PhotoRec run explicitly made in **Free / unallocated-space-only** mode, process its exported files as the working set:
+
+```bash
+python3 videorebuild.pyz run --input /recovery/photorec-free --case /healthy/free-space-case
+```
+
+This invocation does not scan an image and has no automatic image-scan fallback. The free-space provenance comes from the PhotoRec run’s selection, not from VideoRebuild inferring allocation from filenames. Keep this case separate from a case previously indexed with an unrestricted image.
+
+Supplying `--image` without `--extents` indexes available bytes across the image, including allocated space. A PhotoRec `--report` verifies header locations but does not restrict that scan to unallocated ranges. A ddrescue map records acquisition/readability, not filesystem allocation. Filesystem `--extents` follow the supplied logical-file mappings and likewise do not establish a free-space-only policy. Do not add these image paths to a free-space-only workflow without evidence that the accessed ranges are unallocated. PhotoRec documents its [unallocated-space-only selection](https://www.cgsecurity.org/testdisk_doc/photorec.html#carve-the-partition-or-unallocated-space-only).
+
 ## Cases, limits and reports
 
 `scan` performs intake/indexing only. `recover --case …` resumes an indexed case. `report --case …` refreshes local JSON, CSV and HTML reports. The main report is `CASE/reports/index.html`; `results.json` contains typed jobs and provenance. See `--help` for complete options.

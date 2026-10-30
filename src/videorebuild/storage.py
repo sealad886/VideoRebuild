@@ -18,6 +18,7 @@ import tempfile
 import time
 from typing import Iterator, TextIO
 
+from .progress import phase
 from .bmff import MAX_METADATA, FormatError, boxes, parse_movie
 from .ranges import Extent, RescueMap, UnavailableRange, resolve_extents, validate_extents
 
@@ -82,9 +83,12 @@ def create_private_json(path: Path, value: object) -> None:
 
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open('rb') as f:
+    with phase('Hashing '+path.name, total=path.stat().st_size, unit='bytes') as task, path.open('rb') as f:
+        completed = 0
         while data := f.read(1024 * 1024):
             digest.update(data)
+            completed += len(data)
+            task.update(completed)
     return digest.hexdigest()
 
 
@@ -486,37 +490,46 @@ class ReaderPool:
 
 
 def input_files(roots: list[Path], case_root: Path, all_files: bool) -> Iterator[Path]:
-    seen = set()
-    for root in roots:
-        root = root.expanduser().resolve()
-        if not root.exists():
-            raise SafetyError(f'Input does not exist: {root}')
-        if root.is_dir():
-            if within(case_root, root) or within(root, case_root):
-                raise SafetyError('Case and input directories must not contain one another')
-            def onerror(error: OSError) -> None:
-                raise SafetyError(f'Cannot enumerate input directory: {error}') from error
-            def walk_paths():
-                for folder, dirs, names in os.walk(root, followlinks=False, onerror=onerror):
-                    dirs.sort()
-                    for name in sorted(names):
-                        yield Path(folder)/name
-            paths = walk_paths()
-        else:
-            paths = iter([root])
-        for p in paths:
-            if p.is_symlink():
-                LOG.warning('Skipping symlink: %s', p)
-                continue
-            if not all_files and root.is_dir() and p.suffix.lower() not in EXTENSIONS:
-                continue
-            p = p.resolve()
-            if within(p, case_root):
-                raise SafetyError('An input is inside the case directory')
-            regular(p)
-            if str(p) not in seen:
-                seen.add(str(p))
-                yield p
+    with phase('Discovering recovered files', unit='files') as task:
+        seen = set()
+        discovered = skipped = 0
+        for root in roots:
+            root = root.expanduser().resolve()
+            if not root.exists():
+                raise SafetyError(f'Input does not exist: {root}')
+            if root.is_dir():
+                if within(case_root, root) or within(root, case_root):
+                    raise SafetyError('Case and input directories must not contain one another')
+                def onerror(error: OSError) -> None:
+                    raise SafetyError(f'Cannot enumerate input directory: {error}') from error
+                def walk_paths():
+                    for folder, dirs, names in os.walk(root, followlinks=False, onerror=onerror):
+                        dirs.sort()
+                        for name in sorted(names):
+                            yield Path(folder)/name
+                paths = walk_paths()
+            else:
+                paths = iter([root])
+            for p in paths:
+                discovered += 1
+                if discovered % 256 == 0:
+                    task.heartbeat(discovered=discovered, skipped=skipped)
+                if p.is_symlink():
+                    LOG.warning('Skipping symlink: %s', p)
+                    skipped += 1
+                    continue
+                if not all_files and root.is_dir() and p.suffix.lower() not in EXTENSIONS:
+                    skipped += 1
+                    continue
+                p = p.resolve()
+                if within(p, case_root):
+                    raise SafetyError('An input is inside the case directory')
+                regular(p)
+                if str(p) not in seen:
+                    seen.add(str(p))
+                    task.advance(detail=p.name, discovered=discovered, skipped=skipped)
+                    yield p
+        task.heartbeat(discovered=discovered, skipped=skipped)
 
 
 def _candidate_header(read, offset: int, size: int) -> tuple[int, bytes, int] | None:
@@ -554,81 +567,82 @@ def scan_logical(case: Case, sid: int) -> None:
                 raise SafetyError('Logical stream references an unavailable physical source')
             physical[source_id] = dict(source)
     if row['complete']:
-        with ReaderPool(sources,physical_sources=physical) as pool:
+        with phase('Verifying indexed source', total=1, unit='files') as task, ReaderPool(sources,physical_sources=physical) as pool:
             pool.check(sid)
+            task.advance(detail=Path(row['path']).name)
         LOG.info('Already indexed: %s',row['path'])
         return
     case.db.execute('DELETE FROM atoms WHERE source_id=?',(sid,))
     case.db.commit()
     digest = hashlib.sha256()
     count = scanned = 0
-    last_log = time.monotonic()
-    with ReaderPool(sources,physical_sources=physical) as pool:
-        read = lambda offset,size: pool.read(sid,offset,size)
-        for base, data, owned in pool.iter_blocks(sid):
-            digest.update(data[:owned])
-            scanned += owned
-            for match in SIGNATURES.finditer(data):
-                # Type field may be in lookahead; ownership belongs to the size field.
-                start = base + match.start() - 4
-                if not base <= start < base + owned:
-                    continue
-                try:
-                    info = _candidate_header(read,start,row['size'])
-                except UnavailableRange:
-                    continue
-                if info is None:
-                    continue
-                n, tag, header = info
-                available = min(n, row['size'] - start)
-                mdigest = None
-                if tag in {b'moov', b'moof', b'ftyp'}:
-                    cap = 4096 if tag == b'ftyp' else MAX_METADATA
-                    if available != n or n > cap:
+    label = ('Scanning allocation-unfiltered image' if row['kind'] == 'image' else
+             'Scanning mapped stream' if row['kind'] == 'logical' else 'Scanning recovered file')
+    with phase(label, unit='bytes') as task:
+        with ReaderPool(sources,physical_sources=physical) as pool:
+            task.update(total=sum(length for _, length in pool.available_ranges(sid)), detail=Path(row['path']).name)
+            read = lambda offset,size: pool.read(sid,offset,size)
+            for base, data, owned in pool.iter_blocks(sid):
+                digest.update(data[:owned])
+                scanned += owned
+                for match in SIGNATURES.finditer(data):
+                    # Type field may be in lookahead; ownership belongs to the size field.
+                    start = base + match.start() - 4
+                    if not base <= start < base + owned:
                         continue
                     try:
-                        raw = read(start,n)
+                        info = _candidate_header(read,start,row['size'])
                     except UnavailableRange:
                         continue
-                    if tag == b'ftyp':
-                        payload = raw[header:]
-                        if len(payload) < 8 or len(payload) % 4 or not all(32 <= x <= 126 for x in payload[:4]):
+                    if info is None:
+                        continue
+                    n, tag, header = info
+                    available = min(n, row['size'] - start)
+                    mdigest = None
+                    if tag in {b'moov', b'moof', b'ftyp'}:
+                        cap = 4096 if tag == b'ftyp' else MAX_METADATA
+                        if available != n or n > cap:
                             continue
-                    else:
                         try:
-                            root = next(boxes(raw))
-                            child = list(boxes(raw, root.payload, root.end))
-                            kinds = {b.kind for b in child}
-                            if tag == b'moov' and not {b'mvhd', b'trak'} <= kinds:
-                                continue
-                            if tag == b'moof' and not {b'mfhd', b'traf'} <= kinds:
-                                continue
-                        except (FormatError, StopIteration):
+                            raw = read(start,n)
+                        except UnavailableRange:
                             continue
-                        if tag == b'moov' and b'mvex' not in kinds:
-                            mdigest = hashlib.sha256(raw).hexdigest()
-                            error = summary = None
+                        if tag == b'ftyp':
+                            payload = raw[header:]
+                            if len(payload) < 8 or len(payload) % 4 or not all(32 <= x <= 126 for x in payload[:4]):
+                                continue
+                        else:
                             try:
-                                summary = json_text(parse_movie(raw).summary())
-                            except FormatError as e:
-                                error = str(e)
-                            case.db.execute('INSERT OR IGNORE INTO movies VALUES(?,?,?,?)',
-                                            (mdigest, raw, summary, error))
-                elif tag == b'mdat' and available <= header:
-                    continue
-                case.db.execute('''INSERT OR IGNORE INTO atoms
-                    (source_id,kind,offset,size,header,available,payload_size,movie_digest)
-                    VALUES(?,?,?,?,?,?,?,?)''',
-                    (sid, tag.decode(), start, n, header, available, available-header, mdigest))
-                count += 1
-            case.db.commit()
-            if time.monotonic() - last_log > 5:
-                LOG.info('Scanning %s: %.1f%%; %d atom candidates', row['path'],
-                         100 * min(base+owned, row['size']) / max(1, row['size']), count)
-                last_log = time.monotonic()
-        pool.check(sid)
-    scope = 'full' if scanned == row['size'] else 'available-ranges'
-    case.db.execute('UPDATE sources SET sha256=?,complete=1,hash_scope=? WHERE id=?',
-                    (digest.hexdigest(),scope,sid))
-    case.db.commit()
+                                root = next(boxes(raw))
+                                child = list(boxes(raw, root.payload, root.end))
+                                kinds = {b.kind for b in child}
+                                if tag == b'moov' and not {b'mvhd', b'trak'} <= kinds:
+                                    continue
+                                if tag == b'moof' and not {b'mfhd', b'traf'} <= kinds:
+                                    continue
+                            except (FormatError, StopIteration):
+                                continue
+                            if tag == b'moov' and b'mvex' not in kinds:
+                                mdigest = hashlib.sha256(raw).hexdigest()
+                                error = summary = None
+                                try:
+                                    summary = json_text(parse_movie(raw).summary())
+                                except FormatError as e:
+                                    error = str(e)
+                                case.db.execute('INSERT OR IGNORE INTO movies VALUES(?,?,?,?)',
+                                                (mdigest, raw, summary, error))
+                    elif tag == b'mdat' and available <= header:
+                        continue
+                    case.db.execute('''INSERT OR IGNORE INTO atoms
+                        (source_id,kind,offset,size,header,available,payload_size,movie_digest)
+                        VALUES(?,?,?,?,?,?,?,?)''',
+                        (sid, tag.decode(), start, n, header, available, available-header, mdigest))
+                    count += 1
+                case.db.commit()
+                task.update(scanned, atoms=count)
+            pool.check(sid)
+        scope = 'full' if scanned == row['size'] else 'available-ranges'
+        case.db.execute('UPDATE sources SET sha256=?,complete=1,hash_scope=? WHERE id=?',
+                        (digest.hexdigest(),scope,sid))
+        case.db.commit()
     LOG.info('Indexed %s: %d candidate atoms; %d available bytes',row['path'],count,scanned)

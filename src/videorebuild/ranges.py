@@ -12,6 +12,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 from xml.parsers import expat
 
 from .bmff import FormatError
+from .progress import phase
 
 MAX_OFFSET = (1 << 63) - 1
 _DFXML_NS = 'http://www.forensicswiki.org/wiki/Category:Digital_Forensics_XML'
@@ -129,9 +130,10 @@ class RescueMap:
         previous_end = None
         header = False
         total = 0
+        reported = 0
         if not stat.S_ISREG(Path(path).stat().st_mode):
             raise FormatError('ddrescue_map_must_be_regular_file')
-        with Path(path).open('rb') as source:
+        with phase('Reading acquisition map', total=Path(path).stat().st_size, unit='bytes') as task, Path(path).open('rb') as source:
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                 raise FormatError('ddrescue_map_must_be_regular_file')
             while True:
@@ -139,6 +141,9 @@ class RescueMap:
                 if not raw:
                     break
                 total += len(raw)
+                if total - reported >= 65536:
+                    task.update(total, blocks=len(blocks))
+                    reported = total
                 if total > max_bytes or len(raw) > 4096:
                     raise FormatError('ddrescue_map_byte_limit')
                 try:
@@ -171,8 +176,9 @@ class RescueMap:
                 blocks.append(RescueSpan(translated, count, fields[2]))
                 if len(blocks) > max_blocks:
                     raise FormatError('ddrescue_map_block_limit')
-        if not header or not blocks:
-            raise FormatError('empty_ddrescue_map')
+            if not header or not blocks:
+                raise FormatError('empty_ddrescue_map')
+            task.update(total, blocks=len(blocks))
         return cls(blocks, image_offset=image_offset)
 
     def spans(self, offset: int, length: int) -> Iterator[RescueSpan]:
@@ -426,7 +432,7 @@ def iter_dfxml(path: Path, image_size: int, *, evidence_kind: str = 'filesystem'
     if not stat.S_ISREG(Path(path).stat().st_mode):
         raise FormatError('dfxml_must_be_regular_file')
     try:
-        with Path(path).open('rb') as source:
+        with phase('Reading '+evidence_kind+' DFXML', total=Path(path).stat().st_size, unit='bytes') as task, Path(path).open('rb') as source:
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                 raise FormatError('dfxml_must_be_regular_file')
             while True:
@@ -435,6 +441,7 @@ def iter_dfxml(path: Path, image_size: int, *, evidence_kind: str = 'filesystem'
                 if total > max_bytes:
                     raise FormatError('dfxml_byte_limit')
                 reader.parser.Parse(chunk, not chunk)
+                task.update(total, objects=reader.objects)
                 while reader.ready:
                     yield reader.ready.popleft()
                 if not chunk:

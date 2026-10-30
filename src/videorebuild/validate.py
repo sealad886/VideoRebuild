@@ -8,8 +8,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 from .bmff import Movie
+from .progress import phase
 from .storage import SafetyError
 
 
@@ -26,16 +28,28 @@ def run_tool(args: list[str], timeout: float, output_limit: int = 2*1024*1024) -
         except OSError as e:
             raise SafetyError(f'Cannot launch {args[0]}: {e}') from e
         timed_out = False
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            process.wait()
-        except BaseException:
-            process.kill()
-            process.wait()
-            raise
+        with phase(f'{Path(args[0]).name} subprocess', unit='jobs') as task:
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    try:
+                        process.wait(timeout=min(5.0, max(0.0, deadline-time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= deadline:
+                            timed_out = True
+                            process.kill()
+                            process.wait()
+                            task.outcome('failed', detail='timeout; process stopped')
+                            break
+                        task.heartbeat(detail='waiting for process', timeout_seconds=timeout)
+                task.advance()
+                if process.returncode and not timed_out:
+                    task.outcome('failed', detail=f'exit status {process.returncode}')
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
         out.seek(0)
         err.seek(0)
         stdout = out.read(output_limit+1)
@@ -73,9 +87,13 @@ def doctor() -> dict:
 def validate(path: Path, movie: Movie, tools: dict, timeout: float) -> dict:
     base = ['-v', 'error', '-threads', '1', '-f', 'mov', '-protocol_whitelist', 'file',
             '-enable_drefs', '0', '-ignore_editlist', '1']
-    probe = run_tool([tools['ffprobe']['path'], *base, '-count_packets', '-count_frames',
-                      '-show_entries', 'stream=index,codec_type,codec_name,nb_read_frames,nb_read_packets,width,height',
-                      '-of', 'json', str(path)], timeout)
+    with phase('Probe ordinary packet and frame counts', total=1, unit='jobs') as validation_task:
+        probe = run_tool([tools['ffprobe']['path'], *base, '-count_packets', '-count_frames',
+                          '-show_entries', 'stream=index,codec_type,codec_name,nb_read_frames,nb_read_packets,width,height',
+                          '-of', 'json', str(path)], timeout)
+        validation_task.advance()
+        if probe['returncode'] or probe['timeout'] or probe['stderr'].strip() or probe['stdout_truncated']:
+            validation_task.outcome('failed', detail='probe failed or incomplete')
     result = {'ok': False, 'probe': probe}
     if (probe['returncode'] or probe['timeout'] or probe['stderr'].strip() or
             probe['stdout_truncated']):
@@ -113,10 +131,14 @@ def validate(path: Path, movie: Movie, tools: dict, timeout: float) -> dict:
                          'packets': packets, 'frames': frames, 'codec': codec})
     # Independent strict decode after the probe/count pass. Edit lists are ignored
     # only while validating; the output retains the original movie's edit lists.
-    decode = run_tool([tools['ffmpeg']['path'], '-hide_banner', '-nostdin', '-xerror',
-                       *base, '-err_detect', 'explode', '-i', str(path),
-                       '-map', '0:v', '-map', '0:a?', '-threads', '1',
-                       '-filter_threads', '1', '-f', 'null', '-'], timeout)
+    with phase('Strict decode ordinary candidate', total=1, unit='jobs') as validation_task:
+        decode = run_tool([tools['ffmpeg']['path'], '-hide_banner', '-nostdin', '-xerror',
+                           *base, '-err_detect', 'explode', '-i', str(path),
+                           '-map', '0:v', '-map', '0:a?', '-threads', '1',
+                           '-filter_threads', '1', '-f', 'null', '-'], timeout)
+        validation_task.advance()
+        if decode['returncode'] or decode['timeout'] or decode['stderr'].strip():
+            validation_task.outcome('failed', detail='strict decode failed')
     result['decode'] = decode
     result['counts'] = expected
     result['ok'] = not (decode['returncode'] or decode['timeout'] or decode['stderr'].strip())

@@ -15,6 +15,7 @@ from . import __version__
 from .engine import Options
 from .storage import Case, SafetyError
 from .reports import report
+from .progress import reporting
 from .validate import doctor
 
 LOG = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ def positive_int(text: str) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog='videorebuild', description='Reconstruct supported MP4 recordings from recovered files and mapped image byte ranges.')
     p.add_argument('--version', action='version', version=f'VideoRebuild {__version__}')
+    p.add_argument('--no-progress', action='store_true', help='Disable progress feedback; errors and warnings remain visible')
     subs = p.add_subparsers(dest='command', required=True)
     subs.add_parser('doctor', help='Check FFmpeg/ffprobe and print exact versions')
     migration = subs.add_parser('migrate-case', help='Back up and explicitly migrate an older case')
@@ -41,9 +43,9 @@ def parser() -> argparse.ArgumentParser:
         q.add_argument('--case', required=True, type=Path, help='Case/output folder on healthy storage, outside every input directory')
         if name in ('scan', 'run'):
             q.add_argument('--input', action='append', type=Path, default=[], help='Recovered file or directory; repeatable')
-            q.add_argument('--image', action='append', type=Path, default=[], help='Regular raw disk-image file; repeatable; never a device node')
+            q.add_argument('--image', action='append', type=Path, default=[], help='Raw image; without --extents indexes all available bytes, including allocated space; never a device node')
             q.add_argument('--all-files', action='store_true', help='Inspect every regular file rather than only media-like extensions')
-            q.add_argument('--report', type=Path, help='PhotoRec report.xml; verifies recovered headers against exactly one image')
+            q.add_argument('--report', type=Path, help='PhotoRec report.xml; verifies headers against one image but does not restrict scanning to free space')
             q.add_argument('--extents', type=Path, help='Filesystem DFXML raw byte-run report for exactly one image')
             q.add_argument('--mapfile', type=Path, help='Matching GNU ddrescue mapfile for exactly one image')
             q.add_argument('--map-offset', type=int, default=0, help='Explicit image offset minus mapfile input offset in bytes')
@@ -61,11 +63,19 @@ def parser() -> argparse.ArgumentParser:
             q.add_argument('--retry', action='store_true', help='Retry nonmatched results under unchanged search settings')
             q.add_argument('--max-record-bytes', type=positive_int, default=16*1024*1024, help='Fragmented recording window ceiling, at most 256 MiB')
             q.add_argument('--max-segments', type=positive_int, default=64, help='Maximum candidate starts examined per initialization, including rejected starts')
+    for command in subs.choices.values():
+        command.add_argument('--no-progress', action='store_true', default=argparse.SUPPRESS,
+                             help='Disable progress feedback; errors and warnings remain visible')
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    with reporting(enabled=not args.no_progress) as feedback:
+        return _execute(args, feedback)
+
+
+def _execute(args, feedback) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
     if os.name != 'posix':
         print('ERROR: This release supports macOS and Linux; use WSL on Windows.', file=sys.stderr)
@@ -105,6 +115,9 @@ def main(argv: list[str] | None = None) -> int:
             handler = logging.FileHandler(logpath, encoding='utf-8')
             handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
             logging.getLogger().addHandler(handler)
+            feedback.log = lambda message: handler.handle(logging.makeLogRecord({
+                'name': 'videorebuild.progress', 'levelno': logging.INFO, 'levelname': 'INFO',
+                'msg': message, 'args': ()}))
             try:
                 if args.command in ('scan', 'run'):
                     from .workflow import intake
@@ -122,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                     LOG.warning('Could not refresh reports after interruption: %s', error)
                 raise
             finally:
+                feedback.log = None
                 logging.getLogger().removeHandler(handler)
                 handler.close()
         # Completion is not a guarantee that every recording was recovered;

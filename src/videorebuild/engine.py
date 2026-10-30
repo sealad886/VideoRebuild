@@ -8,6 +8,7 @@ search limits are retained instead of being hidden behind a confidence score.
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
 import errno
@@ -20,13 +21,13 @@ from pathlib import Path
 import re
 import shutil
 import struct
-import time
 from typing import Iterable
 
 from . import __version__
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
 from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
 from .validate import doctor, validate
+from .progress import phase
 
 LOG = logging.getLogger(__name__)
 FTYP = make_box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso6')
@@ -92,34 +93,47 @@ def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool 
     if quick and len(selected) > 12:
         indexes = sorted({0, 1, 2, len(selected)//2, len(selected)-3, len(selected)-2, len(selected)-1})
         selected = [selected[i] for i in indexes]
-    for chunk in selected:
-        t = movie.tracks[chunk.track]
-        sid, base = mapping[(chunk.track, chunk.index)]
-        sample_indexes = range(len(chunk.sizes))
-        if quick and len(sample_indexes) > 6:
-            sample_indexes = {0, 1, 2, len(chunk.sizes)//2, len(chunk.sizes)-2, len(chunk.sizes)-1}
-        off = base
-        chunk_end = base + sum(chunk.sizes)
-        window = memoryview(b'')
-        window_start = base
-        for i, n in enumerate(chunk.sizes):
-            if i in sample_indexes:
-                try:
-                    if quick:
-                        raw = pool.read(sid, off, n)
-                    else:
-                        if off + n > window_start + len(window):
-                            window = memoryview(pool.read(sid, off, min(
-                                max(n, 4*1024*1024), chunk_end-off)))
-                            window_start = off
-                        raw = window[off-window_start:off-window_start+n]
-                except FormatError:
-                    return False
-                if not valid_sample(raw, t.codec, t.nal_length):
-                    return False
-            off += n
-        # Cached bytes still require the source-identity gate after validation.
-        pool.check(sid)
+    checked = 0
+    with (phase('Validate sample boundaries', total=sum(len(c.sizes) for c in selected), unit='samples')
+          if not quick and chunks is None else nullcontext()) as task:
+        for chunk in selected:
+            t = movie.tracks[chunk.track]
+            sid, base = mapping[(chunk.track, chunk.index)]
+            sample_indexes = range(len(chunk.sizes))
+            if quick and len(sample_indexes) > 6:
+                sample_indexes = {0, 1, 2, len(chunk.sizes)//2, len(chunk.sizes)-2, len(chunk.sizes)-1}
+            off = base
+            chunk_end = base + sum(chunk.sizes)
+            window = memoryview(b'')
+            window_start = base
+            for i, n in enumerate(chunk.sizes):
+                if i in sample_indexes:
+                    try:
+                        if quick:
+                            raw = pool.read(sid, off, n)
+                        else:
+                            if off + n > window_start + len(window):
+                                window = memoryview(pool.read(sid, off, min(
+                                    max(n, 4*1024*1024), chunk_end-off)))
+                                window_start = off
+                            raw = window[off-window_start:off-window_start+n]
+                    except FormatError:
+                        if task is not None:
+                            task.outcome('failed', detail='sample bytes unavailable')
+                        return False
+                    checked += 1
+                    if task is not None and checked % 4096 == 0:
+                        task.update(checked)
+                    if not valid_sample(raw, t.codec, t.nal_length):
+                        if task is not None:
+                            task.update(checked)
+                            task.outcome('failed', detail='sample boundaries do not match')
+                        return False
+                off += n
+            # Cached bytes still require the source-identity gate after validation.
+            pool.check(sid)
+        if task is not None:
+            task.update(checked)
     return True
 
 
@@ -141,9 +155,13 @@ def _publish_link_or_copy(source: Path, destination: Path) -> str:
         raise SafetyError('Insufficient space for publication copy on a filesystem without hard links')
     try:
         with source.open('rb') as r, destination.open('xb') as w:
-            shutil.copyfileobj(r, w, length=4*1024*1024)
-            w.flush()
-            os.fsync(w.fileno())
+            with phase('Publish candidate copy', total=source.stat().st_size, unit='bytes') as task:
+                while data := r.read(4*1024*1024):
+                    w.write(data)
+                    task.advance(len(data))
+                task.heartbeat(detail='flushing publication')
+                w.flush()
+                os.fsync(w.fileno())
     except BaseException:
         if destination.exists():
             destination.unlink()
@@ -175,7 +193,7 @@ def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
     h = hashlib.sha256()
     media_hash = hashlib.sha256()
     entries = []
-    with dest.open('xb') as output:
+    with phase('Reconstruct encoded media', total=movie.media_size, unit='bytes') as task, dest.open('xb') as output:
         def write(data: bytes) -> None:
             output.write(data)
             h.update(data)
@@ -194,6 +212,7 @@ def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
                 chunk_hash.update(raw)
                 current += len(raw)
                 remaining -= len(raw)
+                task.advance(len(raw))
             source = pool.sources[sid]
             entries.append({'track': c.track, 'chunk': c.index, 'samples': len(c.sizes),
                             'source_id': sid, 'source_path': source['path'], 'source_offset': off,
@@ -201,6 +220,7 @@ def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
                             'output_offset': new_offsets[(c.track, c.index)],
                             'sha256': chunk_hash.hexdigest(),
                             'physical_extents':pool.provenance(sid,off,c.size)})
+        task.heartbeat(detail='flushing candidate')
         output.flush()
         os.fsync(output.fileno())
     return {'sha256': h.hexdigest(), 'media_sha256': media_hash.hexdigest(), 'bytes': size,
@@ -355,16 +375,19 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
                               (sid, moff)).fetchone()
         if row:
             origins.append((sid, row['offset']))
-    for sid, origin in sorted(set(origins)):
-        mapping = {(c.track, c.index): (sid, origin+c.offset) for c in movie.chunks}
-        md = mapping_digest(movie, mapping)
-        if md in tested:
-            continue
-        tested.add(md)
-        r = attempt(case, movie, mapping, pool, tools, opt, 'original_offsets')
-        if r['status'] == 'valid':
-            successes.append(r)
-        limited |= r['status'] == 'limited'
+    origins = sorted(set(origins))
+    with phase('Original offset locations examined', total=len(origins), unit='candidates') as original_task:
+        for sid, origin in origins:
+            original_task.advance()
+            mapping = {(c.track, c.index): (sid, origin+c.offset) for c in movie.chunks}
+            md = mapping_digest(movie, mapping)
+            if md in tested:
+                continue
+            tested.add(md)
+            r = attempt(case, movie, mapping, pool, tools, opt, 'original_offsets')
+            if r['status'] == 'valid':
+                successes.append(r)
+            limited |= r['status'] == 'limited'
     first = movie.chunks[0].offset
     rows = case.db.execute('''SELECT a.* FROM atoms a JOIN sources s ON s.id=a.source_id
                     WHERE a.kind='mdat' AND s.complete=1 AND a.payload_size BETWEEN ? AND ?
@@ -373,20 +396,22 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
     if len(rows) > opt.max_candidates:
         limited = True
         rows = rows[:opt.max_candidates]
-    for i, r in enumerate(rows):
-        sid = r['source_id']
-        base = r['offset'] + r['header']
-        mapping = {(c.track, c.index): (sid, base+c.offset-first) for c in movie.chunks}
-        md = mapping_digest(movie, mapping)
-        if md in tested:
-            continue
-        tested.add(md)
-        a = attempt(case, movie, mapping, pool, tools, opt, 'whole_mdat')
-        if a['status'] == 'valid':
-            successes.append(a)
-        limited |= a['status'] == 'limited'
-        if (i+1) % 100 == 0:
-            LOG.info('%s: tested %d/%d mdat candidates', movie.digest[:12], i+1, len(rows))
+    with phase('Whole mdat locations examined', total=len(rows), unit='candidates') as mdat_task:
+        for r in rows:
+            mdat_task.advance()
+            sid = r['source_id']
+            base = r['offset'] + r['header']
+            mapping = {(c.track, c.index): (sid, base+c.offset-first) for c in movie.chunks}
+            md = mapping_digest(movie, mapping)
+            if md in tested:
+                continue
+            tested.add(md)
+            a = attempt(case, movie, mapping, pool, tools, opt, 'whole_mdat')
+            if a['status'] == 'valid':
+                successes.append(a)
+            limited |= a['status'] == 'limited'
+        if limited:
+            mdat_task.outcome('limited', detail='candidate search or validation limit reached')
     status = finish(case, movie, successes, limited, 'whole_payload', run_key,
                     {'tested_hypotheses': len(tested), 'max_trailing_padding': opt.max_padding})
     return status, successes, limited
@@ -504,6 +529,8 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                 stop_reason = 'nal_check_budget'
                 return
             nal_checks += 1
+            if nal_checks % 4096 == 0:
+                scan_task.heartbeat(anchor_checks=checks, nal_checks=nal_checks)
             if pos + 5 > source_size:
                 return
             local = pos - block_base
@@ -528,63 +555,67 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                 yield total-4
             pos += n+4
     hits = {key: {} for key in groups}
+    located_extents = 0
     visited = set()
     capped = set()
     checks = 0
     nal_checks = 0
     global_limited = False
     stop_reason = None
-    last_log = time.monotonic()
     LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchors), len(pool.sources))
-    for sid, source in pool.sources.items():
-        pool.check(sid)
-        for base, data, owned in pool.iter_blocks(sid,overlap=16):
-            for match in pattern.finditer(data):
-                at = match.start()
-                if at >= owned or at+4 > len(data):
-                    continue
-                for length in totals(sid, base, data, base+at):
-                    for key, relative in anchors.get(length, ()):
-                        if key in capped:
-                            continue
-                        group = groups[key]
-                        start = base + at - relative
-                        identity = (key, sid, start)
-                        if start < 0 or start + group.span > source['size'] or identity in visited:
-                            continue
-                        # Bounded by max_anchor_checks; not an unbounded image hit cache.
-                        visited.add(identity)
-                        checks += 1
-                        if checks > opt.max_anchor_checks:
-                            global_limited = True
-                            stop_reason = 'anchor_check_budget'
+    available_bytes = sum(length for sid in pool.sources for _, length in pool.available_ranges(sid))
+    with phase('Deep search available bytes', total=available_bytes, unit='bytes') as scan_task:
+        scanned = 0
+        for sid, source in pool.sources.items():
+            pool.check(sid)
+            for base, data, owned in pool.iter_blocks(sid,overlap=16):
+                for match in pattern.finditer(data):
+                    at = match.start()
+                    if at >= owned or at+4 > len(data):
+                        continue
+                    for length in totals(sid, base, data, base+at):
+                        for key, relative in anchors.get(length, ()):
+                            if key in capped:
+                                continue
+                            group = groups[key]
+                            start = base + at - relative
+                            identity = (key, sid, start)
+                            if start < 0 or start + group.span > source['size'] or identity in visited:
+                                continue
+                            # Bounded by max_anchor_checks; not an unbounded image hit cache.
+                            visited.add(identity)
+                            checks += 1
+                            if checks > opt.max_anchor_checks:
+                                global_limited = True
+                                stop_reason = 'anchor_check_budget'
+                                break
+                            mapping = group.mapping(sid, start)
+                            if not check_samples(group.movie, mapping, pool, quick=True, chunks=group.chunks):
+                                continue
+                            if not check_samples(group.movie, mapping, pool, chunks=group.chunks):
+                                continue
+                            fingerprint = _group_hash(group, mapping, pool)
+                            if fingerprint in hits[key]:
+                                continue
+                            if len(hits[key]) >= opt.max_hits:
+                                capped.add(key)
+                                continue
+                            if not hits[key]:
+                                located_extents += 1
+                            hits[key][fingerprint] = (sid, start)
+                        if global_limited:
                             break
-                        mapping = group.mapping(sid, start)
-                        if not check_samples(group.movie, mapping, pool, quick=True, chunks=group.chunks):
-                            continue
-                        if not check_samples(group.movie, mapping, pool, chunks=group.chunks):
-                            continue
-                        fingerprint = _group_hash(group, mapping, pool)
-                        if fingerprint in hits[key]:
-                            continue
-                        if len(hits[key]) >= opt.max_hits:
-                            capped.add(key)
-                            continue
-                        hits[key][fingerprint] = (sid, start)
                     if global_limited:
                         break
+                scanned += min(owned, at+1) if global_limited else owned
+                scan_task.update(scanned, anchor_checks=checks, nal_checks=nal_checks, located_extents=located_extents)
                 if global_limited:
                     break
-            if time.monotonic() - last_log > 5:
-                LOG.info('Deep scan %s: %.1f%%; %d checks, %d located extents',
-                         Path(source['path']).name, 100*min(base+owned, source['size'])/max(1, source['size']),
-                         checks, sum(bool(h) for h in hits.values()))
-                last_log = time.monotonic()
+            pool.check(sid)
             if global_limited:
                 break
-        pool.check(sid)
-        if global_limited:
-            break
+        if global_limited or capped:
+            scan_task.outcome('limited', detail=stop_reason or 'hit capacity reached')
     for movie in movies:
         if movie.digest in excluded:
             continue
@@ -604,15 +635,19 @@ def deep_search(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         successes = []
         tried = 0
         alternatives = [list(hits[g.key].values()) for g in gs]
-        for choices in itertools.islice(itertools.product(*alternatives), opt.max_assemblies):
-            mapping = {}
-            for g, (sid, start) in zip(gs, choices):
-                mapping.update(g.mapping(sid, start))
-            r = attempt(case, movie, mapping, pool, tools, opt, 'scattered_extents')
-            tried += 1
-            if r['status'] == 'valid':
-                successes.append(r)
-            limited |= r['status'] == 'limited'
+        with phase('Deep assemblies attempted', total=min(combinations, opt.max_assemblies), unit='candidates') as assembly_task:
+            if combinations > opt.max_assemblies:
+                assembly_task.outcome('limited', detail='assembly budget reached')
+            for choices in itertools.islice(itertools.product(*alternatives), opt.max_assemblies):
+                mapping = {}
+                for g, (sid, start) in zip(gs, choices):
+                    mapping.update(g.mapping(sid, start))
+                r = attempt(case, movie, mapping, pool, tools, opt, 'scattered_extents')
+                tried += 1
+                assembly_task.update(tried)
+                if r['status'] == 'valid':
+                    successes.append(r)
+                limited |= r['status'] == 'limited'
         details['tested_assemblies'] = tried
         finish(case, movie, successes, limited, 'scattered_extents', run_key, details)
 
@@ -634,10 +669,11 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
           LEFT JOIN jobs r ON r.kind='ordinary' AND r.key=m.digest
           WHERE EXISTS(SELECT 1 FROM atoms a JOIN sources s ON a.source_id=s.id
                        WHERE a.movie_digest=m.digest AND s.complete=1) ORDER BY m.digest''')
-    with ReaderPool(sources,physical_sources=case.physical_sources()) as pool:
+    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources()) as pool:
         for sid in sources:
             pool.check(sid)
         for row in rows:
+            jobs_task.advance(processed_movies=processed)
             old_detail = json.loads(row['old_detail']) if row['old_detail'] else {}
             if old_detail.get('run_key') == run_key:
                 if row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] == 'matched'):
@@ -674,4 +710,5 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                     deferred.clear()
         if deferred:
             deep_search(case, deferred, pool, tools, opt, run_key)
+        jobs_task.heartbeat(processed_movies=processed)
     case.event('recovery_complete', {'run_key': run_key, 'processed_movies': processed})
