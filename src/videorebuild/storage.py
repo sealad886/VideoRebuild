@@ -92,8 +92,8 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def regular(path: Path) -> os.stat_result:
-    s = path.stat()
+def regular(path: Path | str) -> os.stat_result:
+    s = os.stat(path)
     if not stat.S_ISREG(s.st_mode):
         raise SafetyError(f'Not a regular file: {path}. Use a disk image, not a live block device.')
     return s
@@ -375,7 +375,7 @@ class ReaderPool:
 
     @staticmethod
     def _check_identity(row: dict) -> None:
-        s = regular(Path(row['path']))
+        s = regular(row['path'])
         if (s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino) != (row['size'], row['mtime_ns'], row['dev'], row['ino']):
             raise SafetyError(f'Source changed since indexing: {row["path"]}. Start a new case for changed evidence.')
 

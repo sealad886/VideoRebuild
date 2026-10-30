@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from helpers import generate
 from videorebuild import engine
-from videorebuild.bmff import Chunk
+from videorebuild.bmff import Chunk, FormatError
 from videorebuild.storage import Case, ReaderPool, scan_logical
 
 
@@ -88,7 +88,7 @@ class ExhaustiveMatchingTests(unittest.TestCase):
                         patch.object(engine, 'groups_for', return_value=[group]), \
                         patch.object(engine, 'check_samples', return_value=True), \
                         patch.object(engine, '_group_hash', side_effect=lambda g, m, p: str(m[(0, 0)][1])), \
-                        patch.object(engine, 'attempt', return_value={'status': 'rejected'}) as attempted, \
+                        patch.object(engine, 'attempt', return_value={'status': 'rejected', 'content_evaluated': True}) as attempted, \
                         patch.object(engine, 'finish') as finished:
                     engine.deep_search(SimpleNamespace(), [movie], pool, {}, options, 'test')
                 self.assertEqual(attempted.call_count, expected)
@@ -102,12 +102,13 @@ class ExhaustiveMatchingTests(unittest.TestCase):
             generate(source, audio=False, seconds=0.25)
             with Case(root / 'case') as case:
                 scan_logical(case, case.register_source(source))
+                deferred = []
                 with patch.object(engine, 'doctor', return_value={}), \
                         patch.object(engine, 'whole_payload', return_value=('search_limited', [], True)), \
-                        patch.object(engine, 'deep_search') as deep:
+                        patch.object(engine, 'deep_search', side_effect=lambda case, movies, *args, **kwargs: deferred.extend(movies)) as deep:
                     engine.recover(case, engine.Options(deep=True))
                 deep.assert_called_once()
-                movie = deep.call_args.args[1][0]
+                movie = deferred[0]
                 self.assertIn(movie.digest, deep.call_args.kwargs['incomplete'])
 
                 # A later successful deep attempt cannot erase the incomplete
@@ -150,9 +151,13 @@ class ExhaustiveMatchingTests(unittest.TestCase):
                                     (movie.digest, digest, 'whole_mdat', status, json.dumps(cached)))
                     case.db.commit()
                     with ReaderPool(case.sources()) as pool, patch.object(engine, 'check_samples') as checked:
-                        self.assertEqual(engine.attempt(case, movie, mapping, pool, {}, engine.Options(), 'whole_mdat'), cached)
-                        checked.assert_not_called()
-                        with patch.object(pool, 'permits', return_value=False):
+                        reused = engine.attempt(case, movie, mapping, pool, {}, engine.Options(), 'whole_mdat')
+                        self.assertEqual(reused['status'], cached['status'])
+                        if status == 'valid':
+                            checked.assert_not_called()
+                        else:
+                            self.assertEqual(checked.call_count, 1)
+                        with patch.object(pool, 'provenance', side_effect=FormatError('source range excluded by allocation scope')):
                             blocked = engine.attempt(case, movie, mapping, pool, {}, engine.Options(), 'whole_mdat')
                         self.assertEqual(blocked['status'], 'rejected')
                         self.assertIn('allocation', blocked['reason'])

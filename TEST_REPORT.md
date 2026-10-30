@@ -1,5 +1,43 @@
 # Executed validation — VideoRebuild 0.2.0
 
+## Performance and exhaustive matching repairs — October 30, 2026
+
+Source and rebuilt standalone archive each passed all **271 tests** on macOS
+with Python 3.13.18: 128.199 seconds for source and 106.416 seconds for the
+archive. The archive's 14 source modules were also compared byte-for-byte
+with the tested source. These runs used generated fixtures; no recovered-file
+codec quality checks or playback were performed.
+
+New regressions cover physical-witness multiplicity and ambiguity, allocation
+and rescue-map exclusions, historical negative-cache promotion, feasible-only
+assembly budgets, physical conflict pruning, repeated identical content,
+long singleton-group recordings, shared discovery across metadata/group
+batches, source mutation (including zero-hit and completed-skip sources),
+fragmented timing, publication integrity and resume limits.
+
+Independent exhaustive comparisons preserved the complete feasible content
+sets for 70 generated fixtures (35 allocation-restricted), and physical
+assignment sets for 80 fixtures. The 512-singleton-group proof used 512
+partial checks and 1,024 provenance calls; ten identical groups/copies needed
+one content attempt and 55 partial checks. The known ambiguity counterexample
+retained both byte-distinct outputs.
+
+A bounded negative-candidate benchmark reduced cold source-identity checks
+from 262,192 to 64 while reading the same 96 bytes. Profiled CPU time changed
+from 9.989 to 0.222 seconds. Eight uncapped deep batches shared one source
+pass. Completed fragmented-job resumes eliminated initialization reads and
+parses, while the missing-timing fixture reduced requested bytes from
+34,591,393 to 1,052,097 with unchanged zero-output behavior. These are
+synthetic operation counts/timings, not physical-I/O measurements or
+production throughput guarantees.
+
+Private reproduction scripts, independent review and operational receipts
+remain under ignored `test-results/performance-audit-20261030/`. The completed
+source index is reused for reconstruction; no raw reindex is required.
+Real-image completeness, historical association and decoded quality are not
+established by these tests. The dated evidence below retains its original
+scope.
+
 ## PR preparation — October 30, 2026
 
 Source and rebuilt zipapp each passed all 123 tests on macOS 27.2 arm64 with

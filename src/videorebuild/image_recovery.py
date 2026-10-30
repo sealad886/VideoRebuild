@@ -177,10 +177,12 @@ def verify_completed(case) -> None:
                 raise SafetyError('Incomplete fragmented publication evidence')
 
 
-def _initializations(case, pool, discovery_task):
-    """Stream distinct initialization locations from the shared source catalogue."""
+def _initialization_locations(case, pool, discovery_task):
+    """Stream indexed locations before reading metadata for eligible jobs."""
     has_anchors = case.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='verified_anchors'").fetchone()
     for sid, source in sorted(pool.sources.items()):
+        # Completed jobs may skip all media reads, but never source identity checks.
+        pool.check(sid)
         constrained = bool(has_anchors and case.db.execute(
             'SELECT 1 FROM verified_anchors WHERE source_id=? LIMIT 1', (sid,)).fetchone())
         if constrained:
@@ -194,39 +196,44 @@ def _initializations(case, pool, discovery_task):
             following = next(rows, None)
             boundary = int(following[0]) if following is not None else source['size']
             previous = following
-            try:
-                head_size = min(16, boundary-current)
-                if not pool.permits(sid, current, head_size):
-                    continue
-                head = pool.read(sid, current, head_size)
-                # box_at deliberately checks lengths; use the small header only to
-                # bound the subsequent source read, never to accept a whole box.
-                ftyp_size = int.from_bytes(head[:4], 'big')
-                if ftyp_size == 1:
-                    ftyp_size = int.from_bytes(head[8:16], 'big')
-                if head[4:8] != b'ftyp' or not 8 <= ftyp_size <= 4096:
-                    continue
-                moov_at = current+ftyp_size
-                moov_head_size = min(16, boundary-moov_at)
-                if moov_head_size <= 0 or not pool.permits(sid, moov_at, moov_head_size):
-                    continue
-                moov_head = pool.read(sid, moov_at, moov_head_size)
-                moov_size = int.from_bytes(moov_head[:4], 'big')
-                if moov_size == 1:
-                    moov_size = int.from_bytes(moov_head[8:16], 'big')
-                size = ftyp_size+moov_size
-                if moov_head[4:8] != b'moov' or not ftyp_size+8 <= size <= MAX_INIT or current+size > boundary:
-                    continue
-                if not pool.permits(sid, current, size):
-                    continue
-                data = pool.read(sid, current, size)
-                init = parse_initialization(data)
-            except (FormatError, struct.error):
-                # Ordinary MP4 metadata remains owned by the sample-table strategy.
-                continue
-            if current+size == boundary and source['kind'] != 'image':
-                continue  # A header is evidence for discovery, not a media job.
-            yield sid, source, current, boundary, init
+            yield sid, source, current, boundary
+
+
+def _read_initialization(pool, sid, source, current, boundary):
+    """Read one bounded, permitted initialization after checking job eligibility."""
+    try:
+        head_size = min(16, boundary-current)
+        if not pool.permits(sid, current, head_size):
+            return None
+        head = pool.read(sid, current, head_size)
+        # Use the small header only to bound the subsequent read, never to
+        # accept a whole box without the canonical parser's length checks.
+        ftyp_size = int.from_bytes(head[:4], 'big')
+        if ftyp_size == 1:
+            ftyp_size = int.from_bytes(head[8:16], 'big')
+        if head[4:8] != b'ftyp' or not 8 <= ftyp_size <= 4096:
+            return None
+        moov_at = current+ftyp_size
+        moov_head_size = min(16, boundary-moov_at)
+        if moov_head_size <= 0 or not pool.permits(sid, moov_at, moov_head_size):
+            return None
+        moov_head = pool.read(sid, moov_at, moov_head_size)
+        moov_size = int.from_bytes(moov_head[:4], 'big')
+        if moov_size == 1:
+            moov_size = int.from_bytes(moov_head[8:16], 'big')
+        size = ftyp_size+moov_size
+        if moov_head[4:8] != b'moov' or not ftyp_size+8 <= size <= MAX_INIT or current+size > boundary:
+            return None
+        if not pool.permits(sid, current, size):
+            return None
+        data = pool.read(sid, current, size)
+        init = parse_initialization(data)
+    except (FormatError, struct.error):
+        # Ordinary MP4 metadata remains owned by the sample-table strategy.
+        return None
+    if current+size == boundary and source['kind'] != 'image':
+        return None  # A header is discovery evidence, not a media job.
+    return init
 
 
 def _restart_is_idr(fragment, init) -> bool:
@@ -344,18 +351,27 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     segment.setdefault('allocation_scope', previous_scope)
                 case.result(saved['key'], saved['status'], prior, kind='fragmented')
     processed = 0
+    visited_sources = set()
     with phase('Fragmented initialization locations examined', unit='candidates') as discovery_task, phase('Fragmented jobs visited', unit='jobs') as job_task:
-        for sid, source, offset, boundary, init in _initializations(case, pool, discovery_task):
-            job_task.advance()
+        for sid, source, offset, boundary in _initialization_locations(case, pool, discovery_task):
+            visited_sources.add(sid)
             key = f'{sid}:{offset}'
             old = case.job('fragmented', key)
+            if old is not None:
+                job_task.advance()
             job_policy_changed = (old is not None and not old['detail'].get('historical_validation') and
                                   old['detail'].get('search_policy') != search_policy)
             if old is not None and not (policy_changed or job_policy_changed or retry and
                     (old['status'] == 'search_limited' or not old['detail'].get('outputs'))):
+                pool.check(sid)
                 continue
             if limit is not None and processed >= limit:
                 break
+            init = _read_initialization(pool, sid, source, offset, boundary)
+            if init is None:
+                continue
+            if old is None:
+                job_task.advance()
             end = boundary
             init_end = offset+len(init.data)
             if end <= init_end or max_bytes <= len(init.data):
@@ -449,6 +465,20 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                             pair_data = read_section(start, length)
                             first = parse_fragment(pair_data, 0, init)
                             if not _restart_is_idr(first, init):
+                                continue
+                            if any(base is None for base in first.decode_times.values()):
+                                # A track already present cannot acquire its missing
+                                # restart origin from a later fragment. Tracks absent
+                                # here may still appear later with explicit timing.
+                                counts = defaultdict(int)
+                                for sample in first.samples:
+                                    counts[sample.track_id] += 1
+                                detail['segments'].append({
+                                    'logical_start': start, 'logical_end': start+len(pair_data),
+                                    'later_section': True, 'fragment_count': 1,
+                                    'sample_counts': dict(counts), 'allocation_scope': allocation_scope,
+                                    'status': 'blocked', 'reason': 'missing_restart_track_timing',
+                                    'stop_reason': 'missing_restart_track_timing'})
                                 continue
                         except (FormatError, struct.error):
                             continue
@@ -567,4 +597,8 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             case.result(key, status, detail, kind='fragmented')
             processed += 1
             LOG.info('Fragmented source=%s offset=%d status=%s outputs=%d', sid, offset, status, len(detail['outputs']))
+    # Reused jobs do not enter the per-job read/finish checks. Recheck every
+    # visited source even when discovery ends or the pending-job limit breaks.
+    for sid in visited_sources:
+        pool.check(sid)
     return processed
