@@ -7,7 +7,6 @@ written to the supplied local JSON destination; no recovery job is resumed.
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -15,8 +14,8 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
 from videorebuild.fragmented import box_at, walk_prefix
-from videorebuild.image_recovery import sha_file, signature, validate_prefix
-from videorebuild.storage import SafetyError
+from videorebuild.image_recovery import signature, validate_prefix
+from videorebuild.storage import SafetyError, create_private_json, file_sha256
 from videorebuild.validate import doctor
 
 
@@ -57,7 +56,7 @@ def audit(case: Path, image: Path) -> dict:
             try:
                 output_before = signature(output)
                 checked = validate_prefix(output, data, prefix, tools, 120)
-                row.update(published_sha256=sha_file(output), validation_ok=checked['ok'],
+                row.update(published_sha256=file_sha256(output), validation_ok=checked['ok'],
                            validation_reason=checked['reason'],
                            output_unchanged=signature(output) == output_before)
                 row['ok'] = (row['source_sha256'] == row['published_sha256'] == row['saved_sha256']
@@ -93,12 +92,7 @@ def main():
         if args.output.exists():
             raise ValueError('Report already exists; choose a new output filename')
         result = audit(args.case, args.image)
-        # Reports contain private local paths. Set owner-only permissions at
-        # exclusive creation so a permissive umask cannot expose them briefly.
-        fd = os.open(args.output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2)
-            f.write('\n')
+        create_private_json(args.output, result)
         print(f"Audit {'passed' if result['ok'] else 'failed'}. Report: {args.output}")
         return 0 if result['ok'] else 1
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, SafetyError) as error:
