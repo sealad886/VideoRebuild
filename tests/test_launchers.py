@@ -26,10 +26,10 @@ class HomebrewLauncherTests(unittest.TestCase):
 
         # Relocate installation roots, not the selection algorithm. No real
         # Homebrew installation or host-global filesystem path is touched.
-        script = (self.repo/'run-fragmented-macos.command').read_text()
+        script = (self.repo/'run-macos.command').read_text()
         for location, fixture in zip(('/opt/homebrew', '/usr/local'), self.prefixes):
             script = script.replace(location, str(fixture))
-        self.launcher = self.root/'run-fragmented-macos.command'
+        self.launcher = self.root/'run-macos.command'
         self.launcher.write_text(script)
         with zipfile.ZipFile(self.root/'videorebuild.pyz', 'w') as archive:
             source = self.repo/'src'
@@ -71,7 +71,7 @@ class HomebrewLauncherTests(unittest.TestCase):
                                    env=environment, capture_output=True, text=True, timeout=30)
         self.assertEqual(completed.returncode, 0, completed.stdout+completed.stderr)
         observed = json.loads(completed.stdout)
-        self.assertEqual(observed['argv'], ['recover-fragmented', '--help', 'argument with spaces'])
+        self.assertEqual(observed['argv'], ['run', '--help', 'argument with spaces'])
         return {name: Path(tool['path']) for name, tool in observed['tools'].items()}
 
     def assert_selected(self, directory):
@@ -92,8 +92,6 @@ class HomebrewLauncherTests(unittest.TestCase):
 
     def test_launchers_reject_python_below_supported_floor(self):
         python = self.prefixes[0]/'opt/python@3.13/bin/python3.13'
-        legacy = self.root/'run-legacy-macos.command'
-        legacy.write_text((self.repo/legacy.name).read_text())
         self.executable(self.fallback/'uname', "printf '%s\\n' Darwin\n")
         self.executable(self.fallback/'osascript', 'exit 99\n')
         environment = os.environ.copy()
@@ -101,7 +99,7 @@ class HomebrewLauncherTests(unittest.TestCase):
         for version in ('3.11', '3.12'):
             self.simulated_python(python, version)
             self.simulated_python(self.fallback/'python3', version)
-            for launcher in (self.launcher, legacy):
+            for launcher in (self.launcher,):
                 with self.subTest(version=version, launcher=launcher.name):
                     completed = subprocess.run(['/bin/bash', str(launcher), '--help'],
                         env=environment, capture_output=True, text=True, timeout=30)

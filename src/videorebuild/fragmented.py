@@ -4,7 +4,9 @@ This backend accepts empty initialization sample tables and fragment-relative
 sample addressing. It deliberately permits absent tfdt: for an unbroken stream
 starting at its initialization, durations accumulate separately for each track.
 It is not a browser MSE conformance checker. Unsupported addressing, encryption,
-missing predecessors, overlapping payloads, and discontinuities fail closed.
+overlapping payloads and discontinuities stop each contiguous sequence. The
+default walk requires initial predecessors; explicit restart mode leaves IDR and
+per-track timing eligibility to the recovery strategy.
 """
 from __future__ import annotations
 
@@ -367,7 +369,8 @@ def parse_fragment(data: bytes, pos: int, init: Initialization, *, sample_budget
     return Fragment(pos, mdat.end, seq, tuple(samples), decode_times)
 
 
-def walk_prefix(data: bytes, init_size: int) -> Prefix:
+def walk_prefix(data: bytes, init_size: int, *, allow_later_start: bool = False) -> Prefix:
+    """Parse one sequence; restart mode relaxes only its first sequence number."""
     init = parse_initialization(data[:init_size])
     result = Prefix(init, init_size, stop_offset=init_size)
     pos, previous = init_size, None
@@ -386,7 +389,7 @@ def walk_prefix(data: bytes, init_size: int) -> Prefix:
             if b.kind != b'moof':
                 raise FormatError(f'expected_moof_at_{pos}_found_{b.kind!r}')
             f = parse_fragment(data, pos, init, sample_budget=MAX_PREFIX_SAMPLES-retained_samples)
-            if previous is None and f.sequence not in (0, 1):
+            if previous is None and not allow_later_start and f.sequence not in (0, 1):
                 raise FormatError(f'missing_initial_fragments_sequence_starts_at_{f.sequence}')
             if previous is not None and f.sequence != previous+1:
                 raise FormatError(f'fragment_sequence_gap_expected_{previous+1}_found_{f.sequence}')

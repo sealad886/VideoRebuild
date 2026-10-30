@@ -10,9 +10,10 @@ import unittest
 from unittest.mock import patch
 
 from videorebuild.bmff import boxes, parse_movie, rewrite_offsets, FormatError
-from videorebuild.cli import main, report
+from videorebuild.cli import main, parser, report
 from videorebuild.engine import Options, recover
-from videorebuild.storage import Case, ReaderPool, SafetyError, scan, scan_source
+from videorebuild.storage import Case, ReaderPool, SafetyError, scan_logical
+from videorebuild.workflow import intake
 from videorebuild.validate import doctor, run_tool
 from helpers import generate, movie_from, payload, scatter, sha, split
 
@@ -71,11 +72,19 @@ class RecoveryTests(unittest.TestCase):
 
     def run_case(self, inputs=(), images=(), opt=None):
         with Case(self.root/'case') as c:
-            scan(c,list(inputs),list(images))
+            self.index(c,list(inputs),list(images))
             recover(c,opt or Options())
             report(c)
-            rows=[dict(r) for r in c.db.execute('SELECT * FROM results')]
+            rows=[dict(r) for r in c.db.execute("SELECT key AS movie_digest,status,detail,updated FROM jobs WHERE kind='ordinary'")]
         return rows
+
+    def index(self,case,inputs,images):
+        arguments=['scan','--case',str(case.root)]
+        for path in inputs:
+            arguments.extend(['--input',str(path)])
+        for path in images:
+            arguments.extend(['--image',str(path)])
+        intake(case,parser().parse_args(arguments))
 
     def assert_recovered(self, rows, original):
         self.assertEqual(len(rows),1)
@@ -171,7 +180,7 @@ class RecoveryTests(unittest.TestCase):
         p=self.root/'input'/'f000040_mdat.mov'; p.write_bytes(p.read_bytes()+b'X')
         with Case(self.root/'case') as c:
             with self.assertRaises(SafetyError):
-                scan(c,[self.root/'input'],[])
+                self.index(c,[self.root/'input'],[])
 
     def test_candidate_change_aborts_resume(self):
         split(self.h264,self.root/'input')
@@ -223,9 +232,9 @@ class RecoveryTests(unittest.TestCase):
         data=(self.root/'input'/'f000040_mdat.mov').read_bytes().replace(b'x264',b'y264',1)
         (self.root/'input'/'f888_mdat.mov').write_bytes(data)
         with Case(self.root/'case') as c:
-            scan(c,[self.root/'input'],[])
+            self.index(c,[self.root/'input'],[])
             recover(c,Options())
-            self.assertEqual(c.db.execute('SELECT status FROM results').fetchone()[0],'ambiguous')
+            self.assertEqual(c.db.execute("SELECT status FROM jobs WHERE kind='ordinary'").fetchone()[0],'ambiguous')
         self.assertFalse(list((self.root/'case'/'reconstructed').glob('*.mp4')))
 
     def test_co64_promotion_above_four_gib(self):
@@ -243,7 +252,7 @@ class RecoveryTests(unittest.TestCase):
                 p=self.root/f'b{shift}.bin'; p.write_bytes(b'X'*shift+raw)
                 with Case(self.root/f'case{shift}') as c:
                     with patch('videorebuild.storage.BLOCK',127):
-                        scan_source(c,p,'image')
+                        scan_logical(c,c.register_source(p,'image'))
                     kinds=[r[0] for r in c.db.execute('SELECT kind FROM atoms')]
                     self.assertEqual(kinds.count('moov'),1)
                     self.assertEqual(kinds.count('mdat'),1)
@@ -293,14 +302,14 @@ class RecoveryTests(unittest.TestCase):
     def test_interrupted_deep_pass_resumes_without_retry_flag(self):
         image=self.root/'card.img'; scatter(self.h264,image)
         with Case(self.root/'case') as c:
-            scan(c,[],[image])
+            self.index(c,[],[image])
             with patch('videorebuild.engine.deep_search',side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     recover(c,Options(deep=True))
-            self.assertEqual(c.db.execute('SELECT status FROM results').fetchone()[0],'awaiting_deep')
+            self.assertEqual(c.db.execute("SELECT status FROM jobs WHERE kind='ordinary'").fetchone()[0],'awaiting_deep')
         with Case(self.root/'case') as c:
             recover(c,Options(deep=True))
-            rows=[dict(r) for r in c.db.execute('SELECT * FROM results')]
+            rows=[dict(r) for r in c.db.execute("SELECT key AS movie_digest,status,detail,updated FROM jobs WHERE kind='ordinary'")]
         self.assert_recovered(rows,self.h264)
 
     def test_scan_only_invalidates_previous_publication(self):
@@ -308,8 +317,8 @@ class RecoveryTests(unittest.TestCase):
         self.run_case([self.root/'input'])
         (self.root/'input'/'another.bin').write_bytes(b'no additional metadata')
         with Case(self.root/'case') as c:
-            scan(c,[self.root/'input'],[])
-            self.assertEqual(c.db.execute('SELECT status FROM results').fetchone()[0],'stale')
+            self.index(c,[self.root/'input'],[])
+            self.assertEqual(c.db.execute("SELECT status FROM jobs WHERE kind='ordinary'").fetchone()[0],'stale')
         self.assertFalse(list((self.root/'case'/'reconstructed').glob('*.mp4')))
 
     def test_identical_candidates_share_only_case_internal_storage(self):

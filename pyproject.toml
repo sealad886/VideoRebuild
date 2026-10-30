@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "videorebuild"
-version = "0.2.0"
-description = "Image-first fragmented MP4 recovery and sample-table-guided media reconstruction"
+version = "0.3.0"
+description = "MP4 reconstruction from recovered files and mapped image byte ranges"
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"

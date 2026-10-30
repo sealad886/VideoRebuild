@@ -1,84 +1,81 @@
-# VideoRebuild 0.2.0
+# VideoRebuild
 
-Local, MIT-licensed video recovery for macOS/Linux. Python 3.13+ and both FFmpeg and ffprobe 8+ are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
+VideoRebuild reconstructs supported AVC/HEVC MP4 video from recovered files and optional original disk-image evidence. It runs locally with Python 3.13+, FFmpeg and ffprobe 8+, and no third-party Python runtime dependencies.
 
-## The new path: fragmented MP4 from original-image bytes
+Version 0.3.0 uses one case and byte-range model for ordinary and fragmented MP4. Logical file bytes may come from multiple noncontiguous image extents. Original inputs remain read-only; output belongs on healthy storage outside every input tree.
 
-`recover-fragmented` addresses PhotoRec output consisting of repeated `ftyp`/`moov` initialization headers and separate `mdat` pieces. It imports `report.xml`, verifies header bytes against the original image, and follows an uninterrupted sequence of `moof`/`mdat` pairs. Headers with identical content remain separate source-location jobs. This is not arbitrary filesystem-fragment reordering.
+A successful decode does not prove original recording identity or completeness. Reports distinguish acquisition status, association evidence and media validation. Missing bytes remain missing; later recoverable sections are separate clips.
 
-Accepted prefixes are copied without re-encoding, checked against exact encoded-packet SHA-256 hashes, counted, and fully decoded. Published files are labeled **decoded prefixes**, never guaranteed complete original recordings. Gaps, truncation, missing reference pictures, unsupported layouts, and missing tracks are not concealed.
+## Run
 
-Read [the fragmented-backend contract](docs/FRAGMENTED.md) before a full run. It includes support, failure states, resource bounds, and resume semantics.
-
-## Start
+Check tools, then recover supplied files:
 
 ```bash
 python3 videorebuild.pyz doctor
-python3 videorebuild.pyz recover-fragmented --help
+python3 videorebuild.pyz run --input /recovery/files --case /healthy/case
 ```
 
-On a Mac, install the runtime yourself with `brew install python@3.13 ffmpeg`. `run-fragmented-macos.command` locates installed Homebrew `python@3.13` and unversioned `ffmpeg` tools when present, resolving Homebrew aliases through `brew --prefix ffmpeg`, then runs the fragmented backend with your arguments. It retains the first complete FFmpeg/ffprobe pair accepted by `doctor`, checking `/opt/homebrew` before `/usr/local`; a later installation cannot override a supported pair. Unsupported or incomplete Homebrew pairs leave the original PATH fallback intact. Both `ffmpeg` and `ffprobe` must be version 8 or newer; `doctor` checks each executable. The launcher never installs or updates dependencies silently.
+For PhotoRec headers and the original raw image:
 
 ```bash
-bash ./run-fragmented-macos.command --help
+python3 videorebuild.pyz run \
+  --input /recovery/photorec \
+  --image /images/disk.img \
+  --report /recovery/photorec/recup_dir.1/report.xml \
+  --mapfile /images/disk.map \
+  --case /healthy/case
 ```
 
-For an interactive Terminal prompt without hardcoded paths:
+The PhotoRec report is optional. When supplied, small recovered MP4 headers must match their reported image bytes exactly. Image size must match reported geometry. Initialization locations remain separate jobs even if codec headers are identical. Image indexing is a sequential bounded scan, not a full-image allocation in memory.
+
+For filesystem-guided reconstruction, produce a DFXML report with the installed Sleuth Kit (qualified locally with fiwalk 4.14.0), then import its raw byte runs:
 
 ```bash
-bash ./recover-interactive.command
+fiwalk -x -z -g -G0 /images/disk.img > /healthy/filesystem.xml
+python3 videorebuild.pyz run \
+  --image /images/disk.img --extents /healthy/filesystem.xml \
+  --mapfile /images/disk.map --case /healthy/case
 ```
 
-The interactive script runs a 50-location pilot. A case directory must be new/empty and outside the recovered-source tree. The image must be the regular, uncompressed raw image represented by the PhotoRec report; a device node, cropped substitute, different image size, or guessed offset rebasing is rejected.
+Fiwalk is optional external tooling, not a Python dependency. Its exit code alone does not establish successful mapping: VideoRebuild validates the complete XML and each object's extent map. This path searches the mapped logical files; it does not separately scan the entire image for unlisted objects. Filesystem support depends on the metadata and external tool; no proprietary filesystem support is claimed.
 
-Use the same arguments with `--all` rather than `--limit 50` to process remaining locations. Do not delete or rename PhotoRec inputs. Re-running a pilot processes up to 50 additional pending locations.
+A mapfile qualifies only mapped image bytes. `+` means reported rescued; other map states and uncovered regions are unavailable. Without a mapfile acquisition status is unknown. If acquisition used different input/output positions, supply `--map-offset DELTA`, where image position = mapfile position + DELTA. Never infer this transform from filenames or file contents.
 
-## Outputs
+## Cases, limits and reports
 
-- `recovered/`: exact contiguous MP4 byte prefixes passing every validation gate.
-- `attempts/`: candidate MP4s, precise source ranges, hashes, and detailed validation logs. These include failed candidates; do not treat them as recovered videos.
-- `reports/index.html`: local summary and latest 100 outcomes.
-- `reports/summary.json`: aggregate results, reasons, pending counts, and tool versions.
-- `reports/results.jsonl`: streaming index of every processed location.
-- `blocked-windows/`: by default, up to four 1 MiB original-image windows around blocked locations, plus offsets and hashes. These can contain private video/audio; inspect before sharing. Disable with `--diagnostic-windows 0`.
-- `fragmented.sqlite3`, `fragmented-case.json`, `fragmented.log`: resume catalogue, source binding, and progress log.
-
-Exit codes: 0 means the case contains at least one decoded prefix; 3 means no decoded prefix was found; 2 means a safety/configuration/input error; 130 means interrupted. Code 0 does not mean every location succeeded. The report is authoritative.
-
-## Other recovery models
-
-The original ordinary-MP4 sample-table and scattered-extent backend remains available under `scan`, `run`, `recover`, and `report`. Its old guided launcher is `run-legacy-macos.command`. It is not the appropriate path for empty fragmented-MP4 initialization tables. See [legacy documentation](docs/LEGACY.md) and [support boundaries](docs/SUPPORT.md).
-
-## Reproduce analysis of an Intake ZIP
+`scan` performs intake/indexing only. `recover --case …` resumes an indexed case. `report --case …` refreshes local JSON, CSV and HTML reports. The main report is `CASE/reports/index.html`; `results.json` contains typed jobs and provenance. See `--help` for complete options.
 
 ```bash
-python3 tools/inspect_diagnostic.py --help
+python3 videorebuild.pyz run --input /recovery/files --case /healthy/case --limit 50
+python3 videorebuild.pyz recover --case /healthy/case --limit 50
+python3 videorebuild.pyz report --case /healthy/case
 ```
 
-This tool verifies sample hashes, parses initialization data, inventories embedded fragments independently of enclosing carve lengths, and reports PhotoRec source discontinuities. It does not extract or upload binary media. An existing output report is not overwritten.
+Ordinary MP4 matching can use `--deep` for bounded scattered-sample searches. Fragmented recovery has a default 16-MiB initialization window (`--max-record-bytes`, maximum 256 MiB), a bounded candidate-start count including rejected starts (`--max-segments`, default 64), and per-process validation timeouts. A limit is a search limit, never proof that more media is absent. Recovery may write candidates and publications, so allow space beyond the final encoded media size. No total-case retention quota is provided.
 
-## Tests and packaging
-
-Run from the project root with both FFmpeg and ffprobe 8+ available:
+Changing source identity, metadata/map binding, coordinate transform or validation settings can require a new case. Completed publications and their evidence are checked before reuse. Old cases require explicit backed-up conversion:
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-python3 tools/build_zipapp.py
-python3 videorebuild.pyz --version
+python3 videorebuild.pyz migrate-case --case /healthy/old-case
 ```
 
-[`TEST_REPORT.md`](TEST_REPORT.md) records executed validation. The October 16 accuracy audit passed all 118 tests on macOS/Apple Silicon with Python 3.11 and 3.13 source checkouts and the Python 3.13 standalone archive. Installed-wheel execution covered an earlier 102-test snapshot. Nine sampled real recovered prefixes passed fresh original-image byte comparisons, packet hashes, timing checks, and full decoding; this does not validate the entire recovery image or establish complete historical recordings. Synthetic fixtures are generated locally, not downloaded, and no private surveillance-media fixture is bundled. See the [accuracy audit](docs/AUDIT_ACCURACY.md) for scope and limits.
+See [case migration](docs/LEGACY.md), [shared architecture](docs/ARCHITECTURE.md), [fragmented strategy](docs/FRAGMENTED.md), [ordinary format support](docs/SUPPORT.md) and [implementation/release plan](docs/IMPLEMENTATION_PLAN.md).
 
-The standalone archive has no Python dependencies. The optional wheel build uses the pinned build requirement in `pyproject.toml`; it is not needed to run the zipapp. FFmpeg performs codec decoding; the Python code implements the narrow recovery/addressing rules.
+On macOS, `run-macos.command` selects an existing supported Homebrew/runtime pair and invokes canonical `run`. `recover-interactive.command` asks for input/output paths. Neither installs dependencies. The old split fragmented and legacy launchers were removed.
 
-To reproduce source and wheel packaging in an isolated project environment:
+## Validation and development
+
+Source execution uses the project environment:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --require-hashes -r requirements-build.txt
+PYTHONPATH=src .venv/bin/python -m videorebuild doctor
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python tools/build_zipapp.py
-.venv/bin/python -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
-.venv/bin/python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
+.venv/bin/python videorebuild.pyz --version
 ```
 
-Use Python 3.13+ for these commands. The source archive includes all four Mac launchers; CI checks their syntax, starts the extracted fragmented launcher, and installs a wheel built from that archive. Local artifacts retain version 0.2.0; validation does not imply a new published release.
+Tests generate synthetic media locally; no private recordings are bundled. Recovery checks encoded packet bytes, counts, supported track layout, exact timing where the strategy supplies it, and strict full decoding. Source immutability, ambiguity, interruption/resume, malformed mappings, resource bounds and migration failures are regression requirements. Optional fiwalk integration tests need the installed tool and otherwise skip explicitly.
+
+The zipapp builder overwrites `videorebuild.pyz`. Wheel/sdist builds use the pinned requirements in `requirements-build.txt` in a project-specific virtual environment. See [TEST_REPORT.md](TEST_REPORT.md) for executed evidence and limits; configured CI coverage is separate from checks that actually ran.
+
+No missing-header inference, generated frames, automatic chronology, raw-device writes, source filesystem repairs, or automatic upload occurs. Private paths and diagnostic windows can reveal sensitive media information; review before sharing.

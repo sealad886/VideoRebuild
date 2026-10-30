@@ -44,7 +44,7 @@ jobs:
           python -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
           SOURCE_CHECK="$(mktemp -d)"
           tar -xzf dist/*.tar.gz -C "$SOURCE_CHECK"
-          for launcher in run-macos.command run-fragmented-macos.command recover-interactive.command run-legacy-macos.command; do
+          for launcher in run-macos.command recover-interactive.command; do
             bash -n "$SOURCE_CHECK/videorebuild-"*/"$launcher"
           done
           bash "$SOURCE_CHECK/videorebuild-"*/run-macos.command --help

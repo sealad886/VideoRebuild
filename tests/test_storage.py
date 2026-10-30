@@ -5,12 +5,15 @@ import json
 import os
 from pathlib import Path
 import stat
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from videorebuild.cli import main
-from videorebuild.storage import Case, SafetyError, atomic_text, create_private_json, file_sha256, write_json
+from videorebuild.storage import (Case, ReaderPool, SafetyError, atomic_text, create_private_json,
+                                 file_sha256, scan_logical, write_json)
+from videorebuild.ranges import Extent, UnavailableRange
 
 
 class StorageTests(unittest.TestCase):
@@ -157,6 +160,258 @@ class StorageTests(unittest.TestCase):
                         self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
             finally:
                 os.umask(previous_umask)
+
+    def test_logical_reads_and_scanning_cross_physical_boundaries(self):
+        from videorebuild.bmff import make_box
+        data = make_box(b'ftyp',b'isom\x00\x00\x00\x00isom')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a,b = root/'a.bin',root/'b.bin'
+            a.write_bytes(b'XX'+data[:6])
+            b.write_bytes(b'junk'+data[6:])
+            with Case(root/'case') as case:
+                first,second = case.register_source(a),case.register_source(b)
+                sid = case.add_stream('video.mp4',[Extent(0,first,2,6),Extent(6,second,4,len(data)-6)],size=len(data))
+                with patch('videorebuild.storage.BLOCK',7):
+                    scan_logical(case,sid)
+                self.assertEqual(case.db.execute('SELECT kind FROM atoms').fetchall()[0][0],'ftyp')
+                self.assertEqual(case.sources()[sid]['sha256'],hashlib.sha256(data).hexdigest())
+                with ReaderPool(case.sources(),limit=1,physical_sources=case.physical_sources()) as pool:
+                    self.assertEqual(pool.read(sid,3,9),data[3:12])
+                    self.assertEqual(len(pool.provenance(sid,3,9)),2)
+                    self.assertLessEqual(len(pool.handles),1)
+                self.assertEqual(a.read_bytes(),b'XX'+data[:6])
+                self.assertEqual(b.read_bytes(),b'junk'+data[6:])
+
+    def test_logical_labels_do_not_conflate_distinct_recordings_and_staging_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'image'; source.write_bytes(b'abcdefgh')
+            with Case(root/'case') as case:
+                physical = case.register_source(source,'image')
+                a = case.add_stream('same.mp4',[Extent(0,physical,0,4)],size=4)
+                b = case.add_stream('same.mp4',[Extent(0,physical,4,4)],size=4)
+                self.assertNotEqual(a,b)
+                self.assertEqual(a,case.add_stream('same.mp4',[Extent(0,physical,0,4)],size=4))
+                case.db.execute('SAVEPOINT intake')
+                case.add_stream('later.mp4',[Extent(0,physical,0,4)],size=4)
+                case.db.execute('ROLLBACK TO intake')
+                case.db.execute('RELEASE intake')
+                self.assertEqual(case.db.execute("SELECT COUNT(*) FROM sources WHERE kind='logical'").fetchone()[0],2)
+
+    def test_map_holes_are_not_read_or_hashed_as_recovered_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'image'; source.write_bytes(b'AAAAXXXXBBBB')
+            rescue = root/'map'; rescue.write_text('0 + 1\n0 4 +\n4 4 -\n8 4 +\n')
+            with Case(root/'case') as case:
+                sid = case.register_source(source,'image',mapfile=rescue)
+                scan_logical(case,sid)
+                with ReaderPool(case.sources()) as pool:
+                    self.assertEqual(list(pool.available_ranges(sid)),[(0,4),(8,4)])
+                    self.assertEqual(pool.read(sid,8,4),b'BBBB')
+                    with self.assertRaises(UnavailableRange):
+                        pool.read(sid,2,8)
+                    rescue.write_text('0 + 1\n0 12 +\n')
+                    with self.assertRaises(SafetyError):
+                        pool.read(sid,0,4)
+                self.assertEqual(case.sources()[sid]['hash_scope'],'available-ranges')
+                self.assertEqual(case.sources()[sid]['sha256'],hashlib.sha256(b'AAAABBBB').hexdigest())
+
+    def test_logical_source_change_and_settings_change_fail_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'input'; source.write_bytes(b'abcdef')
+            with Case(root/'case') as case:
+                sid = case.register_source(source)
+                logical = case.add_stream('video',[Extent(0,sid,0,6)],size=6)
+                scan_logical(case,logical)
+                case.bind('settings',{'version':1})
+                with self.assertRaises(SafetyError):
+                    case.bind('settings',{'version':2})
+                with ReaderPool(case.sources(),physical_sources=case.physical_sources()) as pool:
+                    source.write_bytes(b'longer source')
+                    with self.assertRaises(SafetyError):
+                        pool.read(logical,0,1)
+
+    def test_scanning_one_stream_does_not_parse_unrelated_catalogue_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'image'; source.write_bytes(b'abcdefgh')
+            with Case(root/'case') as case:
+                physical = case.register_source(source,'image')
+                sid = case.add_stream('chosen',[Extent(0,physical,0,8)],size=8)
+                unrelated = case.add_stream('unrelated',[Extent(0,physical,0,8)],size=8)
+                case.db.execute('UPDATE sources SET extents=? WHERE id=?',('{unreadable',unrelated))
+                case.db.commit()
+                scan_logical(case,sid)
+                self.assertEqual(case.sources()[sid]['sha256'],hashlib.sha256(b'abcdefgh').hexdigest())
+
+    def test_narrow_range_and_identity_checks_do_not_walk_every_extent(self):
+        class Counted:
+            def __init__(self,values): self.values,self.reads=values,0
+            def __len__(self): return len(self.values)
+            def __getitem__(self,index):
+                self.reads+=1
+                return self.values[index]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/'image'; source.write_bytes(b'x'*10000)
+            with Case(root/'case') as case:
+                physical=case.register_source(source,'image')
+                sid=case.add_stream('many',[Extent(i,physical,i,1) for i in range(10000)],size=10000)
+                rows={r['id']:dict(r) for r in case.db.execute('SELECT * FROM sources')}
+                with ReaderPool(rows,physical_sources=case.physical_sources()) as pool:
+                    counted=Counted(pool.extents[sid]); pool.extents[sid]=counted
+                    for _ in range(100): pool.check(sid)
+                    self.assertEqual(list(pool.available_ranges(sid,9999,10000)),[(9999,1)])
+                    self.assertLess(counted.reads,40)
+
+
+class MigrationTests(unittest.TestCase):
+    def legacy_ordinary(self,root):
+        case_root = root/'case'
+        with Case(case_root):
+            pass
+        output = case_root/'candidates'/'old.mp4'
+        output.write_bytes(b'original encoded media')
+        digest = file_sha256(output)
+        db = sqlite3.connect(case_root/'case.sqlite3')
+        db.execute('DROP TABLE jobs')
+        db.execute('DROP TABLE settings')
+        db.execute('DROP INDEX sources_physical')
+        for column in ('extents','binding','hash_scope'):
+            db.execute(f'ALTER TABLE sources DROP COLUMN {column}')
+        db.execute('CREATE TABLE results(movie_digest TEXT PRIMARY KEY,status TEXT,detail TEXT,updated REAL)')
+        detail = {'run_key':'old','candidates':[{'path':'candidates/old.mp4','sha256':digest}], 'outputs':[]}
+        db.execute('INSERT INTO results VALUES(?,?,?,?)',('metadata','matched',json.dumps(detail),1.0))
+        db.execute('PRAGMA user_version=1')
+        db.commit(); db.close()
+        return case_root,output
+
+    def test_ordinary_migration_preserves_history_and_creates_verified_backup(self):
+        from videorebuild.migration import migrate_case
+        with tempfile.TemporaryDirectory() as directory:
+            case_root,output = self.legacy_ordinary(Path(directory))
+            original = output.read_bytes()
+            receipt = migrate_case(case_root)
+            self.assertEqual(receipt['migrated_jobs'],1)
+            backup = case_root/receipt['backup']
+            with contextlib.closing(sqlite3.connect(backup)) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT status FROM results').fetchone()[0],'matched')
+            with Case(case_root) as case:
+                job = case.job('ordinary','metadata')
+                self.assertEqual(job['status'],'matched')
+                self.assertTrue(job['detail']['historical_validation'])
+                self.assertNotIn('run_key',job['detail'])
+            self.assertEqual(output.read_bytes(),original)
+            self.assertEqual(migrate_case(case_root)['status'],'already_current')
+
+    def test_corrupt_publication_refuses_migration_without_losing_original_or_backup(self):
+        from videorebuild.migration import migrate_case
+        with tempfile.TemporaryDirectory() as directory:
+            case_root,output = self.legacy_ordinary(Path(directory))
+            output.write_bytes(b'changed')
+            with self.assertRaises(SafetyError):
+                migrate_case(case_root)
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
+            self.assertEqual(output.read_bytes(),b'changed')
+            self.assertEqual(len(list((case_root/'migration-backups').glob('*/case.sqlite3'))),1)
+
+    def test_failed_installation_restores_original_database(self):
+        from videorebuild.migration import migrate_case
+        with tempfile.TemporaryDirectory() as directory:
+            case_root,output = self.legacy_ordinary(Path(directory))
+            replace = os.replace
+            def fail_install(source,destination):
+                if Path(source).name.startswith('.migration-') and Path(destination).name == 'case.sqlite3':
+                    raise OSError('installation failure')
+                return replace(source,destination)
+            with patch('videorebuild.migration.os.replace',side_effect=fail_install):
+                with self.assertRaises(OSError):
+                    migrate_case(case_root)
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM results').fetchone()[0],1)
+            self.assertEqual(output.read_bytes(),b'original encoded media')
+
+    def test_backup_includes_committed_wal_on_failed_migration(self):
+        from videorebuild.migration import migrate_case
+        with tempfile.TemporaryDirectory() as directory:
+            case_root,output = self.legacy_ordinary(Path(directory))
+            output.write_bytes(b'changed')
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as writer:
+                writer.execute('PRAGMA journal_mode=WAL')
+                writer.execute('PRAGMA wal_autocheckpoint=0')
+                writer.execute('INSERT INTO events(created,kind,detail) VALUES(1,?,?)',('wal-only','{}'))
+                writer.commit()
+                self.assertTrue(Path(str(case_root/'case.sqlite3')+'-wal').exists())
+                with self.assertRaises(SafetyError):
+                    migrate_case(case_root)
+                backup = next((case_root/'migration-backups').glob('*/case.sqlite3'))
+                with contextlib.closing(sqlite3.connect(backup)) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='wal-only'").fetchone()[0],1)
+
+    def test_malformed_legacy_detail_preserves_original_database_and_backup(self):
+        from videorebuild.migration import migrate_case
+        with tempfile.TemporaryDirectory() as directory:
+            case_root,_ = self.legacy_ordinary(Path(directory))
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as db:
+                db.execute("UPDATE results SET detail='{broken'")
+                db.commit()
+            with self.assertRaises(ValueError):
+                migrate_case(case_root)
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT detail FROM results').fetchone()[0],'{broken')
+            self.assertEqual(len(list((case_root/'migration-backups').glob('*/case.sqlite3'))),1)
+
+    def test_late_invalid_migration_row_cannot_install_partial_conversion(self):
+        from videorebuild.migration import migrate_case
+        with tempfile.TemporaryDirectory() as directory:
+            case_root,output = self.legacy_ordinary(Path(directory))
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as db:
+                db.execute('INSERT INTO results VALUES(?,?,?,?)',('later','blocked','{broken',2.0))
+                db.commit()
+            with self.assertRaises(ValueError):
+                migrate_case(case_root)
+            with contextlib.closing(sqlite3.connect(case_root/'case.sqlite3')) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM results').fetchone()[0],2)
+                self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='jobs'").fetchone())
+            self.assertEqual(output.read_bytes(),b'original encoded media')
+
+    def test_fragmented_migration_keeps_old_evidence_and_validation_contract(self):
+        from videorebuild.migration import migrate_case
+        from videorebuild.image_recovery import verify_completed
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); case_root=root/'case'; case_root.mkdir()
+            (case_root/'attempts').mkdir(); (case_root/'recovered').mkdir()
+            output = case_root/'recovered'/'prefix.mp4'; output.write_bytes(b'old prefix')
+            evidence = {'outputs':['recovered/prefix.mp4'],'candidate_sha256':file_sha256(output),'output_bytes':10}
+            (case_root/'attempts'/'result.json').write_text(json.dumps(evidence))
+            binding={'image':{'path':str(root/'image'),'size':100,'mtime_ns':1,'device':2,'inode':3}}
+            (case_root/'fragmented-case.json').write_text(json.dumps(binding))
+            with contextlib.closing(sqlite3.connect(case_root/'fragmented.sqlite3')) as db:
+                db.execute('CREATE TABLE results(offset INTEGER PRIMARY KEY,status TEXT,reason TEXT,detail_path TEXT,updated REAL)')
+                db.execute('INSERT INTO results VALUES(?,?,?,?,?)',(0,'decoded_prefix','done','attempts/result.json',1))
+                db.commit()
+            receipt=migrate_case(case_root)
+            self.assertEqual(receipt['migrated_jobs'],1)
+            self.assertFalse((case_root/'fragmented.sqlite3').exists())
+            with Case(case_root) as case:
+                job=list(case.get_jobs('fragmented'))[0]
+                self.assertEqual(job['status'],'decoded_prefix')
+                self.assertTrue(job['detail']['historical_validation'])
+                self.assertEqual(job['detail']['output_evidence'][0]['sha256'],file_sha256(output))
+                self.assertEqual(case.sources(),{})
+                verify_completed(case)
+                output.write_bytes(b'changed historical publication')
+                with self.assertRaises(SafetyError):
+                    verify_completed(case)
+                output.write_bytes(b'old prefix')
+            self.assertEqual(output.read_bytes(),b'old prefix')
 
 
 if __name__ == '__main__':

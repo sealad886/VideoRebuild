@@ -179,3 +179,18 @@ Supporting files: `test-results/unittest.log`, `fragmented-unittest.log`, `runti
 ## Limits
 
 The corrected backend recovers uninterrupted fMP4 prefixes at reported initialization locations. It is not a general filesystem-fragment reassembler and does not claim every prefix is an entire original recording. It cannot prove recording identity, chronology, or recovery of overwritten bytes. Read `docs/FRAGMENTED.md` before a bulk run.
+
+
+## Shared byte-range release candidate 0.3.0 — 2026-10-30
+
+Baseline `9db774d`, work branch `codex/shared-byte-range`. Python 3.13.18, macOS/Apple Silicon, FFmpeg/ffprobe 9.0.2; optional fiwalk 4.14.0. The pre-change source suite passed 147 tests. Final reviewed source passed **189 tests in 42.220 s**; standalone-zipapp imports passed **189 in 61.045 s**; isolated installed wheel, built from the sdist and tested outside the checkout, passed **189 in 59.893 s**. No skips occurred locally, including real fiwalk integration. Build requirements were installed from the existing hash-pinned manifest into the project .venv (setuptools 84.1.0).
+
+Commands/evidence: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`/tmp/videorebuild-release-tests.log`), zipapp imports (`/tmp/videorebuild-zipapp-tests.log`), wheel-from-sdist isolated environment and extracted-source launcher verification (`/tmp/videorebuild-distribution-verification.log`). Source AST syntax, shell launcher syntax, package metadata/runtime version agreement and `git diff --check` also passed.
+
+A generated H.264/AAC MP4 was stored across noncontiguous FAT16 clusters inside an MBR partition starting at 1 MiB. Actual fiwalk output plus a matching mapfile drove canonical CLI reconstruction. Encoded video/audio payload, strict decoding and unchanged input hashes passed. Other fixtures cover physically noncontiguous fragmented MP4, files-only recovery, rescued prefix and later IDR/tfdt section around a rescue hole, missing restart timing, duplicate header locations, malformed XML rollback, map transforms/unknown ranges, migration backup/WAL/rollback, source/output changes and bounded interruption/resume.
+
+Requested Simplify Code and independent performance-centric Adversarial Audit passes completed before any main merge. All confirmed in-scope findings were fixed and independently rechecked; see [SHARED_RANGE_REVIEW.md](docs/SHARED_RANGE_REVIEW.md). Selected-stream setup is linear in relevant mappings; migration streams rows; source checks cache physical IDs; narrow availability uses binary search; malformed fragment candidates consume attempt and aggregate-read budgets. Synthetic performance results do not establish real-image throughput or recovery yield.
+
+Hosted CI is pending at this local checkpoint. Remote `main` is absent; the existing default is `codex/fragment-accuracy-audit`. Automatic approval review rejected creating remote main at the verified existing local main commit. Therefore no merge, tag or public release has occurred; source/artifact checks alone are not a release claim. A focused draft PR against the existing default branch is the review target until explicit main-creation approval resolves that gate.
+
+No private image, recording or existing recovery case was processed. Original filesystem support/yield remains unverified. Optional fiwalk tests skip on hosts without the tool; configured Linux/macOS Python 3.13/3.14 CI coverage must be distinguished from executed results. Forced termination during final migration installation may require restoring the retained complete backup; ordinary exception rollback is tested. No PyPI publication is implied.

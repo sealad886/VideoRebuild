@@ -22,10 +22,10 @@ class RecoveredPrefixAuditTests(unittest.TestCase):
             recovery, image, locations = write_case_inputs(root, [movie, movie], len(prefix.initialization.data))
             case = root/'case'
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                status = main(['recover-fragmented', '--image', str(image), '--root', str(recovery),
-                               '--case', str(case), '--diagnostic-windows', '0'])
+                status = main(['run', '--image', str(image), '--input', str(recovery),
+                               '--report', str(recovery/'recup_dir.1/report.xml'), '--case', str(case)])
             self.assertEqual(status, 0)
-            missing = case/'recovered'/f'offset-{locations[0][0]:014d}-prefix.mp4'
+            missing = next((case/'reconstructed').glob(f'fragment-*-{locations[0][0]}-*.mp4'))
             missing.unlink()
             before = {path: path.read_bytes() for path in case.rglob('*') if path.is_file()}
             source_before = image.read_bytes()
@@ -53,11 +53,11 @@ class RecoveredPrefixAuditTests(unittest.TestCase):
             recovery, image, _ = write_case_inputs(root, [movie], len(prefix.initialization.data))
             case = root/'case'
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                status = main(['recover-fragmented', '--image', str(image), '--root', str(recovery),
-                               '--case', str(case), '--diagnostic-windows', '0'])
+                status = main(['run', '--image', str(image), '--input', str(recovery),
+                               '--report', str(recovery/'recup_dir.1/report.xml'), '--case', str(case)])
             self.assertEqual(status, 0)
-            publication = next((case/'recovered').glob('*.mp4'))
-            database = case/'fragmented.sqlite3'
+            publication = next((case/'reconstructed').glob('*.mp4'))
+            database = case/'case.sqlite3'
             before = {path: path.read_bytes() for path in (image, publication, database)}
             tool = Path(__file__).resolve().parents[1]/'tools/check_recovered_prefixes.py'
             report = root/'passed.json'

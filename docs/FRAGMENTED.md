@@ -1,64 +1,41 @@
-# Fragmented backend: scope and safety contract
+# Fragmented MP4 strategy and safety contract
 
-## Runtime
+## Shared inputs and identity
 
-Both FFmpeg and ffprobe must be version 8 or newer. `doctor` rejects either
-executable below this floor before recovery begins. FFmpeg 7.1.5 can report a
-codec-inferred packet duration instead of the MOV container's sample duration
-when composition-time entries are present; FFmpeg 8 records that duration in
-its packet timing data. The independent timing gate remains exact rather than
-accepting a guessed duration. See the [versioned source references](REFERENCES.md).
+Canonical `run`/`recover` uses the shared Case, ReaderPool, settings, jobs and reports described in ARCHITECTURE.md. Sources can be recovered regular files, raw image ranges, or explicitly mapped logical filesystem files. Physical extents may be noncontiguous; logical gaps and unrescued image bytes remain unavailable.
 
-## Inputs and identity
+With `--report`, PhotoRec XML supplies initialization locations and recovered headers provide comparison bytes. Report image size must match the source image. Byte-run sector padding is clipped to logical filesize. Header files must match the image mappings exactly. Bare filenames are resolved beside report.xml's recup_dir; qualified names use explicit recovery-folder/basename components. Filenames do not establish recording identity.
 
-The authoritative media source is a regular raw disk-image file, opened read-only. PhotoRec `report.xml` supplies byte locations; recovered `.mp4` headers provide exact comparison bytes. XML byte-run lengths can include sector padding, so comparisons are clipped to the logical `filesize`. For example, a 1,174-byte header mapped over 1,536 bytes is compared using 1,174 bytes, not 1,536.
+Without PhotoRec, the shared bounded scan discovers ftyp/moov initialization candidates. Each initialization location remains a separate job, including equal header hashes. Windows stop at the next initialization or configured record limit. Repeated headers identify configuration, not unique recordings. Raw-image association is reported as a candidate; explicit logical files retain their filesystem/recovered-file evidence classification.
 
-Every initialization location is a separate SQLite job. A repeated header hash identifies a codec configuration, not a unique recording. Numeric PhotoRec names and `mfhd` sequence numbers are not calendar timestamps or globally unique recording identifiers.
+Image/map/report identities and settings are bound to the case. This is not a full forensic custody ledger or protection against a hostile administrator preserving metadata. Consumed ranges and publications are hashed. Inputs remain read-only.
 
-The report is streamed into SQLite, not loaded as a document tree. Small MP4 entries up to 1 MiB are indexed. Record candidates are processed in source-offset order. Each source window ends at the next reported initialization location, the per-record size ceiling, or image end, whichever comes first. This boundary is intentionally conservative: an overlapping or false-positive initialization can cause a false negative, but not a cross-boundary concatenation claim.
+## Supported container subset
 
-PhotoRec may use bare filenames for files beside `report.xml`, then qualified paths for later recovery folders. A bare filename is mapped only to the report's containing `recup_dir.*` folder. Qualified paths use their final recovery-folder and basename components. Image-byte comparison remains required; filenames never establish recording identity.
+FFmpeg and ffprobe 8+ are required. Initialization consists of ftyp followed by moov, mvex/trex, empty stts/stsc/stsz/stco, one sample description per track and self-contained data references. Video is H.264 avc1/avc3 or HEVC hvc1/hev1; optional audio is AAC mp4a. Audio-only jobs are not exposed. Every declared track must have samples; none is silently discarded.
 
-The image size must equal the report's source size. The code does not infer whole-disk versus partition rebasing. Each processed recovered header must match its report-mapped image bytes exactly. A split header must also appear physically contiguous at its starting location before this backend can follow its media.
+Fragments use mfhd plus traf/tfhd, optional tfdt v0/v1 and one or more trun boxes. default-base-is-moof addressing and an explicit first data offset per track are required; later runs may continue contiguously. Supported defaults/per-sample fields include duration, size, flags, sample-description index 1 and signed/unsigned composition offsets. Each moof is immediately followed by a finite mdat whose payload is exactly accounted for, without gaps/overlap/out-of-bounds samples.
 
-Source binding uses path, size, inode/device, mtime/ctime, sampled image hashes, a full XML hash, and tool/recovery settings. It is not a full-image forensic hash, hardware write blocker, or defense against an adversarial local administrator preserving metadata. The exact consumed image window and published byte prefix are hashed separately. The image is checked for changes before/after each candidate; recovered headers are checked before/after reads.
+Every video's length-prefixed NAL layout is checked; 1-, 2- and 4-byte length fields are supported. AVC NAL types 1..23 and HEVC 0..40 are accepted. Codec decoding remains FFmpeg's responsibility. The first video sample must contain AVC IDR type 5 or HEVC IDR 19/20 and must not be flagged non-sync. CRA/open-GOP restarts are not supported.
 
-## Implemented format subset
+Within a section, sequences must increment by one and explicit tfdt bases must match accumulated per-track durations. The original-prefix path requires initial sequence 0 or 1; without tfdt it accumulates each track from zero. A later independent section can begin at another sequence, but needs explicit restart decode timing for every declared track. Missing cross-track phase is blocked rather than guessed.
 
-An initialization consists of an exact `ftyp` followed by `moov`, with `mvex`/`trex`, empty `stts`/`stsc`/`stsz`/`stco`, one sample description per track, self-contained data references, H.264 (`avc1`/`avc3`) or HEVC (`hvc1`/`hev1`) video, and optional AAC (`mp4a`). Audio-only recovery is not exposed in this backend. All declared tracks need samples; none are silently discarded.
+Free/skip boxes between fragments are retained; intact mfra or new ftyp ends a section. An unsupported structure, clock discontinuity or unavailable range stops the current section. Candidate later moofs are independently assessed only within the bounded logical source/window; discovery does not silently join a gap or associate arbitrary orphans across recordings.
 
-Fragments contain `mfhd` and one or more `traf` boxes. Each track fragment uses `tfhd`, optional `tfdt` version 0 or 1, and one or more `trun` boxes. `default-base-is-moof` addressing is required. The first run for each track has an explicit moof-relative data offset; subsequent runs may continue contiguously. Supported defaults are duration, size, flags, and sample-description index 1. Per-sample durations, sizes, flags, first-sample flags, and signed/unsigned composition offsets are parsed.
+## Outputs and validation
 
-Each `moof` is immediately followed by one finite-length `mdat`. Referenced samples must account for its payload exactly, without gaps, overlap, or out-of-bounds data. Every video sample's length-prefixed NAL layout is checked. HEVC is limited to recognized NAL types 0..40; H.264 to 1..23. Supported length fields are 1, 2, or 4 bytes. Codec decoding remains FFmpeg's responsibility.
+`decoded_prefix` is a validated original beginning under this model. `decoded_segment` identifies a separately exported later section; an initialization job containing such outputs has `decoded_segments` status. Output files live in reconstructed/ and jobs reference their exact paths/hashes. A later output includes copied initialization plus surviving section bytes; encoded samples remain unchanged, but its whole-file hash need not equal a contiguous image range.
 
-The first fragment sequence is 0 or 1; successors must increment by one. Sequence wraparound is not guessed. Without `tfdt`, timestamps accumulate independently per track from zero along the verified sequence. With `tfdt`, each later base must agree exactly with that track's accumulated end. Clock discontinuities stop the prefix. This supports the observed recorder layout without pretending that browser MSE requirements are a universal file-validation rule.
+Publication requires supported structure, sequence, timing, all-track presence, IDR start, exact encoded-packet hashes/counts and full strict decoding. Packet DTS/PTS/duration are independently checked using rational time bases, including documented MOV normalization for negative composition offsets. Decoder diagnostics prevent publication even with process exit zero. A successful clip does not establish complete historical recording boundaries, camera identity, wall-clock dates or absence of original dropped frames.
 
-The first video sample must contain an IDR (HEVC type 19/20 or AVC type 5) and must not be flagged non-sync. CRA-only starts and recovery beginning in the middle of a GOP are not claimed. Full decoding errors—including stderr diagnostics with a zero process exit code—prevent publication.
+Manifests separately record acquisition status, association, logical/physical ranges, per-range hashes, validation and gaps. Blocked/decode_failed/search_limited outcomes retain reasons. No frames are generated, duplicated, interpolated or filled to conceal missing bytes. Clips across missing intervals are not combined automatically. Private diagnostic windows are no longer exported during ordinary recovery; diagnostic tools are explicit separate operations.
 
-`free` and `skip` boxes between fragments are retained unchanged. An intact `mfra` or a new `ftyp` ends the prefix. Other top-level layouts stop the prefix. There is no blind signature hunt to bridge an unexpected gap in the recovery path. A separate diagnostic inspector can find valid embedded pairs in an over-carved `mdat`, but it never automatically associates those orphans with a recording.
+## Resume, bounds and limits
 
-## Outputs and interpretation
+One shared case lock prevents concurrent writers. Initialization jobs checkpoint after their bounded attempt. Interruption retries uncommitted work; an existing output can be reused only if bytes agree exactly. Completed publications and validation evidence are verified before reuse. Historical migrated evidence retains its original validation scope.
 
-`decoded_prefix` means the exact contiguous image byte prefix passed: structure, sequence, timing, all-track presence, IDR-start checks, exact encoded-packet hashes, packet/frame counts, and full decoding. Packet DTS, PTS, and duration are independently compared with the parser's per-track timeline using exact rational time bases. For negative composition offsets, the comparison accounts for FFmpeg MOV demuxing's per-track PTS normalization (the largest negative offset's magnitude); arbitrary timestamp shifts or tolerances are not accepted. Missing timing fields or a mismatch prevent publication. It does not establish completeness, original recording identity, wall-clock date, or whether the camera originally dropped frames. A partial prefix may be published after a later truncation; its stop reason and original-image stopping offset are retained.
+The record window defaults to 16 MiB and is capped at 256 MiB. Initialization is capped at 1 MiB; moof at 4 MiB. Each fragment and retained prefix have explicit sample budgets (200,000); samples are at most 64 MiB, and NAL counts are capped at 4,096 per sample. The candidate-start attempt limit, including rejected starts, defaults to 64 and is capped at 1,024. Aggregate candidate-media reads are capped at twice the bounded source-window length; prefilter bytes are reused during assembly. Budget stops retain validated clips and report search_limited. Subprocess timeouts and output-spooling bounds remain enforced. Hitting a limit is not proof that later media is absent.
 
-`blocked` means no eligible prefix under the implemented model. `decode_failed` means a structurally eligible candidate failed decoding, packet hashes, counts, or a validation timeout. Validation logs are retained. No video or audio is generated, re-encoded, interpolated, duplicated, or filled to conceal missing bytes.
+Candidate plus publication can consume about twice retained encoded bytes, with additional evidence/log space. There is no total-case quota or automatic retention deletion. Use healthy output storage with capacity for attempted alternatives.
 
-Both the attempt copy and published prefix consume disk space (up to approximately twice the accepted encoded bytes). Failed attempt candidates remain for diagnosis. There is no automatic retention deletion or whole-case disk quota. Input files are never altered; disk-full errors abort explicitly. Choose healthy output storage with sufficient capacity.
-
-## Resume and limits
-
-Completed jobs are checkpointed per image offset. An interrupted uncommitted job is retried; prior uniquely named attempt folders remain as evidence. A publish-before-commit interruption can reuse an output only if its bytes match the new candidate exactly. A conflicting existing output causes a hard error. Completed results are not silently invalidated.
-
-Before processing pending jobs, resume verifies every completed published prefix against its stored size and SHA-256. Missing or changed output or validation evidence stops with exit code 2 and preserves the case for investigation. This reads completed output bytes again but does not repeat decoding.
-
-Only the pilot count and diagnostic-window settings may change while reusing a case. A source fingerprint, tool, timeout, application version, or record-window limit change requires a new case. Thus a timeout is not a claim that recovery is impossible, but raising the timeout is an explicit new run/case.
-
-A per-record image window defaults to 16 MiB, configurable from 1 KiB to 256 MiB. Initialization is capped at 1 MiB and moof at 4 MiB. A fragment has at most 200,000 samples; each sample is at most 64 MiB. NAL counts are capped at 4,096 per sample. Temporary subprocess output is spooled to disk, retained probe JSON is capped at 64 MiB (including packet hashes and timing), retained stderr at 64 KiB, and each external validation process defaults to a 120-second timeout. Hitting a limit is a reported stop/rejection, not proof of missing source data.
-
-The retained prefix also has a total budget of 200,000 samples across all fragments. A fragment exceeding the remaining budget is not retained; parsing stops with `prefix_sample_budget_exceeded`, preserving the preceding complete prefix for validation. This is an operational memory bound, not a claim that later source samples are missing or malformed.
-
-## Not implemented
-
-Arbitrary filesystem cluster-chain reconstruction; noncontiguous original fragments; cross-recording fragment matching; missing initialization reconstruction; absolute `tfhd` offsets; browser streaming MSE conformance; encryption/CENC; external references; edit lists or track-reference relationships; auxiliary/proprietary tracks; Annex-B conversion; timestamp OCR; wall-clock chronology; joining separate recordings; compressed image containers; raw device access; repair of source filesystems.
-
-The distinction is important: fragmented MP4 (the container layout) is not the same as a file being fragmented across filesystem clusters. This backend handles the former in contiguous source ranges. It does not silently claim to solve the latter.
+Missing-initialization reconstruction, automatic cross-recording association, arbitrary cluster permutation, absolute tfhd addressing, encryption/CENC, external references, edit lists/auxiliary/proprietary tracks, Annex-B conversion, timestamp OCR and wall-clock joining remain unsupported. Explicit raw filesystem extent imports support physical fragmentation without claiming a general proprietary filesystem recovery engine.

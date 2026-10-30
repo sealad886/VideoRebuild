@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from videorebuild.bmff import FormatError, boxes, make_box, parse_movie, rewrite_offsets, valid_sample, _sample_sizes
-from videorebuild.storage import iter_blocks
+from videorebuild.storage import ReaderPool, source_identity
 
 
 class BoxTests(unittest.TestCase):
@@ -78,7 +78,7 @@ class BoxTests(unittest.TestCase):
     def test_block_ownership_exactly_once(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'x.bin'; raw=bytes(range(100)); p.write_bytes(raw)
-            with patch('videorebuild.storage.BLOCK', 17):
-                blocks=list(iter_blocks(p, 16))
+            with patch('videorebuild.storage.BLOCK',17), ReaderPool({1:source_identity(p)}) as pool:
+                blocks=list(pool.iter_blocks(1,16))
             self.assertEqual(b''.join(b[:n] for _,b,n in blocks),raw)
             self.assertEqual([p for p,_,_ in blocks], [0,17,34,51,68,85])
