@@ -22,6 +22,10 @@ Within a section, sequences must increment by one and explicit tfdt bases must m
 
 Free/skip boxes between fragments are retained; intact mfra or new ftyp ends a section. An unsupported structure, clock discontinuity or unavailable range stops the current section. Candidate later moofs are independently assessed up to the next initialization or source boundary; discovery does not silently join a gap or associate arbitrary orphans across recordings.
 
+## Reconstruction-only mode
+
+With `--reconstruct-only`, fragment parsing, NAL framing, IDR starts, timing continuity, track completeness and allocation/acquisition checks still define eligible sections. FFmpeg/ffprobe validation is skipped. Outputs use `reconstructed_prefix` / `reconstructed_segment` labels (job status `reconstructed_prefix` / `reconstructed_segments`) with `decode_checked: false` and `scope: structural_reconstruction_only`. Original bytes and metadata remain preserved; no codec quality or playability is claimed. Default strict mode retains the validation contract below. Mode changes require `--retry`, preserve prior settings in a backup and revisit previous coverage without reindexing.
+
 ## Outputs and validation
 
 `decoded_prefix` is a validated original beginning under this model. `decoded_segment` identifies a separately exported later section; an initialization job containing such outputs has `decoded_segments` status. Output files live in reconstructed/ and jobs reference their exact paths/hashes. A later output includes copied initialization plus surviving section bytes; encoded samples remain unchanged, but its whole-file hash need not equal a contiguous image range.

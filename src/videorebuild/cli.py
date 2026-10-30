@@ -50,6 +50,7 @@ def parser() -> argparse.ArgumentParser:
             q.add_argument('--mapfile', type=Path, help='Matching GNU ddrescue mapfile for exactly one image')
             q.add_argument('--map-offset', type=int, default=0, help='Explicit image offset minus mapfile input offset in bytes')
         if name in ('recover', 'run'):
+            q.add_argument('--reconstruct-only', action='store_true', help='Export structurally reconstructed encoded bytes without FFmpeg/ffprobe quality checks; outputs are not decode-validated')
             q.add_argument('--deep', action='store_true', help='Search scattered sample-table extents when whole-payload matching fails')
             if name == 'recover':
                 q.add_argument('--allocation-map', type=Path, help='Image-bound filesystem-unallocated JSON policy for an existing index; rejects allocated image reads without reindexing')

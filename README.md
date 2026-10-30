@@ -68,6 +68,15 @@ The policy is schema 1 JSON with `kind: "filesystem-unallocated"` and an `images
 
 This policy gates image reads during reconstruction, including metadata evidence, cached attempts and fragment windows. It intersects acquisition availability without changing source/index rows. Regular recovered files remain eligible; their free-space provenance still comes from their original recovery selection. Historical publications remain historical and are not retrospectively certified by a new policy. Allocated files can serve as independently extracted controls for reconstruction testing; this does not assume damaged filesystem metadata or authorize recovering allocated footage.
 
+To reconstruct an indexed case without FFmpeg/ffprobe quality checks:
+
+```bash
+python3 videorebuild.pyz recover --case /healthy/case --deep --retry \
+  --allocation-map /healthy/filesystem-unallocated.json --reconstruct-only
+```
+
+This mode preserves encoded bytes and the structural/source checks needed for assembly. Outputs are labelled `reconstructed` (or fragmented `reconstructed_prefix` / `reconstructed_segments`), with explicit evidence that decoding was not checked. It does not require FFmpeg/ffprobe. The default mode retains strict codec validation. Switching modes retries previous decisions while preserving the index; back up the case first.
+
 ## Cases, limits and reports
 
 `scan` performs intake/indexing only. `recover --case …` resumes an indexed case. `report --case …` refreshes local JSON, CSV and HTML reports. The main report is `CASE/reports/index.html`; `results.json` contains typed jobs and provenance. See `--help` for complete options.
@@ -103,7 +112,7 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python videorebuild.pyz --version
 ```
 
-Tests generate synthetic media locally; no private recordings are bundled. Recovery checks encoded packet bytes, counts, supported track layout, exact timing where the strategy supplies it, and strict full decoding. Source immutability, ambiguity, interruption/resume, malformed mappings, resource bounds and migration failures are regression requirements. Optional fiwalk integration tests need the installed tool and otherwise skip explicitly.
+Tests generate synthetic media locally; no private recordings are bundled. Recovery checks encoded packet bytes, counts, supported track layout, exact timing where the strategy supplies it, and strict full decoding. For reconstruction without codec quality checks, use `--reconstruct-only`; original AVC standalone SEI metadata is preserved and outputs are explicitly labelled as reconstructed without decode validation. Validator revisions and the selected mode recheck prior decisions on resume without rebuilding the index; see [ordinary format support](docs/SUPPORT.md). Source immutability, ambiguity, interruption/resume, malformed mappings, resource bounds and migration failures are regression requirements. Optional fiwalk integration tests need the installed tool and otherwise skip explicitly.
 
 The zipapp builder overwrites `videorebuild.pyz`. Wheel/sdist builds use the pinned requirements in `requirements-build.txt` in a project-specific virtual environment. See [TEST_REPORT.md](TEST_REPORT.md) for executed evidence and limits; configured CI coverage is separate from checks that actually ran.
 

@@ -14,6 +14,8 @@ from .bmff import Movie
 from .progress import phase
 from .storage import SafetyError
 
+VALIDATION_REVISION = 1
+
 
 def run_tool(args: list[str], timeout: float, output_limit: int = 2*1024*1024) -> dict:
     """Spool output to temporary files rather than accumulate unbounded pipe data."""

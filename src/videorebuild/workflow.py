@@ -175,7 +175,7 @@ def reconstruct(case: Case, args) -> None:
     with phase('Reconstructing ordinary MP4 recordings', total=1, unit='strategies') as task:
         recover(case, Options(**fields), args.limit, args.retry, allocation_scope=allocation_scope)
         task.advance()
-    tools = doctor()
+    tools = {'mode': 'structural_reconstruction_only'} if args.reconstruct_only else doctor()
     with phase('Reconstructing fragmented MP4 recordings', total=1, unit='strategies') as task, ReaderPool(case.sources(), physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool:
         recover_fragmented(case, pool, tools, args, args.limit, args.retry)
         task.advance()

@@ -143,6 +143,7 @@ class ExhaustiveMatchingTests(unittest.TestCase):
                     candidate = case.root / 'candidates' / 'cached.mp4'
                     candidate.write_bytes(source.read_bytes())
                     cached = {'status': status, 'tools': {}, 'timeout': 300.0,
+                              'validation_revision': engine.VALIDATION_REVISION,
                               'path': 'candidates/cached.mp4', 'sha256': hashlib.sha256(candidate.read_bytes()).hexdigest()}
                     digest = engine.mapping_digest(movie, mapping)
                     case.db.execute('INSERT INTO attempts(movie_digest,mapping_digest,stage,status,detail) VALUES(?,?,?,?,?)',

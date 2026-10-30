@@ -269,8 +269,11 @@ def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> 
     """Keep evidence settings immutable; permit explicit search expansion on retry."""
     immutable = {'version': __version__, 'max_record_bytes': options.max_record_bytes,
                  'timeout': options.timeout, 'tools': tools}
+    reconstruct_only = bool(getattr(options, 'reconstruct_only', False))
     policy = {'max_segments': options.max_segments, 'indexed_starts': 'through_next_initialization',
               'allocation_scope': allocation_scope}
+    if reconstruct_only:
+        policy['reconstruct_only'] = True
     row = case.db.execute("SELECT value FROM settings WHERE name='fragmented_settings'").fetchone()
     prior = json.loads(row[0]) if row else None
     legacy = prior is not None and 'max_segments' in prior
@@ -279,8 +282,11 @@ def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> 
     if legacy:
         old_policy = {'max_segments': prior['max_segments'], 'indexed_starts': 'bounded_record_window'}
         prior = {key: value for key, value in prior.items() if key != 'max_segments'}
+    mode_changed = old_policy is not None and bool(old_policy.get('reconstruct_only', False)) != reconstruct_only
     if prior is not None and prior != immutable:
-        raise SafetyError('Case settings changed for fragmented_settings; use a new case')
+        stable = lambda value: {key: item for key, item in value.items() if key != 'tools'}
+        if not (retry and mode_changed and stable(prior) == stable(immutable)):
+            raise SafetyError('Case settings changed for fragmented_settings; use a new case')
     changed = old_policy is not None and old_policy != policy
     if changed:
         old_limit = old_policy['max_segments']
@@ -297,6 +303,7 @@ def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> 
         case.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',
                         ('fragmented_search_policy', json.dumps(policy, sort_keys=True, separators=(',', ':'))))
         case.event('fragmented_search_policy_expanded', {'before': old_policy, 'after': policy,
+                                                       'mode_changed': mode_changed,
                                                        'backup': str(backup.relative_to(case.root))})
     else:
         case.bind('fragmented_settings', immutable)
@@ -314,12 +321,15 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
     max_bytes = options.max_record_bytes
     max_segments = options.max_segments
     timeout = options.timeout
+    reconstruct_only = bool(getattr(options, 'reconstruct_only', False))
     check_options(options)
     verify_completed(case)
     allocation_scope = pool.allocation_scope.digest if pool.allocation_scope is not None else None
     policy_changed = _bind_search_policy(case, tools, options, retry, allocation_scope)
     search_policy = {'max_segments': max_segments, 'indexed_starts': 'through_next_initialization',
                      'allocation_scope': allocation_scope}
+    if reconstruct_only:
+        search_policy['reconstruct_only'] = True
     if policy_changed:
         for saved in case.get_jobs('fragmented'):
             prior = saved['detail']
@@ -364,6 +374,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                       'search_end': end, 'next_initialization': boundary,
                       'tracks': {str(k): asdict(v) for k, v in init.tracks.items()},
                       'outputs': [], 'output_evidence': [], 'segments': [], 'gaps': [],
+                      'reconstruct_only': reconstruct_only, 'decode_checked': False,
                       'timing_note': 'Decode times are media ticks, not wall-clock dates.'}
             # Existing validated clips are immutable. Retry searches uncovered
             # starts without replacing a previously published bounded section.
@@ -374,7 +385,8 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     if name in old['detail']:
                         detail[name] = old['detail'][name]
             published = iter(sorted((segment['logical_start'], segment['logical_end'])
-                                   for segment in detail['segments'] if segment.get('output')))
+                                   for segment in detail['segments'] if segment.get('output') and
+                                   bool(segment.get('reconstruct_only', False)) == reconstruct_only))
             published_range = next(published, None)
             read_bytes = 0
 
@@ -479,7 +491,10 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                         write_task.update(len(retained))
                         stream.flush()
                         os.fsync(stream.fileno())
-                    checked = validate_prefix(candidate, data, prefix, tools, timeout)
+                    checked = ({'ok': True, 'decode_checked': False,
+                                'scope': 'structural_reconstruction_only',
+                                'reason': 'structural_reconstruction_only'} if reconstruct_only else
+                               validate_prefix(candidate, data, prefix, tools, timeout))
                     # Exact packet comparison needs a bounded large probe response, but
                     # failed responses must not accumulate that response per section.
                     for command in ('probe', 'decode'):
@@ -506,8 +521,10 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                             stream.flush()
                             os.fsync(stream.fileno())
                     relative = str(output.relative_to(case.root))
-                    segment.update(status='decoded_segment' if later else 'decoded_prefix',
-                                   reason='packet_hashes_timing_and_decode_passed', output=relative,
+                    segment.update(status=('reconstructed_segment' if later else 'reconstructed_prefix') if reconstruct_only else
+                                          ('decoded_segment' if later else 'decoded_prefix'),
+                                   reason='structural_reconstruction_only' if reconstruct_only else 'packet_hashes_timing_and_decode_passed',
+                                   reconstruct_only=reconstruct_only, output=relative,
                                    first_sequence=prefix.fragments[0].sequence,
                                    last_sequence=prefix.fragments[-1].sequence,
                                    durations_seconds={str(tid): (clock-prefix.starts[tid])/init.tracks[tid].timescale
@@ -515,7 +532,10 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     if start > consumed:
                         detail['gaps'].append({'start': consumed, 'end': start,
                                                'reason': 'not_exported_between_sections'})
-                    detail['outputs'].append(relative)
+                    detail['segments'] = [saved for saved in detail['segments'] if saved.get('output') != relative]
+                    detail['output_evidence'] = [saved for saved in detail['output_evidence'] if saved['path'] != relative]
+                    if relative not in detail['outputs']:
+                        detail['outputs'].append(relative)
                     detail['output_evidence'].append({'path': relative, 'size': len(retained), 'sha256': digest})
                     detail['segments'].append(segment)
                     consumed = max(consumed, segment['logical_end'])
@@ -529,7 +549,11 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             if detail.get('limit_reason'):
                 status = 'search_limited'
             elif detail['outputs']:
-                status = 'decoded_segments' if any(s['later_section'] and s['status'] == 'decoded_segment' for s in detail['segments']) else 'decoded_prefix'
+                unchecked = reconstruct_only or any(s.get('reconstruct_only', False) for s in detail['segments'] if s.get('output'))
+                detail['decode_checked'] = not unchecked
+                later_outputs = any(s['later_section'] for s in detail['segments'] if s.get('output'))
+                status = ('reconstructed_segments' if later_outputs else 'reconstructed_prefix') if unchecked else (
+                          'decoded_segments' if later_outputs else 'decoded_prefix')
             elif any(s['status'] == 'decode_failed' for s in detail['segments']):
                 status = 'decode_failed'
             else:

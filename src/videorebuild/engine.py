@@ -27,7 +27,7 @@ from typing import Iterable
 from . import __version__
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
 from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
-from .validate import doctor, validate
+from .validate import VALIDATION_REVISION, doctor, validate
 from .progress import phase
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ class Options:
     timeout: float = 300.0
     max_output_bytes: int = 16 * 1024**3
     deep: bool = False
+    reconstruct_only: bool = False
     max_groups: int = 200_000
     max_hits: int | None = None
     max_assemblies: int | None = None
@@ -49,7 +50,7 @@ class Options:
 
     def check(self) -> None:
         for k, v in asdict(self).items():
-            if k == 'deep' or (v is None and k in {'max_candidates', 'max_padding', 'max_hits', 'max_assemblies', 'max_anchor_checks'}):
+            if k in {'deep', 'reconstruct_only'} or (v is None and k in {'max_candidates', 'max_padding', 'max_hits', 'max_assemblies', 'max_anchor_checks'}):
                 continue
             if not math.isfinite(v) or (v < 0 if k == 'max_padding' else v <= 0):
                 raise SafetyError(f'{k} must be a positive finite value (padding may be zero)')
@@ -242,7 +243,9 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
                            (movie.digest, md)).fetchone()
     if prev:
         old = json.loads(prev['detail'])
-        same_tools = (not old.get('historical_validation') and old.get('tools') == tools and
+        same_tools = (not old.get('historical_validation') and
+                      old.get('validation_revision') == VALIDATION_REVISION and
+                      old.get('reconstruct_only', False) == opt.reconstruct_only and old.get('tools') == tools and
                       old.get('timeout') == opt.timeout)
         if same_tools and old.get('status') == 'valid':
             p = case.root / old['path']
@@ -252,7 +255,8 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
         if same_tools and old.get('status') == 'rejected':
             return old
     result = {'status': 'rejected', 'mapping_digest': md, 'stage': stage,
-              'tools': tools, 'timeout': opt.timeout}
+              'tools': tools, 'timeout': opt.timeout, 'validation_revision': VALIDATION_REVISION,
+              'reconstruct_only': opt.reconstruct_only}
     temp = case.root / 'work' / f'{movie.digest}-{md}.mp4'
     target = case.root / 'candidates' / f'{movie.digest[:24]}-{md[:24]}.mp4'
     if temp.exists() or temp.is_symlink():
@@ -268,7 +272,9 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
             result['reason'] = 'some_NAL_samples_do_not_match'
         else:
             proof = reconstruct(movie, mapping, pool, temp, opt.max_output_bytes)
-            checked = validate(temp, movie, tools, opt.timeout)
+            checked = ({'ok': True, 'reason': 'structural_reconstruction_only',
+                        'decode_checked': False, 'scope': 'structural_reconstruction_only'}
+                       if opt.reconstruct_only else validate(temp, movie, tools, opt.timeout))
             result['validation'] = checked
             result['reason'] = checked['reason']
             if checked['ok']:
@@ -326,12 +332,14 @@ def _publish(case: Case, movie: Movie, successes: list[dict], status: str) -> li
         final.unlink()
     if sidecar.exists():
         sidecar.unlink()
-    if status != 'matched' or len(successes) != 1:
+    if status not in {'matched', 'reconstructed'} or len(successes) != 1:
         return []
     candidate = case.root / successes[0]['path']
     storage_mode = _publish_link_or_copy(candidate, final)
     write_json(sidecar, {'status': status, 'candidate': successes[0]['path'], 'storage_mode': storage_mode,
                          'sha256': successes[0]['sha256'],
+                         'decode_checked': not successes[0].get('reconstruct_only', False),
+                         'validation_scope': 'structural_reconstruction_only' if successes[0].get('reconstruct_only') else 'strict_decode',
                          'meaning': 'One byte-distinct candidate passed within the completed search model; not proof of historical identity.'})
     return [str(final.relative_to(case.root))]
 
@@ -350,16 +358,19 @@ def finish(case: Case, movie: Movie, candidates: list[dict], limited: bool,
     elif limited:
         status = 'search_limited'
     elif len(good) == 1:
-        status = 'matched'
+        status = 'reconstructed' if good[0].get('reconstruct_only') else 'matched'
     else:
         status = 'unresolved'
     outputs = _publish(case, movie, good, status)
     detail = {'run_key': run_key, 'stage': stage, 'candidates': good, 'search_limited': limited,
-              'outputs': outputs, 'scope': 'Uniqueness applies only to the documented, completed hypotheses searched.'}
+              'outputs': outputs,
+              'decode_checked': bool(good) and all(not c.get('reconstruct_only', False) for c in good),
+              'scope': 'Uniqueness applies only to the documented, completed hypotheses searched.'}
     if extra:
         detail.update(extra)
     case.result(movie.digest, status, detail)
-    LOG.info('%s %s: %d byte-distinct decode-checked candidates', movie.digest[:12], status, len(good))
+    LOG.info('%s %s: %d byte-distinct candidates (%s)', movie.digest[:12], status, len(good),
+             'structural reconstruction; no decode check' if any(c.get('reconstruct_only') for c in good) else 'decode checked')
     return status
 
 
@@ -725,16 +736,17 @@ def _assemblies(search, groups):
 
 def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = False, *, allocation_scope=None) -> None:
     opt.check()
-    tools = doctor()
+    tools = {'mode': 'structural_reconstruction_only'} if opt.reconstruct_only else doctor()
     sources = case.sources()
     if not sources:
         raise SafetyError('No completed source scans; run scan or run first')
-    run_key = hashlib.sha256(json_text({'version': __version__, 'matching_revision': 2,
+    run_key = hashlib.sha256(json_text({'version': __version__, 'matching_revision': 2, 'validation_revision': VALIDATION_REVISION,
                          'allocation_scope': allocation_scope.digest if allocation_scope is not None else None,
                          'options': asdict(opt), 'tools': tools,
                          'sources': [(sid,s['sha256'],s['path'],s.get('extents'),s.get('binding'))
                                      for sid,s in sorted(sources.items())]}).encode()).hexdigest()
-    case.event('recovery_started', {'run_key': run_key, 'tools': tools, 'options': asdict(opt)})
+    case.event('recovery_started', {'run_key': run_key, 'tools': tools, 'options': asdict(opt),
+                 'validation_revision': VALIDATION_REVISION})
     deferred = []
     incomplete = set()
     processed = 0
@@ -753,7 +765,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
             jobs_task.advance(processed_movies=processed)
             old_detail = json.loads(row['old_detail']) if row['old_detail'] else {}
             if old_detail.get('run_key') == run_key:
-                if row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] == 'matched'):
+                if row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] in {'matched', 'reconstructed'}):
                     candidates = old_detail.get('candidates', [])
                     for c in candidates:
                         p = case.root / c['path']

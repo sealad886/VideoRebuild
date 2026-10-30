@@ -43,7 +43,7 @@ class BoxTests(unittest.TestCase):
 
     def test_avc_length_chain(self):
         # One SEI NAL followed by one IDR NAL; total sample boundaries are exact.
-        data = struct.pack('>I', 3)+b'\x06ab'+struct.pack('>I', 4)+b'\x65xyz'
+        data = struct.pack('>I', 5)+b'\x06\x06\x01\xc0\x80'+struct.pack('>I', 4)+b'\x65xyz'
         self.assertTrue(valid_sample(data, b'avc1', 4))
         self.assertFalse(valid_sample(data[:-1], b'avc1', 4))
         self.assertFalse(valid_sample(data+b'X', b'avc1', 4))

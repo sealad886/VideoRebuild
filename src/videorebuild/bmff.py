@@ -123,6 +123,7 @@ class Track:
     duration: int
     chunks: tuple[Chunk, ...]
     config_hash: str
+    configuration: bytes = b''
 
 
 @dataclass(frozen=True)
@@ -253,6 +254,7 @@ def parse_movie(data: bytes) -> Movie:
         codec = entry.kind
         nal_length = 0
         config_hash = ''
+        cfg = b''
         if handler == b'vide':
             if codec not in VIDEO_CODECS:
                 raise FormatError(f'unsupported video codec {codec!r}')
@@ -326,7 +328,7 @@ def parse_movie(data: bytes) -> Movie:
         if si != len(sizes):
             raise FormatError('unassigned samples')
         tracks.append(Track(ti, track_id, handler, codec, nal_length, len(sizes),
-                            timescale, duration, tuple(chunks), config_hash))
+                            timescale, duration, tuple(chunks), config_hash, cfg))
         all_chunks.extend(chunks)
     if not any(t.handler == b'vide' for t in tracks):
         raise FormatError('no supported video track')
@@ -359,34 +361,92 @@ def rewrite_offsets(movie: Movie, offsets: dict[tuple[int, int], int]) -> bytes:
     return rebuild(next(boxes(movie.data)))
 
 
-def valid_sample(data: bytes, codec: bytes, length_size: int) -> bool:
-    """Validate *all* NAL boundaries and basic headers, not merely the first NAL."""
+def iter_sample_nals(data: bytes, codec: bytes, length_size: int):
+    """Yield fully bounded NAL views; do not interpret picture/slice contents."""
+    if length_size not in (1, 2, 4) or codec not in VIDEO_CODECS:
+        raise FormatError('unsupported_NAL_framing')
+    view = memoryview(data)
     p = count = 0
-    has_vcl = False
-    while p < len(data):
-        if p + length_size > len(data):
-            return False
-        n = int.from_bytes(data[p:p+length_size], 'big')
+    hevc = codec in {b'hvc1', b'hev1'}
+    while p < len(view):
+        if p+length_size > len(view):
+            raise FormatError('truncated_NAL_length')
+        n = int.from_bytes(view[p:p+length_size], 'big')
         p += length_size
-        if n < (2 if codec in {b'hvc1', b'hev1'} else 1) or p+n > len(data):
-            return False
-        h = data[p]
-        if h & 0x80:
-            return False
-        if codec in {b'avc1', b'avc3'}:
-            typ = h & 31
-            if not 1 <= typ <= 23:
-                return False
-            has_vcl |= typ in (1, 2, 3, 4, 5)
-        elif codec in {b'hvc1', b'hev1'}:
-            typ = (h >> 1) & 63
-            if typ > 40 or not (data[p+1] & 7):
-                return False
-            has_vcl |= typ <= 31
-        else:
-            return False
-        p += n
+        if n < (2 if hevc else 1) or p+n > len(view):
+            raise FormatError('invalid_NAL_length')
+        nal = view[p:p+n]
+        typ = (nal[0] >> 1) & 63 if hevc else nal[0] & 31
+        if nal[0] & 128 or (hevc and (typ > 40 or not nal[1] & 7)) or (not hevc and not 1 <= typ <= 23):
+            raise FormatError('invalid_NAL_header')
         count += 1
         if count > 65536:
+            raise FormatError('too_many_NALs_in_sample')
+        yield nal
+        p += n
+    if not count:
+        raise FormatError('empty_video_sample')
+
+
+def _valid_avc_sei(nal) -> bool:
+    """Validate SEI message envelopes and EBSP escaping, without guessing payloads."""
+    if nal[0] != 6:
+        return False
+    rbsp = bytearray()
+    zeroes = 0
+    i = 1
+    while i < len(nal):
+        value = nal[i]
+        if zeroes >= 2:
+            if value == 3:
+                if i+1 == len(nal) or nal[i+1] > 3:
+                    return False
+                zeroes = 0
+                i += 1
+                continue
+            if value <= 2:
+                return False
+        rbsp.append(value)
+        zeroes = zeroes+1 if value == 0 else 0
+        i += 1
+    if not rbsp or rbsp[-1] != 128:
+        return False
+    end = len(rbsp)-1
+    p = messages = 0
+    while p < end:
+        for field in range(2):
+            value = 0
+            while p < end and rbsp[p] == 255:
+                value += 255
+                p += 1
+            if p >= end:
+                return False
+            value += rbsp[p]
+            p += 1
+            if field == 1:
+                p += value
+        if p > end:
             return False
-    return p == len(data) and count > 0 and has_vcl
+        messages += 1
+    return p == end and messages > 0
+
+
+def sample_kind(data: bytes, codec: bytes, length_size: int) -> str | None:
+    """Recognize VCL samples or well-framed AVC standalone SEI, never HEVC-only metadata."""
+    vcl = False
+    sei_only = codec in {b'avc1', b'avc3'}
+    try:
+        for nal in iter_sample_nals(data, codec, length_size):
+            typ = (nal[0] >> 1) & 63 if codec in {b'hvc1', b'hev1'} else nal[0] & 31
+            vcl |= typ <= 31 if codec in {b'hvc1', b'hev1'} else typ in (1, 2, 3, 4, 5)
+            if codec in {b'avc1', b'avc3'} and typ == 6 and not _valid_avc_sei(nal):
+                return None
+            sei_only &= typ == 6
+    except FormatError:
+        return None
+    return 'vcl' if vcl else 'avc_sei' if sei_only else None
+
+
+def valid_sample(data: bytes, codec: bytes, length_size: int) -> bool:
+    """Check complete sample framing, including narrowly supported standalone AVC SEI."""
+    return sample_kind(data, codec, length_size) is not None

@@ -8,7 +8,17 @@ Supported metadata uses one sample description per track, self-contained media r
 
 Normal reconstruction supports 1-, 2-, and 4-byte NAL length prefixes. It copies every encoded sample and rewrites every chunk offset as 64-bit `co64`. It preserves the surviving `moov` hierarchy except for offset tables and enclosing box sizes. A new generic ISO BMFF `ftyp` and `mdat` are written. Top-level proprietary boxes outside `moov` are not copied. This is media reconstruction, not a byte-identical copy of the original container.
 
-The whole-payload model assumes the first referenced sample begins at the candidate `mdat` payload start; it preserves original inter-chunk gaps when locating bytes, then omits unused gaps from the rebuilt payload. Candidates with more than `--max-padding` trailing bytes are outside that search model. Original-relative source mappings are tested separately.
+The whole-payload model assumes the first referenced sample begins at the candidate `mdat` payload start; it preserves original inter-chunk gaps when locating bytes, then omits unused gaps from the rebuilt payload. When an explicit `--max-padding` cutoff is supplied, larger trailing payloads are outside that search model; the default has no padding cutoff. Original-relative source mappings are tested separately.
+
+### Reconstruction without codec quality checks
+
+Use `recover --reconstruct-only` to assemble and export encoded bytes without running FFmpeg or ffprobe. The same mode is available on `run`; use `recover` to preserve an existing index. Source identities, acquisition/allocation boundaries, sample-table layout, nonoverlapping mappings and complete NAL framing remain enforced because they determine which bytes belong in an assembly. There is no transcode, codec repair, frame generation or audio alteration.
+
+Ordinary AVC sample tables may contain standalone SEI metadata samples in addition to picture-bearing samples. Complete length-prefixed SEI NALs require valid emulation-prevention, payload lengths and RBSP termination. Other non-VCL-only samples and HEVC ancillary-only samples remain unsupported. Malformed SEI is rejected even when it shares a sample with a picture. Every original packet, including SEI, is retained.
+
+An ordinary unique structural result is labelled `reconstructed`, with `decode_checked: false` and `scope: structural_reconstruction_only` in candidate evidence. Fragmented outputs similarly use `reconstructed_prefix` or separately exported `reconstructed_segment`. These statuses do not claim codec quality or playability. Ambiguous assignments remain ambiguous; candidate reconstructions and their evidence are retained rather than choosing an arbitrary original.
+
+Without `--reconstruct-only`, the existing strict decoding contract remains in force, including its conservative rejection of nonstandard packet/frame relationships. Validator revisions and the selected mode bind both attempt reuse and whole-job coverage. Resuming after a change revisits prior decisions without rebuilding the source/atom index. Retain a consistent case backup before reprocessing to preserve earlier evidence.
 
 ## Scattered extents
 
@@ -21,7 +31,7 @@ A deep extent is a video chunk plus the subsequent audio chunks before the next 
 - A filesystem fragment boundary inside the group requires an explicit logical extent map; blind matching does not infer it.
 - One long video-only MP4 chunk remains one extent even if it contains many frames. Deep search is not frame-by-frame reconstruction inside that chunk.
 
-Candidate anchors use selected sample sizes and 4-byte NAL prefixes. The search accumulates up to 65,536 NAL units per chain, matching the ordinary sample validator's bound, then validates every video sample against the sample-table boundaries. A terminal one-byte AVC NAL is supported; HEVC requires its two-byte header. Candidate sample anchors are selected from the first eight and last four samples of each video chunk, with sizes from 8 bytes to less than 16 MiB. `--max-anchor-checks` separately bounds both target associations and total NAL-chain checks. Exhaustion stops the scan with `search_limited`; result details distinguish `nal_check_budget` and `anchor_check_budget` and retain both counters. These search limits are part of the documented model, not evidence that other layouts cannot be recovered.
+Candidate anchors use selected sample sizes and 4-byte NAL prefixes. The search accumulates up to 65,536 NAL units per chain, matching the ordinary sample validator's bound, then validates every video sample against the sample-table boundaries. A terminal one-byte AVC NAL is supported; HEVC requires its two-byte header. Candidate sample anchors are selected from the first eight and last four samples of each video chunk, with sizes from 8 bytes to less than 16 MiB. An explicitly supplied `--max-anchor-checks` separately bounds both target associations and total NAL-chain checks; the default is uncapped. Exhaustion stops the scan with `search_limited`; result details distinguish `nal_check_budget` and `anchor_check_budget` and retain both counters. These search limits are part of the documented model, not evidence that other layouts cannot be recovered.
 
 AAC has no equivalent length-prefix identity signature here. Its association comes from the surviving layout and the contiguous-extent hypothesis; AAC is independently decoded and counted before publication. A decodable wrong audio association remains theoretically possible. This release does not prove source identity or use face/audio recognition.
 
@@ -46,6 +56,6 @@ Byte-identical extent hits are deduplicated to one representative physical locat
 
 ## Validation meaning
 
-A successful probe alone is insufficient. Publication requires an exact structural assignment of all chunks, nonoverlapping in-bounds source ranges, correct length-prefixed NAL framing for every video sample, full frame/packet counting without reported errors, expected stream codec/types and counts, and a second full strict decoding pass. Edit lists are ignored for validation counts only and are preserved in output metadata.
+A successful probe alone is insufficient. Publication requires an exact structural assignment of all chunks, nonoverlapping in-bounds source ranges, correct length-prefixed NAL framing for every video sample, full frame/packet counting without reported errors, expected stream codec/types and counts, and a second full strict decoding pass. This codec-validation requirement applies to the default mode; `--reconstruct-only` exports structural reconstructions with explicit non-decoded evidence as described above. Edit lists are ignored for validation counts only and are preserved in output metadata.
 
 Conservative validation can reject playable but unusual files, including field-coded streams, nonstandard packet/frame relationships, permissively decoded corruption, or unsupported track arrangements. Such rejection is preferable to announcing an unverified repair. No successful result proves chronology, source-camera identity, or preservation of information absent from the supplied sources.
