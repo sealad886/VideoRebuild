@@ -78,6 +78,41 @@ class HomebrewLauncherTests(unittest.TestCase):
         self.assertEqual(self.selected_tools(),
                          {name: directory/name for name in ('ffmpeg', 'ffprobe')})
 
+    def simulated_python(self, path, version):
+        # Only simulate the version preflight; application execution still uses
+        # this test's real interpreter and canonical doctor.
+        if path.is_symlink():
+            path.unlink()
+        check = 'import sys; sys.version_info=tuple(map(int,sys.argv[1].split("."))); exec(sys.argv[2])'
+        self.executable(path,
+            'if [ "$1" = -c ]; then\n'
+            f'  exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} {shlex.quote(version)} "$2"\n'
+            'fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n')
+
+    def test_launchers_reject_python_below_supported_floor(self):
+        python = self.prefixes[0]/'opt/python@3.13/bin/python3.13'
+        legacy = self.root/'run-legacy-macos.command'
+        legacy.write_text((self.repo/legacy.name).read_text())
+        self.executable(self.fallback/'uname', "printf '%s\\n' Darwin\n")
+        self.executable(self.fallback/'osascript', 'exit 99\n')
+        environment = os.environ.copy()
+        environment['PATH'] = os.pathsep.join((str(self.fallback), '/usr/bin', '/bin'))
+        for version in ('3.11', '3.12'):
+            self.simulated_python(python, version)
+            self.simulated_python(self.fallback/'python3', version)
+            for launcher in (self.launcher, legacy):
+                with self.subTest(version=version, launcher=launcher.name):
+                    completed = subprocess.run(['/bin/bash', str(launcher), '--help'],
+                        env=environment, capture_output=True, text=True, timeout=30)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn('3.13', completed.stderr)
+                    self.assertEqual(completed.stdout, '')
+
+    def test_newer_python_passes_preflight(self):
+        self.simulated_python(self.prefixes[0]/'opt/python@3.13/bin/python3.13', '3.14')
+        self.assert_selected(self.fallback)
+
     def test_first_supported_pair_is_retained(self):
         first = self.homebrew(self.prefixes[0], ('9.0.2', '9.0.2'))
         for second in (('8.0.1', '8.0.1'), ('7.1.5', '7.1.5')):

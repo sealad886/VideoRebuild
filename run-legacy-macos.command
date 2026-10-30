@@ -22,7 +22,7 @@ for tool in python3 ffmpeg ffprobe osascript; do
         exit 2
     fi
 done
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else "Python 3.11 or newer is required")'
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,13) else "Python 3.13 or newer is required")'
 if [ ! -f "$ROOT/videorebuild.pyz" ]; then
     printf 'Missing videorebuild.pyz. From the project folder run: python3 tools/build_zipapp.py\n' >&2
     exit 2

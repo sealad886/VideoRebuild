@@ -11,11 +11,11 @@ for PREFIX in /opt/homebrew /usr/local; do
 done
 if [[ -z "$PYTHON" ]]; then
   if ! PYTHON="$(command -v python3)"; then
-    printf '%s\n' 'ERROR: Python 3.11+ is required. Install python@3.13 with Homebrew.' >&2
+    printf '%s\n' 'ERROR: Python 3.13+ is required. Install python@3.13 with Homebrew.' >&2
     exit 2
   fi
 fi
-"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "ERROR: Python 3.11+ is required")'
+"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 13) else "ERROR: Python 3.13+ is required")'
 for PREFIX in /opt/homebrew /usr/local; do
   if [[ -x "$PREFIX/bin/brew" ]] && FFMPEG_PREFIX="$("$PREFIX/bin/brew" --prefix ffmpeg 2>/dev/null)"; then
     if [[ -x "$FFMPEG_PREFIX/bin/ffmpeg" && -x "$FFMPEG_PREFIX/bin/ffprobe" ]] &&

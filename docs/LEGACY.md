@@ -23,9 +23,9 @@ Every published result must satisfy structural checks, a full ffprobe count/deco
 
 ## Run on macOS
 
-The simplest distribution is the bundled `videorebuild.pyz`. It needs Python 3.11 or newer but does not need pip or a virtual environment.
+The simplest distribution is the bundled `videorebuild.pyz`. It needs Python 3.13 or newer but does not need pip or a virtual environment.
 
-Use Python 3.11+ and both FFmpeg and ffprobe 8+. The Homebrew command below installs its current unversioned FFmpeg formula; `doctor` checks both executables against the minimum supported major version and records their actual versions. The launchers select installed tools without installing or updating dependencies.
+Use Python 3.13+ and both FFmpeg and ffprobe 8+. The Homebrew command below installs its current unversioned FFmpeg formula; `doctor` checks both executables against the minimum supported major version and records their actual versions. The launchers select installed tools without installing or updating dependencies.
 
 ```bash
 brew install python@3.13 ffmpeg

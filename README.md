@@ -1,6 +1,6 @@
 # VideoRebuild 0.2.0
 
-Local, MIT-licensed video recovery for macOS/Linux. Python 3.11+ and both FFmpeg and ffprobe 8+ are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
+Local, MIT-licensed video recovery for macOS/Linux. Python 3.13+ and both FFmpeg and ffprobe 8+ are required. The included `videorebuild.pyz` needs no Python package installation. There are no network calls in the recovery code.
 
 ## The new path: fragmented MP4 from original-image bytes
 
@@ -81,4 +81,4 @@ python3 -m venv .venv
 .venv/bin/python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
 ```
 
-Use Python 3.11+ for these commands. The source archive includes all four Mac launchers; CI checks their syntax, starts the extracted fragmented launcher, and installs a wheel built from that archive. Local artifacts retain version 0.2.0; validation does not imply a new published release.
+Use Python 3.13+ for these commands. The source archive includes all four Mac launchers; CI checks their syntax, starts the extracted fragmented launcher, and installs a wheel built from that archive. Local artifacts retain version 0.2.0; validation does not imply a new published release.
