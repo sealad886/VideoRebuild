@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -61,11 +62,18 @@ class RecoveredPrefixAuditTests(unittest.TestCase):
             tool = Path(__file__).resolve().parents[1]/'tools/check_recovered_prefixes.py'
             report = root/'passed.json'
             command = [sys.executable, str(tool), str(case), str(image)]
-            completed = subprocess.run(command+[str(report)], capture_output=True, text=True, timeout=45)
+            completed = subprocess.run(command+[str(report)], capture_output=True, text=True, timeout=45,
+                                       umask=0)
             self.assertEqual(completed.returncode, 0, completed.stdout+completed.stderr)
+            self.assertEqual(stat.S_IMODE(report.stat().st_mode) & 0o077, 0,
+                             'A report with private source paths must not grant group/other access')
             result = json.loads(report.read_text())
             self.assertTrue(result['ok'])
             self.assertEqual(len(result['results']), 1)
+            report_before = report.read_bytes()
+            repeated = subprocess.run(command+[str(report)], capture_output=True, text=True, timeout=45)
+            self.assertEqual(repeated.returncode, 2, repeated.stdout+repeated.stderr)
+            self.assertEqual(report.read_bytes(), report_before)
             for path, original in before.items():
                 self.assertEqual(path.read_bytes(), original, str(path))
 

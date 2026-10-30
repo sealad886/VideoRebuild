@@ -7,6 +7,7 @@ written to the supplied local JSON destination; no recovery job is resumed.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -92,7 +93,10 @@ def main():
         if args.output.exists():
             raise ValueError('Report already exists; choose a new output filename')
         result = audit(args.case, args.image)
-        with args.output.open('x', encoding='utf-8') as f:
+        # Reports contain private local paths. Set owner-only permissions at
+        # exclusive creation so a permissive umask cannot expose them briefly.
+        fd = os.open(args.output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2)
             f.write('\n')
         print(f"Audit {'passed' if result['ok'] else 'failed'}. Report: {args.output}")
