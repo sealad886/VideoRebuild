@@ -40,16 +40,20 @@ jobs:
       - name: Build source distribution and install its wheel
         run: |
           python -m pip install --require-hashes -r requirements-build.txt
-          python tools/build_zipapp.py
           python -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
           SOURCE_CHECK="$(mktemp -d)"
           tar -xzf dist/*.tar.gz -C "$SOURCE_CHECK"
           for launcher in run-macos.command recover-interactive.command; do
             bash -n "$SOURCE_CHECK/videorebuild-"*/"$launcher"
           done
-          bash "$SOURCE_CHECK/videorebuild-"*/run-macos.command --help
+          test ! -e "$SOURCE_CHECK/videorebuild-"*/videorebuild.pyz
           python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
           python -m pip install --no-deps dist/*.whl
+          cd "$SOURCE_CHECK"
+          python -c 'import pathlib, sys, videorebuild, videorebuild.tui; assert pathlib.Path(videorebuild.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())'
+          videorebuild --version
+          videorebuild tui --help
+          python -m videorebuild --help
           videorebuild doctor
       - name: Zipapp
         run: |

@@ -34,6 +34,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument('--no-progress', action='store_true', help='Disable progress feedback; errors and warnings remain visible')
     subs = p.add_subparsers(dest='command', required=True)
     subs.add_parser('doctor', help='Check FFmpeg/ffprobe and print exact versions')
+    terminal = subs.add_parser('tui', help='Open keyboard-driven recovery menus or watch an existing case read-only',
+        description='Keyboard-driven recovery menus. Review a command before running it, or watch a case without controlling its process.',
+        epilog='Examples: videorebuild tui; videorebuild tui --case /healthy/case --watch. Use arrow keys and Enter; Q returns or quits.')
+    terminal.add_argument('--case', type=Path, help='Case/output folder to prefill')
+    terminal.add_argument('--watch', action='store_true', help='Open the read-only case viewer directly; requires --case')
     migration = subs.add_parser('migrate-case', help='Back up and explicitly migrate an older case')
     migration.add_argument('--case', required=True, type=Path)
     for name in ('scan', 'recover', 'run', 'report'):
@@ -75,6 +80,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == 'tui':
+        from .tui import run
+        return run(args.case, watch=args.watch)
     with reporting(enabled=not args.no_progress) as feedback:
         return _execute(args, feedback)
 

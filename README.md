@@ -1,10 +1,46 @@
 # VideoRebuild
 
-VideoRebuild reconstructs supported AVC/HEVC MP4 video from recovered files and optional original disk-image evidence. It runs locally with Python 3.13+, FFmpeg and ffprobe 8+, and no third-party Python runtime dependencies.
+VideoRebuild reconstructs supported AVC/HEVC MP4 video from recovered files and optional original disk-image evidence. It runs locally with Python 3.13+ and no third-party Python runtime dependencies. FFmpeg and ffprobe 8+ are required for codec validation; reconstruction-only mode does not require them.
 
 Version 0.3.0 uses one case and byte-range model for ordinary and fragmented MP4. Logical file bytes may come from multiple noncontiguous image extents. Original inputs remain read-only; output belongs on healthy storage outside every input tree.
 
 A successful decode does not prove original recording identity or completeness. Reports distinguish acquisition status, association evidence and media validation. Missing bytes remain missing; later recoverable sections are separate clips.
+
+## Install
+
+From this checkout, install with pip in a virtual environment:
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
+videorebuild tui
+```
+
+Installation creates the `videorebuild` command. All recovery, reporting and TUI
+commands use that same entry point:
+
+```bash
+videorebuild --help
+videorebuild run --input /recovery/files --case /healthy/case --reconstruct-only
+videorebuild tui --case /healthy/case --watch
+```
+
+For an isolated command available from any directory, use either
+[pipx](https://packaging.python.org/en/latest/guides/installing-stand-alone-command-line-tools/)
+or [uv](https://docs.astral.sh/uv/guides/tools/#installing-tools):
+
+```bash
+pipx install --python python3.13 .
+# Or:
+uv tool install --python 3.13 .
+```
+
+For development, use `python -m pip install -e .` in the activated project
+virtual environment. Regular and editable installs follow the
+[standard pip local-project workflow](https://pip.pypa.io/en/stable/topics/local-project-installs/).
+Python packages are installed into the selected environment; FFmpeg/ffprobe
+remain separately installed system tools when codec validation is enabled.
 
 ## How recovery works
 
@@ -66,7 +102,7 @@ Both strategies record output hashes and source provenance. Default mode also ap
 **Recovered references move to a second matching tier; source files and indexed evidence are not deleted.** Tier 1 prioritizes physical ranges not already used by accepted recovered outputs. Tier 2 retains those used ranges as fallback evidence. The default searches Tier 1 only. Use `--include-recovered` to check the lower-priority tier when Tier 1 finds no match for the target:
 
 ```bash
-python3 videorebuild.pyz recover --case /healthy/case --deep --retry --include-recovered
+videorebuild recover --case /healthy/case --deep --retry --include-recovered
 ```
 
 This is a search heuristic: a Tier 1 success does not trigger a Tier 2 uniqueness audit. Reports record `search_tiers`, including which tiers were searched and whether the second tier remained unsearched; CSV/HTML expose that scope too. A first-tier miss does not prove absence in the second tier. Successful published outputs supply the physical references for demotion; content equality alone does not prove that two separately stored locations are the same physical bytes. Completed jobs can still be skipped on resume after checking their publications.
@@ -97,14 +133,14 @@ See [ordinary support and grouping limits](docs/SUPPORT.md), [fragmented sequenc
 Check tools, then recover supplied files:
 
 ```bash
-python3 videorebuild.pyz doctor
-python3 videorebuild.pyz run --input /recovery/files --case /healthy/case
+videorebuild doctor
+videorebuild run --input /recovery/files --case /healthy/case
 ```
 
 For PhotoRec headers and the original raw image:
 
 ```bash
-python3 videorebuild.pyz run \
+videorebuild run \
   --input /recovery/photorec \
   --image /images/disk.img \
   --report /recovery/photorec/recup_dir.1/report.xml \
@@ -118,7 +154,7 @@ For filesystem-guided reconstruction, produce a DFXML report with the installed 
 
 ```bash
 fiwalk -x -z -g -G0 /images/disk.img > /healthy/filesystem.xml
-python3 videorebuild.pyz run \
+videorebuild run \
   --image /images/disk.img --extents /healthy/filesystem.xml \
   --mapfile /images/disk.map --case /healthy/case
 ```
@@ -126,6 +162,62 @@ python3 videorebuild.pyz run \
 Fiwalk is optional external tooling, not a Python dependency. Its exit code alone does not establish successful mapping: VideoRebuild validates the complete XML and each object's extent map. This path searches the mapped logical files; it does not separately scan the entire image for unlisted objects. Filesystem support depends on the metadata and external tool; no proprietary filesystem support is claimed.
 
 A mapfile qualifies only mapped image bytes. `+` means reported rescued; other map states and uncovered regions are unavailable. Without a mapfile acquisition status is unknown. If acquisition used different input/output positions, supply `--map-offset DELTA`, where image position = mapfile position + DELTA. Never infer this transform from filenames or file contents.
+
+## Terminal interface
+
+Open the keyboard-driven interface, inspired by PhotoRec and TestDisk:
+
+```bash
+videorebuild tui
+videorebuild tui --case /healthy/case
+videorebuild tui --case /healthy/case --watch
+```
+
+After an editable install, the same `videorebuild tui` command runs the working source.
+The interface uses Python's standard-library `curses` module on macOS and Linux;
+it needs an interactive terminal and adds no Python dependencies.
+
+Use the arrow keys and Enter to select actions and change options. Path fields
+open a filesystem browser in the style of PhotoRec:
+
+- **Up/Down** moves through entries; **Enter/Right** opens a directory.
+- **Left/Backspace**, or opening `..`, goes to the parent directory.
+- **C** selects the current directory for a case or recovered-input folder.
+- **Enter** selects a file for recovered input, a raw image, or an allocation map.
+- **N** names a new case folder inside the current directory. Browsing only
+  records that path; the recovery command creates it when started.
+- **G** jumps to a typed path; **D** clears an optional field; **Q/Esc** cancels.
+
+Directories appear before files, and the list scrolls with the selection.
+Mounted macOS drives are accessible under `/Volumes`. Browsing reads directory
+entries and creates no files or directories.
+
+Choose an existing case to resume recovery, or supply a recovered-files root
+and/or a regular raw image for indexing. Scan-only and scan-plus-recovery are
+separate actions. Review the generated command before starting it. The menu
+starts with deep search enabled, codec checks disabled (`--reconstruct-only`),
+and second-tier fallback disabled. These menu defaults are shown explicitly;
+the existing CLI defaults are unchanged. Advanced mapping and search-budget
+options remain available through the CLI.
+
+Starting an operation returns the terminal to the canonical CLI for live phase
+and work counters, then returns to the menu when it finishes. The existing case
+lock prevents a second writer, and progress appends to the same case `run.log`.
+During a foreground operation, Ctrl-C uses the CLI's normal interruption/resume
+handling.
+
+The **watch** screen reads recent log lines, indexed-source and job counts,
+case-lock state, and available output space without opening the case for
+recovery. It refreshes automatically; quitting the viewer leaves any running
+recovery untouched. A free lock or quiet log does not prove successful
+completion. Check the owning process's exit status and final reports.
+An idle-case snapshot briefly holds a shared lock while reading counts. If a
+simultaneous CLI launch reports that the case is busy, retry the launch.
+
+An allocation-map path applies only to **recover existing index**. The menu
+rejects it for scan actions rather than ignoring the restriction. Raw-image
+indexing without filesystem extents includes allocated bytes; the interface
+does not infer unallocated space or PhotoRec Free-mode provenance.
 
 ## Progress and recovery scope
 
@@ -136,7 +228,7 @@ Use `--no-progress` to suppress progress feedback; warnings and errors remain vi
 For a PhotoRec run explicitly made in **Free / unallocated-space-only** mode, process its exported files as the working set:
 
 ```bash
-python3 videorebuild.pyz run --input /recovery/photorec-free --case /healthy/free-space-case
+videorebuild run --input /recovery/photorec-free --case /healthy/free-space-case
 ```
 
 This invocation does not scan an image and has no automatic image-scan fallback. The free-space provenance comes from the PhotoRec run’s selection, not from VideoRebuild inferring allocation from filenames. For an already indexed image case, constrain reconstruction with an independently established allocation map as described below; the existing index need not be rebuilt.
@@ -146,7 +238,7 @@ Supplying `--image` without `--extents` indexes available bytes across the image
 An existing image index can be reused with an image-bound unallocated-range policy:
 
 ```bash
-python3 videorebuild.pyz recover --case /healthy/case --deep --retry \
+videorebuild recover --case /healthy/case --deep --retry \
   --allocation-map /healthy/filesystem-unallocated.json
 ```
 
@@ -157,7 +249,7 @@ This policy gates image reads during reconstruction, including metadata evidence
 To reconstruct an indexed case without FFmpeg/ffprobe quality checks:
 
 ```bash
-python3 videorebuild.pyz recover --case /healthy/case --deep --retry \
+videorebuild recover --case /healthy/case --deep --retry \
   --allocation-map /healthy/filesystem-unallocated.json --reconstruct-only
 ```
 
@@ -167,10 +259,22 @@ This mode preserves encoded bytes and the structural/source checks needed for as
 
 `scan` performs intake/indexing only. `recover --case …` resumes an indexed case. `report --case …` refreshes local JSON, CSV and HTML reports. The main report is `CASE/reports/index.html`; `results.json` contains typed jobs and provenance. See `--help` for complete options.
 
+`.DS_Store` metadata is ignored during discovery, indexing, matching and file
+browsing, including with `--all-files`. Previously indexed `.DS_Store` rows stay
+as historical evidence but are excluded from recovery reads. The original files
+are never deleted or modified.
+
+Rebooting or remounting a source volume can change its operating-system device
+number. That transient number does not invalidate the existing index. Resume
+still checks the recorded file size, modification time and inode; each reader
+pins the current filesystem identity and checks the opened file against its
+path. Indexed content hashes remain provenance, rather than a claim that every
+source was freshly hashed on resume. Historical sidecar identities are retained.
+
 ```bash
-python3 videorebuild.pyz run --input /recovery/files --case /healthy/case --limit 50
-python3 videorebuild.pyz recover --case /healthy/case --limit 50
-python3 videorebuild.pyz report --case /healthy/case
+videorebuild run --input /recovery/files --case /healthy/case --limit 50
+videorebuild recover --case /healthy/case --limit 50
+videorebuild report --case /healthy/case
 ```
 
 Ordinary MP4 matching can use `--deep` for scattered-sample searches. Candidate, trailing-padding, hit, assembly, anchor-check and fragmented-start cutoffs are disabled by default. Explicit `--max-candidates`, `--max-padding`, `--max-hits`, `--max-assemblies`, `--max-anchor-checks` and `--max-segments` remain optional search cutoffs; reaching one reports incomplete search rather than proving absence or uniqueness. A whole-payload cutoff does not prevent deep search when no valid candidate has been found. `--max-groups` controls batch capacity without omitting later recordings.
@@ -180,7 +284,7 @@ Search hypotheses use private temporary SQLite storage and streaming traversal r
 Changing source identity, metadata/map binding, coordinate transform or validation settings can require a new case. Completed publications and their evidence are checked before reuse. Old cases require explicit backed-up conversion:
 
 ```bash
-python3 videorebuild.pyz migrate-case --case /healthy/old-case
+videorebuild migrate-case --case /healthy/old-case
 ```
 
 See [case migration](docs/LEGACY.md), [shared architecture](docs/ARCHITECTURE.md), [fragmented strategy](docs/FRAGMENTED.md), [ordinary format support](docs/SUPPORT.md) and [implementation/release plan](docs/IMPLEMENTATION_PLAN.md).
@@ -189,17 +293,16 @@ On macOS, `run-macos.command` selects an existing supported Homebrew/runtime pai
 
 ## Validation and development
 
-Source execution uses the project environment:
+Development uses an editable install in the project environment:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m videorebuild doctor
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python tools/build_zipapp.py
-.venv/bin/python videorebuild.pyz --version
+.venv/bin/python -m pip install -e .
+.venv/bin/videorebuild --version
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Tests generate synthetic media locally; no private recordings are bundled. Recovery checks encoded packet bytes, counts, supported track layout, exact timing where the strategy supplies it, and strict full decoding. For reconstruction without codec quality checks, use `--reconstruct-only`; original AVC standalone SEI metadata is preserved and outputs are explicitly labelled as reconstructed without decode validation. Validator revisions and the selected mode recheck prior decisions on resume without rebuilding the index; see [ordinary format support](docs/SUPPORT.md). Source immutability, ambiguity, interruption/resume, malformed mappings, resource bounds and migration failures are regression requirements. Optional fiwalk integration tests need the installed tool and otherwise skip explicitly.
 
-The zipapp builder overwrites `videorebuild.pyz`. Wheel/sdist builds use the pinned requirements in `requirements-build.txt` in a project-specific virtual environment. See [TEST_REPORT.md](TEST_REPORT.md) for executed evidence and limits; configured CI coverage is separate from checks that actually ran.
+Wheel/sdist builds use the pinned requirements in `requirements-build.txt` in a project-specific virtual environment. An optional standalone Python ZIP archive (`videorebuild.pyz`) can still be produced with `.venv/bin/python tools/build_zipapp.py`; the builder overwrites that local archive. Pip installation does not require or build it. See [TEST_REPORT.md](TEST_REPORT.md) for executed evidence and limits; configured CI coverage is separate from checks that actually ran.
 
 No missing-header inference, generated frames, automatic chronology, raw-device writes, source filesystem repairs, or automatic upload occurs. Private paths and diagnostic windows can reveal sensitive media information; review before sharing.
