@@ -23,7 +23,8 @@ class ExhaustiveMatchingTests(unittest.TestCase):
                 source = root / 'payloads.bin'
                 padding = 2*1024*1024
                 source.write_bytes(bytes(530*16+padding))
-                movie = SimpleNamespace(digest='synthetic', chunks=[Chunk(0, 0, 0, (5,), 0)], span=5)
+                movie = SimpleNamespace(digest='synthetic', chunks=[Chunk(0, 0, 0, (5,), 0)], span=5,
+                                        tracks=[SimpleNamespace(handler=b'vide')])
                 with Case(root / 'case') as case:
                     sid = case.register_source(source)
                     scan_logical(case, sid)
@@ -49,7 +50,8 @@ class ExhaustiveMatchingTests(unittest.TestCase):
             root = Path(directory)
             source = root / 'payloads.bin'
             source.write_bytes(bytes(100*16))
-            movie = SimpleNamespace(digest='synthetic', chunks=[Chunk(0, 0, 0, (5,), 0)], span=5)
+            movie = SimpleNamespace(digest='synthetic', chunks=[Chunk(0, 0, 0, (5,), 0)], span=5,
+                                        tracks=[SimpleNamespace(handler=b'vide')])
             with Case(root / 'case') as case:
                 sid = case.register_source(source)
                 scan_logical(case, sid)

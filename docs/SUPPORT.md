@@ -54,6 +54,14 @@ Byte-identical extent hits retain their physical locations until joint nonoverla
 | Intact short recordings without reliable dates | Reconstructed individually if supported; not joined into a guessed timeline. |
 | Live device nodes / compressed images / mounted filesystem repair | No raw-device access, decompression, or filesystem modifications. |
 
+## Candidate tiers and output order
+
+The default search enumerates supported candidates in the first tier: references to physical bytes not already represented by accepted publications. Recovering a fragment demotes its physical intervals, including aliases and mapped logical references, to the second tier. Inputs, atom indexes and accepted media files remain intact. Metadata remains readable, and a resumed target may revalidate its own accepted ranges.
+
+Use `recover --include-recovered` (also available on `run`) to search recovered references only for a target with no first-tier candidate after its whole/deep passes complete. Fallback obeys the same allocation/acquisition restrictions. `search_tiers` records searched coverage and whether second-tier evidence remains unsearched; uniqueness and no-match statements apply only to searched tiers. Optional finite budgets retain incomplete-search semantics.
+
+Each recovered output has a JSON sidecar with `ordered_fragments`: ordinal output ranges and hashes, source logical ranges, bound physical extents and track/chunk or fragment-sequence information. Generated ordinary container bytes are distinguished from copied media. Existing publications are backfilled using retained provenance and bounded structural reads without decoding or recopying media; missing proof produces an explicit `historical_manifest_unavailable` reason. Later scoped misses retain earlier accepted files and list them separately as historical outputs.
+
 ## Validation meaning
 
 A successful probe alone is insufficient. Publication requires an exact structural assignment of all chunks, nonoverlapping in-bounds source ranges, correct length-prefixed NAL framing for every video sample, full frame/packet counting without reported errors, expected stream codec/types and counts, and a second full strict decoding pass. This codec-validation requirement applies to the default mode; `--reconstruct-only` exports structural reconstructions with explicit non-decoded evidence as described above. Edit lists are ignored for validation counts only and are preserved in output metadata.

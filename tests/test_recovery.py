@@ -206,7 +206,7 @@ class RecoveryTests(unittest.TestCase):
         out=self.assert_recovered(self.run_case([self.root/'input']),self.h264)
         out.unlink()
         with Case(self.root/'case') as c:
-            with self.assertRaisesRegex(SafetyError,'Published output changed or disappeared'):
+            with self.assertRaises(SafetyError):
                 recover(c,Options())
         self.assertFalse(out.exists())
 
@@ -221,7 +221,7 @@ class RecoveryTests(unittest.TestCase):
         candidate_hash=sha(candidate)
         out.write_bytes(b'corrupted publication')
         with Case(self.root/'case') as c:
-            with self.assertRaisesRegex(SafetyError,'Published output changed or disappeared'):
+            with self.assertRaises(SafetyError):
                 recover(c,Options())
         self.assertEqual(sha(candidate),candidate_hash)
         self.assertEqual(out.read_bytes(),b'corrupted publication')

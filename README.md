@@ -6,6 +6,92 @@ Version 0.3.0 uses one case and byte-range model for ordinary and fragmented MP4
 
 A successful decode does not prove original recording identity or completeness. Reports distinguish acquisition status, association evidence and media validation. Missing bytes remain missing; later recoverable sections are separate clips.
 
+## How recovery works
+
+VideoRebuild matches available encoded bytes to surviving container metadata. It does not choose a first clip by filename, compare scenes, or infer an unknown timeline. Ordinary MP4 uses sample tables as its layout and ordering template; fragmented MP4 uses adjacent fragment boxes, sequence numbers and per-track media timing. The workflow runs the ordinary strategy, including any deferred deep search, before the fragmented strategy.
+
+![Recovery overview: read-only evidence is indexed and range-gated; ordinary sample-table matching runs before fragmented sequence matching; eligible bytes are copied into scoped outputs, with explicit risks and search costs.](docs/images/recovery-process.png)
+
+The graphic summarizes the two models side by side. The Mermaid flow below makes the execution order and the deep-search condition explicit. Range checks apply to every strategy and actual source read; the original index may include bytes excluded by a later allocation policy.
+
+```mermaid
+flowchart TD
+    A["Read-only files, images or mapped extents"] --> B["Bounded scan: source identity, MP4 boxes and metadata index"]
+    B --> C["Reconstruction reads: identity + acquisition + optional allocation policy"]
+    C --> E["Tier 1: references not already used by recovered outputs"]
+    E --> O["Ordinary MP4: supported surviving moov sample tables"]
+    O --> W["Try original offsets, then eligible whole mdat translations"]
+    W --> V["Check candidates: bounds, framing, physical non-overlap; reconstruct survivors"]
+    V --> D{"No accepted candidate<br/>and deep enabled?"}
+    D -- Yes --> H["Shared anchor discovery in permitted bytes"]
+    H --> G["Verify complete video framing in each extent; hash group bytes"]
+    G --> J["Enumerate feasible content choices + non-overlapping physical witnesses"]
+    J --> K["Restore metadata order; fully check and reconstruct each assembly"]
+    D -- No --> U["Classify byte-distinct results; publish only unique accepted ordinary output"]
+    K --> U
+    U --> F["Then fragmented MP4: supported initialization locations"]
+    F --> S["Try initialization end, then eligible indexed moof starts"]
+    S --> T["Walk adjacent moof + mdat: start IDR, sequence +1, track timing and coverage"]
+    T --> P["Keep contiguous prefix or independently eligible later sections; never bridge gaps"]
+    P --> Q["Copy initialization + retained original fragment bytes"]
+    Q --> R["Publish scoped sections, hashes, provenance and stop reasons"]
+    R --> Z["Shared case reports + per-output ordered fragment JSON; record searched tiers"]
+    N["Validation mode applies to both strategies:<br/>default strict codec checks;<br/>--reconstruct-only skips decoding and records decode_checked=false"] -.-> V
+    N -.-> K
+    N -.-> R
+    X["If no Tier 1 match: --include-recovered enables Tier 2 fallback.<br/>Previously recovered references remain available there; source files are unchanged."] -.-> E
+```
+
+### How initial candidates are chosen
+
+| Strategy | Candidate selection | What determines sequence |
+| --- | --- | --- |
+| Ordinary: original offsets | For each eligible location of the exact `moov`, try file/logical-source origin zero and the nearest preceding permitted `ftyp` origin. Add that origin to the metadata's chunk offsets. | The surviving sample tables specify chunk/sample order, track configuration and timing. |
+| Ordinary: whole payload | Try indexed `mdat` payloads in completed sources large enough for the whole metadata chunk span. Align the first referenced chunk with the payload start and apply one translation to all chunk offsets. Default search has no candidate-count or trailing-padding cutoff. | Original relative chunk offsets remain fixed in each hypothesis; bytes are not chosen by file date, name or visual similarity. |
+| Ordinary: deep search | Only when `--deep` is enabled and whole-payload search found no accepted candidate: use selected video sample sizes and 4-byte NAL-length chains to nominate extent starts, then check all video sample framing in each extent. | An extent is one video chunk plus adjacent audio chunks, with internal relative offsets preserved. Compatible extent locations may be scattered or physically out of order; output order comes from the metadata. |
+| Fragmented MP4 | Use verified PhotoRec initialization anchors when present for a source, otherwise indexed `ftyp` locations. Require a supported `ftyp` + `moov` initialization with `mvex`/`trex`. First try its end, then indexed `moof` starts before the next initialization or source end. | Each `moof` must be immediately followed by its supported `mdat`. Sequences increment by one and explicit track decode times must agree with accumulated durations. |
+
+An anchor hit is a search lead, not an identity proof. Deep search keeps matching physical locations, including equal-content alternatives, until it can establish a joint non-overlapping assignment. It considers selective groups first to reduce branching, then restores metadata order. If any required group is missing, ordinary reconstruction cannot invent it. Deep search does not infer arbitrary sector permutations inside a group, and does not search scattered alternatives after a whole-payload candidate has already survived.
+
+A fragmented prefix must begin with sequence 0 or 1 and an IDR for every video track. A prefix may omit initial `tfdt` timing and accumulate media time from zero; any supplied explicit timing must agree with accumulated durations. A later independent section may start at another sequence, but needs an IDR for every video track and an explicit first decode time for every declared track. Every declared track must appear before publication. Missing restart timing, unavailable ranges or sequence discontinuities stop or block a section; later eligible starts are considered separately. Media timestamps do not establish wall-clock dates.
+
+### How bytes become an output
+
+Ordinary reconstruction checks complete chunk assignments, source identity, permitted/readable ranges, full video sample framing and logical/physical non-overlap. It copies the original encoded chunks, writes a new generic `ftyp` and `mdat`, and rewrites `moov` chunk offsets as `co64`. It does not re-encode the samples. Fragmented reconstruction copies the original initialization and surviving section bytes; it does not rewrite fragment headers to conceal gaps.
+
+Both strategies record output hashes and source provenance. Default mode also applies codec validation; `--reconstruct-only` skips FFmpeg/ffprobe and labels outputs with `decode_checked=false`. In ordinary recovery, multiple byte-distinct accepted results remain `ambiguous`; a cutoff remains `search_limited`, and no accepted candidate remains `unresolved`. Only a unique accepted result within the completed ordinary search model receives an authoritative publication. Fragmented publications retain prefix/segment scope rather than claiming a complete historical recording.
+
+### Recovered fragments and the two search tiers
+
+**Recovered references move to a second matching tier; source files and indexed evidence are not deleted.** Tier 1 prioritizes physical ranges not already used by accepted recovered outputs. Tier 2 retains those used ranges as fallback evidence. The default searches Tier 1 only. Use `--include-recovered` to check the lower-priority tier when Tier 1 finds no match for the target:
+
+```bash
+python3 videorebuild.pyz recover --case /healthy/case --deep --retry --include-recovered
+```
+
+This is a search heuristic: a Tier 1 success does not trigger a Tier 2 uniqueness audit. Reports record `search_tiers`, including which tiers were searched and whether the second tier remained unsearched; CSV/HTML expose that scope too. A first-tier miss does not prove absence in the second tier. Successful published outputs supply the physical references for demotion; content equality alone does not prove that two separately stored locations are the same physical bytes. Completed jobs can still be skipped on resume after checking their publications.
+
+Within one ordinary assembly, overlapping physical ranges cannot be reused, including the same bytes exposed through different input mappings. Within one fragmented initialization job, a local `consumed` boundary skips starts already covered by an accepted/published section. Failed section attempts do not advance that boundary. Neither rule establishes global ownership across all outputs.
+
+This is not an assumption that original FAT files share clusters through hard links or symlinks. Normal FAT file allocation gives a file its cluster chain. The uncertainty is which surviving metadata actually belongs to which payload: sample sizes, NAL framing, codec settings and even successful decoding can be compatible without proving historical association. Recovered copies and raw-image views can also expose evidence from the same original bytes through separate inputs. Tiering deliberately makes earlier accepted associations higher priority; enabling fallback preserves a route to competing associations when no first-tier match is found.
+
+**Current limitation:** recovery does not globally reconcile overlapping source-range claims across different recovered recordings. Such outputs are competing associations to review, not automatically independent recordings. Trustworthy filesystem extent/ownership evidence can strengthen association; unallocated-range eligibility, structural success and archive novelty alone do not prove it.
+
+Each recovered file's accompanying JSON includes an `ordered_fragments` manifest. Entries identify assembly order, source locations, physical extents where available, destination offsets, lengths and hashes. Initialization, padding/container spans and generated ordinary-container bytes are labelled separately; a fragmented media entry covers its complete `moof`/`mdat` pair and records sequence, track sample counts and decode-time metadata. The manifest describes the actual copied/generated assembly, not inferred wall-clock recording order. Existing publications are backfilled on resume where saved provenance supports it; insufficient historical evidence is explicitly flagged rather than invented.
+
+### Failure points, risks and performance costs
+
+| Stage | Failure or interpretation risk | Main cost / mitigation |
+| --- | --- | --- |
+| Metadata and source intake | Missing/split `moov`, unsupported tracks, unavailable bytes or an incorrect supplied allocation map can prevent or mis-scope recovery. No metadata or frames are fabricated. | Initial bounded scan and hashing; completed indexes are reused. Allocation policy gates reconstruction reads without rebuilding the index. |
+| Whole-payload matching | Layout compatibility is not historical recording identity. Unsupported layouts or overwritten bytes may never match. | Many metadata jobs × many eligible `mdat` translations; canonical mapping hashes and durable attempt-cache lookups/writes. Prepared offset plans reduce repeated work. Completed case reads avoid pinning SQLite WAL growth. |
+| Deep discovery | Size/NAL anchors can collide; required contiguous groups may be missing. Audio association follows the metadata/group model; reconstruction-only mode does not decode-check it. | Scanning permitted bytes, NAL-chain checks, candidate framing and hashing. Shared discovery avoids a separate source scan for every metadata batch. |
+| Assembly | Multiple feasible byte-distinct mappings remain ambiguous. Per-output non-overlap does not settle cross-output ownership. | Content combinations and physical-witness backtracking can grow rapidly. Selective group ordering and overlap pruning reduce work without discarding feasible alternatives. |
+| Fragmented sections | Unsupported addressing, missing IDR/timing, absent tracks, sequence gaps or byte-window bounds stop or block a section. A recovered prefix ending does not prove the original recording ended there. | Repeated bounded parsing and sample checks at eligible starts. Cheap restart prefilters and completed-job reuse avoid unnecessary full reads. |
+| Output and validation | Disk exhaustion, changed sources/publications or explicit budgets can stop recovery. Structural success alone does not establish playability, chronology or camera identity. | Payload reads/copies, hashes, flush/fsync, and strict-mode probing/decoding. Temporary SQLite stores bound RAM, but search/evidence/output disk use still grows; there is no total-case retention quota. |
+
+See [ordinary support and grouping limits](docs/SUPPORT.md), [fragmented sequence/timing rules](docs/FRAGMENTED.md) and [shared source/range architecture](docs/ARCHITECTURE.md). Implementation entry points are [`whole_payload`, `deep_search`, `attempt`, `reconstruct` and `finish`](src/videorebuild/engine.py), [`recover_fragmented`](src/videorebuild/image_recovery.py) and [`walk_prefix`](src/videorebuild/fragmented.py). The [graphic generation brief](docs/images/recovery-process-prompt.md) records how the explanatory image was produced; code and the detailed contracts remain authoritative.
+
 ## Run
 
 Check tools, then recover supplied files:

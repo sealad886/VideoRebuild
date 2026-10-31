@@ -53,7 +53,7 @@ class DeepSearchPerformanceTests(unittest.TestCase):
             stat = source.stat()
             sources = {1: dict(path=str(source), size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                                dev=stat.st_dev, ino=stat.st_ino)}
-            case = SimpleNamespace(root=root, result=Mock())
+            case = SimpleNamespace(root=root, result=Mock(), job=Mock(return_value=None))
             with ReaderPool(sources) as pool, patch.object(engine, 'attempt') as attempt:
                 engine.deep_search(case, [movie], pool, {},
                                    engine.Options(max_anchor_checks=3), 'synthetic')

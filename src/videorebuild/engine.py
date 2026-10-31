@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import defaultdict
+from collections.abc import Mapping as MappingView
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
@@ -34,7 +35,7 @@ from .progress import phase
 
 LOG = logging.getLogger(__name__)
 FTYP = make_box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso6')
-Mapping = dict[tuple[int, int], tuple[int, int]]
+Mapping = MappingView[tuple[int, int], tuple[int, int]]
 MAX_DEEP_METADATA = 32 * 1024 * 1024
 
 
@@ -46,6 +47,7 @@ class Options:
     max_output_bytes: int = 16 * 1024**3
     deep: bool = False
     reconstruct_only: bool = False
+    include_recovered: bool = False
     max_groups: int = 200_000
     max_hits: int | None = None
     max_assemblies: int | None = None
@@ -53,14 +55,58 @@ class Options:
 
     def check(self) -> None:
         for k, v in asdict(self).items():
-            if k in {'deep', 'reconstruct_only'} or (v is None and k in {'max_candidates', 'max_padding', 'max_hits', 'max_assemblies', 'max_anchor_checks'}):
+            if k in {'deep', 'reconstruct_only', 'include_recovered'} or (v is None and k in {'max_candidates', 'max_padding', 'max_hits', 'max_assemblies', 'max_anchor_checks'}):
                 continue
             if not math.isfinite(v) or (v < 0 if k == 'max_padding' else v <= 0):
                 raise SafetyError(f'{k} must be a positive finite value (padding may be zero)')
 
 
+class _TranslationPlan:
+    """Movie invariants shared by uniform-offset hypotheses; no source bytes cached."""
+    def __init__(self, movie: Movie):
+        self.movie = movie
+        self.offsets = {(c.track, c.index): c.offset for c in movie.chunks}
+        self.ordered = sorted(self.offsets.items())
+        self.minimum = min(self.offsets.values())
+        self.maximum = max(self.offsets[(c.track, c.index)] + c.size for c in movie.chunks)
+        video = [c for c in movie.chunks if movie.tracks[c.track].handler == b'vide']
+        if len(video) > 12:
+            indexes = sorted({0, 1, 2, len(video)//2, len(video)-3, len(video)-2, len(video)-1})
+            video = [video[i] for i in indexes]
+        self.quick_chunks = video
+
+    def mapping(self, sid: int, translation: int):
+        return _TranslatedMapping(self, sid, translation)
+
+
+class _TranslatedMapping(MappingView):
+    """Read-only mapping with exactly the same assignments as its eager dict."""
+    def __init__(self, plan: _TranslationPlan, sid: int, translation: int):
+        self.plan, self.sid, self.translation = plan, sid, translation
+
+    def __getitem__(self, key):
+        return self.sid, self.translation + self.plan.offsets[key]
+
+    def __iter__(self):
+        return iter(self.plan.offsets)
+
+    def __len__(self):
+        return len(self.plan.offsets)
+
+    def check_source(self, pool: ReaderPool):
+        if (self.sid not in pool.sources or self.translation + self.plan.minimum < 0 or
+                self.translation + self.plan.maximum > pool.sources[self.sid]['size']):
+            raise FormatError('chunk outside source')
+        pool.check(self.sid)
+
+
 def mapping_digest(movie: Movie, mapping: Mapping) -> str:
-    value = [movie.digest, sorted((t, c, sid, off) for (t, c), (sid, off) in mapping.items())]
+    if isinstance(mapping, _TranslatedMapping) and mapping.plan.movie is movie:
+        rows = [(t, c, mapping.sid, mapping.translation + off)
+                for (t, c), off in mapping.plan.ordered]
+    else:
+        rows = sorted((t, c, sid, off) for (t, c), (sid, off) in mapping.items())
+    value = [movie.digest, rows]
     return hashlib.sha256(json_text(value).encode()).hexdigest()
 
 
@@ -99,8 +145,11 @@ def validate_ranges(movie: Movie, mapping: Mapping, pool: ReaderPool) -> None:
 def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool = False,
                   chunks: Iterable[Chunk] | None = None, *, unavailable_raises: bool = False) -> bool:
     """Check AVC/HEVC access-unit framing against *metadata* sample boundaries."""
-    selected = list(movie.chunks if chunks is None else chunks)
-    selected = [c for c in selected if movie.tracks[c.track].handler == b'vide']
+    if quick and chunks is None and isinstance(mapping, _TranslatedMapping) and mapping.plan.movie is movie:
+        selected = mapping.plan.quick_chunks
+    else:
+        selected = list(movie.chunks if chunks is None else chunks)
+        selected = [c for c in selected if movie.tracks[c.track].handler == b'vide']
     if quick and len(selected) > 12:
         indexes = sorted({0, 1, 2, len(selected)//2, len(selected)-3, len(selected)-2, len(selected)-1})
         selected = [selected[i] for i in indexes]
@@ -206,13 +255,17 @@ def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
     h = hashlib.sha256()
     media_hash = hashlib.sha256()
     entries = []
+    ordered = []
     with phase('Reconstruct encoded media', total=movie.media_size, unit='bytes') as task, dest.open('xb') as output:
         def write(data: bytes) -> None:
             output.write(data)
             h.update(data)
-        write(FTYP)
-        write(moov)
-        write(struct.pack('>I4sQ', 1, b'mdat', movie.media_size + 16))
+        for label, raw in (('ftyp', FTYP), ('moov', moov), ('mdat_header', struct.pack('>I4sQ', 1, b'mdat', movie.media_size + 16))):
+            ordered.append({'ordinal': len(ordered), 'kind': 'container', 'container': label,
+                            'output_offset': output.tell(), 'length': len(raw),
+                            'sha256': hashlib.sha256(raw).hexdigest(), 'generated': True,
+                            'source_id': None, 'physical_extents': []})
+            write(raw)
         for c in movie.chunks:
             sid, off = mapping[(c.track, c.index)]
             remaining = c.size
@@ -233,11 +286,16 @@ def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
                             'output_offset': new_offsets[(c.track, c.index)],
                             'sha256': chunk_hash.hexdigest(),
                             'physical_extents':pool.provenance(sid,off,c.size)})
+            for extent in entries[-1]['physical_extents']:
+                row = pool.physical[extent['source_id']]
+                extent['source_identity'] = {key: row.get(key) for key in ('dev', 'ino', 'size', 'mtime_ns', 'sha256')}
+            ordered.append(dict(entries[-1], ordinal=len(ordered), kind='media',
+                                logical_offset=off, length=c.size, generated=False))
         task.heartbeat(detail='flushing candidate')
         output.flush()
         os.fsync(output.fileno())
     return {'sha256': h.hexdigest(), 'media_sha256': media_hash.hexdigest(), 'bytes': size,
-            'chunks': entries, 'metadata_sha256': movie.digest,
+            'chunks': entries, 'ordered_fragments': ordered, 'metadata_sha256': movie.digest,
             'note': 'Encoded samples are copied; container offsets are rebuilt. Identity and wall-clock chronology are not proven.'}
 
 
@@ -249,11 +307,63 @@ def _record_attempt(case, movie, md, stage, result):
     case.db.commit()
 
 
+def _tier_eligible(movie, mapping, pool):
+    if not getattr(pool, 'tiers', None) or not pool.tiers.has_recovered:
+        return True
+    if isinstance(mapping, _TranslatedMapping):
+        # A whole-payload reference crossing accepted bytes belongs to tier two.
+        return pool.candidate_permits(mapping.sid, mapping.translation + mapping.plan.minimum,
+                                      mapping.plan.maximum - mapping.plan.minimum)
+    return all(pool.candidate_permits(sid, offset, length)
+               for sid, offset, length in source_ranges(movie, mapping))
+
+
+def _search_scope(case):
+    value = getattr(case, '_search_tiers', None)
+    if value is not None and value['searched'] == [1]:
+        value['second_tier_unsearched'] = case._candidate_tiers.has_recovered
+    return value
+
+
+def _scoped_result(case, key, status, detail):
+    previous = case.job('ordinary', key)
+    history = list(detail.get('historical_publications', []))
+    if previous:
+        old = previous['detail']
+        history += old.get('historical_publications', [])
+        if len(old.get('candidates', [])) == 1:
+            candidate = old['candidates'][0]
+            history += [{'path': path, 'sha256': candidate['sha256'], 'candidate': candidate['path']}
+                        for path in old.get('outputs', [])]
+    retained = []
+    for entry in history:
+        if entry['path'] not in detail.get('outputs', []) and entry not in retained:
+            retained.append(entry)
+    if retained:
+        detail['historical_publications'] = retained
+        detail['historical_outputs'] = [entry['path'] for entry in retained]
+    if _search_scope(case) is not None:
+        detail['search_tiers'] = dict(_search_scope(case))
+    case.result(key, status, detail)
+
+
+def _refresh_tiers(case):
+    tiers = getattr(case, '_candidate_tiers', None)
+    if tiers is not None:
+        tiers.refresh()
+
+
 def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools: dict,
             opt: Options, stage: str) -> dict:
+    if not _tier_eligible(movie, mapping, pool):
+        return {'status': 'rejected', 'stage': stage, 'reason': 'recovered_reference_second_tier'}
     md = mapping_digest(movie, mapping)
     try:
-        ranges = _mapping_ranges(movie, mapping, pool)
+        if isinstance(mapping, _TranslatedMapping) and mapping.plan.movie is movie:
+            mapping.check_source(pool)
+            ranges = ()
+        else:
+            ranges = _mapping_ranges(movie, mapping, pool)
         # A quick negative proves only that this assembly cannot work. Check
         # every referenced source, including those outside the sparse screen,
         # without resolving every chunk's provenance before that rejection.
@@ -345,7 +455,7 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
                 result.update(status='valid', path=str(target.relative_to(case.root)),
                               sha256=proof['sha256'], media_sha256=proof['media_sha256'])
                 write_json(target.with_suffix('.json'), {'version': __version__, 'stage': stage,
-                            'movie': movie.summary(), 'provenance': proof, 'validation': checked})
+                            'movie': movie.summary(), 'provenance': proof, 'ordered_fragments': proof['ordered_fragments'], 'search_tiers': _search_scope(case), 'validation': checked})
             elif checked.get('probe', {}).get('timeout') or checked.get('decode', {}).get('timeout'):
                 result['status'] = 'limited'
     except FormatError as e:
@@ -362,26 +472,126 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
     return result
 
 
+def _ordered_manifest(case, path, evidence):
+    """Backfill byte order from canonical chunk evidence; never decode or recopy media."""
+    if evidence.get('ordered_fragments'):
+        return evidence
+    proof = evidence.get('provenance', {})
+    chunks = proof.get('chunks', [])
+    if not chunks or any(not all(key in chunk for key in ('output_offset', 'size', 'source_offset', 'sha256')) for chunk in chunks):
+        return dict(evidence, historical_manifest_unavailable='missing_ordered_chunk_provenance')
+    size = path.stat().st_size
+    ordered = []
+    physical = case.physical_sources()
+    def span_hash(stream, offset, length):
+        stream.seek(offset)
+        digest = hashlib.sha256()
+        remaining = length
+        while remaining:
+            raw = stream.read(min(remaining, 1024 * 1024))
+            if not raw:
+                raise SafetyError('Published output truncated during manifest backfill')
+            digest.update(raw)
+            remaining -= len(raw)
+        return digest.hexdigest()
+    cursor = 0
+    with path.open('rb') as source:
+        for chunk in sorted(chunks, key=lambda item: item['output_offset']):
+            offset, length = chunk['output_offset'], chunk['size']
+            if offset < cursor or length <= 0 or offset + length > size:
+                raise SafetyError('Invalid historical output chunk evidence')
+            if offset > cursor:
+                ordered.append({'ordinal': len(ordered), 'kind': 'container', 'generated': True,
+                                'output_offset': cursor, 'length': offset-cursor,
+                                'sha256': span_hash(source, cursor, offset-cursor),
+                                'source_id': None, 'physical_extents': []})
+            entry = dict(chunk, ordinal=len(ordered), kind='media', generated=False,
+                         logical_offset=chunk['source_offset'], length=length)
+            if span_hash(source, offset, length) != entry['sha256']:
+                raise SafetyError('Historical chunk hash does not match publication')
+            for extent in entry.get('physical_extents', []):
+                row = physical[extent['source_id']]
+                ReaderPool._check_identity(row)
+                extent['source_identity'] = {key: row.get(key) for key in ('dev','ino','size','mtime_ns','sha256')}
+            ordered.append(entry)
+            cursor = offset + length
+        if cursor < size:
+            ordered.append({'ordinal': len(ordered), 'kind': 'container', 'generated': True,
+                            'output_offset': cursor, 'length': size-cursor,
+                            'sha256': span_hash(source, cursor, size-cursor),
+                            'source_id': None, 'physical_extents': []})
+    return dict(evidence, ordered_fragments=ordered)
+
+
+def _backfill_candidate_manifest(case, candidate):
+    path = case.root / candidate['path']
+    sidecar = path.with_suffix('.json')
+    if sidecar.is_symlink():
+        raise SafetyError('Candidate manifest is a symlink')
+    evidence = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+    updated = _ordered_manifest(case, path, evidence)
+    if updated != evidence:
+        write_json(sidecar, updated)
+    return updated
+
+
+def _backfill_ordinary_publications(case):
+    for job in case.get_jobs('ordinary'):
+        detail = job['detail']
+        publications = list(detail.get('historical_publications', []))
+        candidates = detail.get('candidates', [])
+        if len(candidates) == 1:
+            publications += [{'path': output, 'sha256': candidates[0]['sha256'],
+                              'candidate': candidates[0]['path']} for output in detail.get('outputs', [])]
+        for entry in publications:
+            output = case.root / entry['path']
+            candidate = {'path': entry['candidate'], 'sha256': entry['sha256']}
+            for path in (output, case.root / candidate['path']):
+                if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(case.root) or file_sha256(path) != entry['sha256']:
+                    raise SafetyError('Published output changed or disappeared')
+            evidence = _backfill_candidate_manifest(case, candidate)
+            sidecar = output.with_suffix('.json')
+            if sidecar.is_symlink():
+                raise SafetyError('Published manifest is a symlink')
+            published = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+            updated = dict(published)
+            for field in ('ordered_fragments', 'historical_manifest_unavailable'):
+                if field in evidence:
+                    updated[field] = evidence[field]
+            if updated != published:
+                write_json(sidecar, updated)
+
+
 def _publish(case: Case, movie: Movie, successes: list[dict], status: str) -> list[str]:
     """Published output is a case-internal hard link, never a source-file link."""
     final = case.root / 'reconstructed' / f'{movie.digest[:24]}.mp4'
     sidecar = final.with_suffix('.json')
     if final.is_symlink() or sidecar.is_symlink():
         raise SafetyError('Published artifact is a symlink')
-    if final.exists():
-        # Detach the old publication name; candidate bytes and history are retained.
-        final.unlink()
-    if sidecar.exists():
-        sidecar.unlink()
     if status not in {'matched', 'reconstructed'} or len(successes) != 1:
         return []
     candidate = case.root / successes[0]['path']
-    storage_mode = _publish_link_or_copy(candidate, final)
+    evidence = _backfill_candidate_manifest(case, successes[0])
+    if evidence.get('search_tiers') != _search_scope(case):
+        evidence['search_tiers'] = _search_scope(case)
+        write_json(candidate.with_suffix('.json'), evidence)
+    if final.exists():
+        if file_sha256(final) != successes[0]['sha256']:
+            # Preserve the prior publication; the accepted candidate already has
+            # its own canonical bytes and sidecar and can be the current output.
+            return [successes[0]['path']]
+        storage_mode = 'retained_existing_publication'
+    else:
+        storage_mode = _publish_link_or_copy(candidate, final)
+    evidence = _backfill_candidate_manifest(case, successes[0])
     write_json(sidecar, {'status': status, 'candidate': successes[0]['path'], 'storage_mode': storage_mode,
-                         'sha256': successes[0]['sha256'],
+                         'sha256': successes[0]['sha256'], 'provenance': evidence.get('provenance', {}),
+                         'ordered_fragments': evidence.get('ordered_fragments', evidence.get('provenance', {}).get('ordered_fragments', [])),
+                         'historical_manifest_unavailable': evidence.get('historical_manifest_unavailable'),
                          'decode_checked': not successes[0].get('reconstruct_only', False),
                          'validation_scope': 'structural_reconstruction_only' if successes[0].get('reconstruct_only') else 'strict_decode',
-                         'meaning': 'One byte-distinct candidate passed within the completed search model; not proof of historical identity.'})
+                         'search_tiers': _search_scope(case),
+                         'meaning': 'One byte-distinct candidate passed within searched tiers; unsearched tiers may contain alternatives, and historical identity is not proven.'})
     return [str(final.relative_to(case.root))]
 
 
@@ -402,14 +612,29 @@ def finish(case: Case, movie: Movie, candidates: list[dict], limited: bool,
         status = 'reconstructed' if good[0].get('reconstruct_only') else 'matched'
     else:
         status = 'unresolved'
+    previous = case.job('ordinary', movie.digest)
+    history = list(previous['detail'].get('historical_publications', [])) if previous else []
+    if previous and previous['detail'].get('outputs') and len(previous['detail'].get('candidates', [])) == 1:
+        candidate = previous['detail']['candidates'][0]
+        for path in previous['detail']['outputs']:
+            entry = {'path': path, 'sha256': candidate['sha256'], 'candidate': candidate['path']}
+            if entry not in history:
+                history.append(entry)
     outputs = _publish(case, movie, good, status)
     detail = {'run_key': run_key, 'stage': stage, 'candidates': good, 'search_limited': limited,
               'outputs': outputs,
               'decode_checked': bool(good) and all(not c.get('reconstruct_only', False) for c in good),
               'scope': 'Uniqueness applies only to the documented, completed hypotheses searched.'}
+    retained = [entry for entry in history if entry['path'] not in outputs]
+    if retained:
+        detail['historical_publications'] = retained
+        detail['historical_outputs'] = [entry['path'] for entry in retained]
     if extra:
         detail.update(extra)
-    case.result(movie.digest, status, detail)
+    if _search_scope(case) is not None:
+        detail['search_tiers'] = dict(_search_scope(case))
+    _scoped_result(case, movie.digest, status, detail)
+    _refresh_tiers(case)
     LOG.info('%s %s: %d byte-distinct candidates (%s)', movie.digest[:12], status, len(good),
              'structural reconstruction; no decode check' if any(c.get('reconstruct_only') for c in good)
              else 'decode checked' if good else 'no accepted candidate; no decode claim')
@@ -432,6 +657,8 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
     successes = {}
     limited = False
     tested = 0
+    plan = _TranslationPlan(movie)
+    metadata_pool = pool.tiers.pool if getattr(pool, 'tiers', None) else pool
     with _search_store() as search:
         search.execute('CREATE TABLE translations (sid INTEGER,base INTEGER,PRIMARY KEY(sid,base)) WITHOUT ROWID')
         search.execute('CREATE TABLE origins (sid INTEGER,base INTEGER,PRIMARY KEY(sid,base)) WITHOUT ROWID')
@@ -439,25 +666,27 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
                                      WHERE a.movie_digest=? AND s.complete=1''', (movie.digest,))
         for location in locations:
             sid, moff = location['source_id'], location['offset']
-            if sid not in pool.sources or not pool.permits(sid, moff, location['size']):
+            if sid not in pool.sources or not metadata_pool.permits(sid, moff, location['size']):
                 continue
             if pool.sources[sid]['kind'] in ('file', 'logical'):
                 search.execute('INSERT OR IGNORE INTO origins VALUES(?,0)', (sid,))
             for row in case.db.execute("SELECT offset,size FROM atoms WHERE source_id=? AND kind='ftyp' AND offset<=? ORDER BY offset DESC", (sid, moff)):
-                if pool.permits(sid, row['offset'], row['size']):
+                if metadata_pool.permits(sid, row['offset'], row['size']):
                     search.execute('INSERT OR IGNORE INTO origins VALUES(?,?)', (sid, row['offset']))
                     break
         with phase('Original offset locations examined', unit='candidates') as task:
             for sid, origin in search.execute('SELECT sid,base FROM origins ORDER BY sid,base'):
+                if not _tier_eligible(movie, plan.mapping(sid, origin), pool):
+                    continue
                 task.advance()
                 search.execute('INSERT INTO translations VALUES(?,?)', (sid, origin))
                 tested += 1
-                mapping = {(c.track, c.index): (sid, origin+c.offset) for c in movie.chunks}
+                mapping = plan.mapping(sid, origin)
                 result = attempt(case, movie, mapping, pool, tools, opt, 'original_offsets')
                 if result['status'] == 'valid':
                     successes.setdefault(result['media_sha256'], result)
                 limited |= result['status'] == 'limited'
-        query = '''SELECT a.* FROM atoms a JOIN sources s ON s.id=a.source_id
+        query = '''SELECT a.source_id,a.offset,a.header FROM atoms a JOIN sources s ON s.id=a.source_id
                    WHERE a.kind='mdat' AND s.complete=1 AND a.payload_size>=?'''
         parameters = [movie.span]
         if opt.max_padding is not None:
@@ -470,23 +699,30 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
                 if row['source_id'] in pool.sources and pool.permits(row['source_id'], row['offset'], row['header']):
                     limited = True
                     break
+        # Finish the case read before attempts commit. A live case cursor pins
+        # the WAL snapshot and prevents checkpoint recycling across the search.
+        search.execute('CREATE TABLE candidates (position INTEGER PRIMARY KEY,sid INTEGER,offset INTEGER,header INTEGER)')
+        search.executemany('INSERT INTO candidates(sid,offset,header) VALUES(?,?,?)',
+                           case.db.execute(query, parameters))
         examined = 0
         with phase('Whole mdat locations examined', unit='candidates') as task:
-            for row in case.db.execute(query, parameters):
-                sid = row['source_id']
-                if sid not in pool.sources or not pool.permits(sid, row['offset'], row['header']):
+            for sid, offset, header in search.execute('SELECT sid,offset,header FROM candidates ORDER BY position'):
+                if sid not in pool.sources or not pool.permits(sid, offset, header):
+                    continue
+                translation = offset+header-movie.chunks[0].offset
+                if not _tier_eligible(movie, plan.mapping(sid, translation), pool):
                     continue
                 if opt.max_candidates is not None and examined >= opt.max_candidates:
                     limited = True
                     break
                 examined += 1
                 task.update(examined)
-                translation = row['offset']+row['header']-movie.chunks[0].offset
+                translation = offset+header-movie.chunks[0].offset
                 inserted = search.execute('INSERT OR IGNORE INTO translations VALUES(?,?)', (sid, translation)).rowcount
                 if not inserted:
                     continue
                 tested += 1
-                mapping = {(c.track, c.index): (sid, translation+c.offset) for c in movie.chunks}
+                mapping = plan.mapping(sid, translation)
                 result = attempt(case, movie, mapping, pool, tools, opt, 'whole_mdat')
                 if result['status'] == 'valid':
                     successes.setdefault(result['media_sha256'], result)
@@ -722,8 +958,8 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     for movie in movies:
         gs = groups_for(movie)
         if any(not g.anchors() for g in gs):
-            case.result(movie.digest, 'search_limited' if movie.digest in incomplete else 'unsupported', {'run_key': run_key,
-                        'reason': 'deep search requires eligible 4-byte NAL-length samples in every extent'})
+            _scoped_result(case, movie.digest, 'search_limited' if movie.digest in incomplete else 'unsupported', {'run_key': run_key,
+                        'reason': 'deep search requires eligible 4-byte NAL-length samples in every extent', 'search_tiers': _search_scope(case)})
             excluded.add(movie.digest)
             continue
         per_movie[movie.digest] = gs
@@ -1020,17 +1256,32 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                  'validation_revision': VALIDATION_REVISION})
     incomplete = set()
     processed = 0
-    # Do not load all moov BLOBs into memory. A separate cursor streams them.
-    rows = case.db.execute('''SELECT m.*,r.status AS old_status,r.detail AS old_detail FROM movies m
-          LEFT JOIN jobs r ON r.kind='ordinary' AND r.key=m.digest
-          WHERE EXISTS(SELECT 1 FROM atoms a JOIN sources s ON a.source_id=s.id
-                       WHERE a.movie_digest=m.digest AND s.complete=1) ORDER BY m.digest''')
     with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store() as pending:
+        # Snapshot only selected identities on disk, then load one metadata
+        # BLOB at a time with a completed point query. Streaming the case SELECT
+        # through attempt writes pins its WAL for the entire recovery.
+        pending.execute('CREATE TABLE selected(digest TEXT PRIMARY KEY) WITHOUT ROWID')
+        pending.executemany('INSERT INTO selected VALUES(?)', case.db.execute('''SELECT m.digest FROM movies m
+              WHERE EXISTS(SELECT 1 FROM atoms a JOIN sources s ON a.source_id=s.id
+                           WHERE a.movie_digest=m.digest AND s.complete=1) ORDER BY m.digest'''))
         deferred = _DeferredMovies(case, pending)
         for sid in sources:
             pool.check(sid)
-        for row in rows:
-            if not any(pool.permits(location['source_id'], location['offset'], location['size'])
+        _backfill_ordinary_publications(case)
+        from .candidate_tiers import CandidateTiers
+        pending.execute('CREATE TABLE visited_movies(digest TEXT PRIMARY KEY) WITHOUT ROWID')
+        base_pool = pool
+        tiers = CandidateTiers(case, base_pool)
+        case._candidate_tiers = tiers
+        case._search_tiers = {'policy': 'unclaimed_first', 'searched': [1],
+                             'include_recovered': opt.include_recovered,
+                             'second_tier_unsearched': tiers.has_recovered,
+                             'uniqueness_scope': 'searched_tiers_only'}
+        pool = tiers.view()
+        for (digest,) in pending.execute('SELECT digest FROM selected ORDER BY digest'):
+            row = case.db.execute('''SELECT m.*,r.status AS old_status,r.detail AS old_detail FROM movies m
+                  LEFT JOIN jobs r ON r.kind='ordinary' AND r.key=m.digest WHERE m.digest=?''', (digest,)).fetchone()
+            if not any(base_pool.permits(location['source_id'], location['offset'], location['size'])
                        for location in case.db.execute('SELECT source_id,offset,size FROM atoms WHERE movie_digest=?', (row['digest'],))):
                 continue
             jobs_task.advance(processed_movies=processed)
@@ -1042,31 +1293,69 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                         p = case.root / c['path']
                         if not p.is_file() or p.is_symlink() or file_sha256(p) != c['sha256']:
                             raise SafetyError(f'Previously validated candidate changed or disappeared: {p}')
+                        _backfill_candidate_manifest(case, c)
                     for output in old_detail.get('outputs', []):
                         p = case.root / output
                         if (not p.is_file() or p.is_symlink() or len(candidates) != 1 or
                                 file_sha256(p) != candidates[0]['sha256']):
                             raise SafetyError(f'Published output changed or disappeared: {p}')
+                        published_manifest = p.with_suffix('.json')
+                        evidence = json.loads(published_manifest.read_text()) if published_manifest.is_file() else {}
+                        candidate_evidence = _backfill_candidate_manifest(case, candidates[0])
+                        for field in ('ordered_fragments', 'historical_manifest_unavailable'):
+                            if field in candidate_evidence:
+                                evidence[field] = candidate_evidence[field]
+                        write_json(published_manifest, evidence)
                     continue
             if limit is not None and processed >= limit:
                 break
             processed += 1
+            pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
             if row['error']:
-                case.result(row['digest'], 'unsupported', {'run_key': run_key, 'reason': row['error']})
+                _scoped_result(case, row['digest'], 'unsupported', {'run_key': run_key, 'reason': row['error'], 'search_tiers': dict(_search_scope(case))})
                 continue
             movie = parse_movie(row['data'])
             if movie.media_size > opt.max_output_bytes:
-                case.result(movie.digest, 'search_limited', {'run_key': run_key, 'reason': 'output_size_budget'})
+                _scoped_result(case, movie.digest, 'search_limited', {'run_key': run_key, 'reason': 'output_size_budget', 'search_tiers': dict(_search_scope(case))})
                 continue
             LOG.info('Matching %s: %d chunks, %.2f MiB media', movie.digest[:12], len(movie.chunks), movie.media_size / 1024**2)
-            status, candidates, whole_limited = whole_payload(case, movie, pool, tools, opt, run_key)
+            owner_pool = tiers.view(('ordinary', movie.digest))
+            status, candidates, whole_limited = whole_payload(case, movie, owner_pool, tools, opt, run_key)
             if opt.deep and status in {'unresolved', 'search_limited'} and not candidates:
                 if whole_limited:
                     incomplete.add(movie.digest)
-                case.result(movie.digest, 'awaiting_deep', {'run_key': run_key,
-                            'reason': 'whole-payload search finished; deep pass not yet completed'})
-                deferred.add(movie.digest)
+                current = case.job('ordinary', movie.digest)
+                waiting = dict(current['detail']) if current else {}
+                waiting.update(run_key=run_key, reason='whole-payload search finished; deep pass not yet completed',
+                               search_tiers=dict(_search_scope(case)))
+                _scoped_result(case, movie.digest, 'awaiting_deep', waiting)
+                if old_detail.get('outputs') or old_detail.get('historical_publications'):
+                    # A resumed target may revalidate its own accepted extents.
+                    # Other targets' accepted bytes remain excluded by this view.
+                    deep_search(case, [movie], owner_pool, tools, opt, run_key, incomplete=incomplete)
+                else:
+                    deferred.add(movie.digest)
         if deferred:
             deep_search(case, deferred, pool, tools, opt, run_key, incomplete=incomplete)
+        if opt.include_recovered and tiers.has_recovered:
+            # Only targets without any first-tier result may search recovered references.
+            case._search_tiers = dict(case._search_tiers, searched=[1, 2], second_tier_unsearched=False)
+            pending.execute('DELETE FROM deferred')
+            fallback = deferred
+            for (digest,) in pending.execute('SELECT digest FROM visited_movies ORDER BY digest'):
+                job = case.job('ordinary', digest)
+                if not job or job['detail'].get('run_key') != run_key or job['detail'].get('candidates'):
+                    continue
+                row = case.db.execute('SELECT data,error FROM movies WHERE digest=?', (digest,)).fetchone()
+                if row['error']:
+                    continue
+                movie = parse_movie(row['data'])
+                status, candidates, whole_limited = whole_payload(case, movie, base_pool, tools, opt, run_key)
+                if opt.deep and not candidates and status in {'unresolved', 'search_limited'}:
+                    if whole_limited:
+                        incomplete.add(digest)
+                    fallback.add(digest)
+            if fallback:
+                deep_search(case, fallback, base_pool, tools, opt, run_key, incomplete=incomplete)
         jobs_task.heartbeat(processed_movies=processed)
     case.event('recovery_complete', {'run_key': run_key, 'processed_movies': processed})

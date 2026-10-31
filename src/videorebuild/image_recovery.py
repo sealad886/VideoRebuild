@@ -19,11 +19,12 @@ import struct
 import uuid
 
 from . import __version__
-from .bmff import FormatError
+from .bmff import FormatError, boxes
 from .fragmented import MAX_INIT, MAX_MOOF, parse_fragment, parse_initialization, walk_prefix
 from .storage import SafetyError, file_sha256, write_json
 from .validate import run_tool
 from .progress import phase
+from .candidate_tiers import CandidateTiers
 
 LOG = logging.getLogger(__name__)
 
@@ -173,6 +174,12 @@ def verify_completed(case) -> None:
                         not output.resolve().is_relative_to(output_root) or
                         output.stat().st_size != item['size'] or file_sha256(output) != item['sha256']):
                     raise SafetyError(f'Missing or changed fragmented publication: {output}')
+                if item.get('manifest_path'):
+                    manifest = case.root / item['manifest_path']
+                    if (manifest.is_symlink() or not manifest.is_file() or
+                            not manifest.resolve().is_relative_to(output_root) or
+                            file_sha256(manifest) != item.get('manifest_sha256')):
+                        raise SafetyError(f'Missing or changed fragmented manifest: {manifest}')
             if len(detail.get('output_evidence', [])) != len(detail['outputs']):
                 raise SafetyError('Incomplete fragmented publication evidence')
 
@@ -279,6 +286,8 @@ def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> 
     reconstruct_only = bool(getattr(options, 'reconstruct_only', False))
     policy = {'max_segments': options.max_segments, 'indexed_starts': 'through_next_initialization',
               'allocation_scope': allocation_scope}
+    policy['candidate_tiers'] = 'unclaimed_first'
+    policy['include_recovered'] = bool(getattr(options, 'include_recovered', False))
     if reconstruct_only:
         policy['reconstruct_only'] = True
     row = case.db.execute("SELECT value FROM settings WHERE name='fragmented_settings'").fetchone()
@@ -318,6 +327,110 @@ def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> 
     return changed
 
 
+def _fragment_manifest(pool, sid, initialization_offset, start, retained, prefix):
+    """Exact ordered source-to-output spans; no decoder or chronology inference."""
+    init_size = len(prefix.initialization.data)
+    pieces = []
+    def append(kind, output_offset, size, logical_offset, **identity):
+        if size <= 0:
+            return
+        extents = pool.provenance(sid, logical_offset, size)
+        for extent in extents:
+            row = pool.physical[extent['source_id']]
+            extent['source_identity'] = {key: row.get(key) for key in ('dev', 'ino', 'size', 'mtime_ns', 'sha256')}
+        pieces.append(dict(ordinal=len(pieces), kind=kind, source_id=sid,
+                           logical_offset=logical_offset, length=size, output_offset=output_offset,
+                           sha256=hashlib.sha256(memoryview(retained)[output_offset:output_offset+size]).hexdigest(),
+                           physical_extents=extents, **identity))
+    append('initialization', 0, init_size, initialization_offset)
+    cursor = init_size
+    for fragment in prefix.fragments:
+        append('container', cursor, fragment.start-cursor, start+cursor-init_size)
+        counts = defaultdict(int)
+        for sample in fragment.samples:
+            counts[sample.track_id] += 1
+        append('media', fragment.start, fragment.end-fragment.start,
+               start+fragment.start-init_size, sequence=fragment.sequence,
+               content='moof_mdat_container_and_encoded_media',
+               sample_counts=dict(counts), decode_times=dict(fragment.decode_times))
+        cursor = fragment.end
+    append('container', cursor, len(retained)-cursor, start+cursor-init_size)
+    return {'schema': 1, 'kind': 'ordered-fragment-manifest',
+            'output_sha256': hashlib.sha256(retained).hexdigest(), 'output_size': len(retained),
+            'decode_checked': False, 'ordered_fragments': pieces}
+
+
+def _backfill_fragment_manifests(case, pool):
+    """Add ordered evidence for existing outputs without recopying or decoding."""
+    for job in list(case.get_jobs('fragmented')):
+        detail = job['detail']
+        changed = False
+        segments = {segment.get('output'): segment for segment in detail.get('segments', [])}
+        for entry in detail.get('output_evidence', []):
+            if entry.get('manifest_path'):
+                continue
+            output = case.root / entry['path']
+            segment = segments.get(entry['path'], {})
+            checked = segment.get('validation', {}).get('decode_checked')
+            decoded = checked if isinstance(checked, bool) else (
+                segment.get('reconstruct_only') is not True and (
+                    segment.get('status') in {'decoded_prefix', 'decoded_segment'} or
+                    detail.get('decode_checked') is True))
+            validation_scope = ('strict_decode' if decoded else
+                                'structural_reconstruction_only' if segment.get('reconstruct_only') is True else
+                                'historical_validation_unknown')
+            manifest = {'schema': 1, 'kind': 'ordered-fragment-manifest',
+                        'status': 'historical_manifest_unavailable',
+                        'output_sha256': entry['sha256'], 'output_size': entry['size'],
+                        'decode_checked': decoded, 'validation_scope': validation_scope}
+            try:
+                sid, init_at, start = detail.get('source_id'), detail.get('logical_offset'), segment.get('logical_start')
+                if sid not in pool.sources or not isinstance(init_at, int) or not isinstance(start, int):
+                    raise FormatError('historical_source_coordinates_unavailable')
+                if not segment.get('source_ranges'):
+                    raise FormatError('historical_physical_proof_unavailable')
+                if entry['size'] > 256*1024*1024:
+                    raise FormatError('historical_output_exceeds_bounded_manifest_parser')
+                with output.open('rb') as stream:
+                    raw = stream.read(entry['size']+1)
+                if len(raw) != entry['size'] or hashlib.sha256(raw).hexdigest() != entry['sha256']:
+                    raise SafetyError('Historical fragmented output changed during manifest backfill')
+                roots = boxes(raw)
+                ftyp, moov = next(roots), next(roots)
+                if ftyp.kind != b'ftyp' or moov.kind != b'moov' or moov.end > MAX_INIT:
+                    raise FormatError('historical_initialization_unavailable')
+                prefix = walk_prefix(raw, moov.end, allow_later_start=True)
+                if prefix.end != len(raw) or not prefix.fragments:
+                    raise FormatError('historical_fragment_layout_not_fully_represented')
+                # Reuse saved physical proof rather than infer another association.
+                expected = pool.provenance(sid, init_at, moov.end) + pool.provenance(sid, start, len(raw)-moov.end)
+                signature = lambda spans: [(v['source_id'], v['source_offset'], v['length']) for v in spans]
+                if signature(expected) != signature(segment['source_ranges']):
+                    raise FormatError('historical_physical_proof_does_not_match_coordinates')
+                manifest = _fragment_manifest(pool, sid, init_at, start, raw, prefix)
+                manifest.update(status='backfilled_from_existing_publication',
+                                decode_checked=decoded, validation_scope=validation_scope)
+            except (FormatError, StopIteration, KeyError, TypeError, ValueError) as error:
+                manifest['reason'] = str(error) or 'historical_layout_unavailable'
+            sidecar = output.with_suffix('.json')
+            if sidecar.exists() or sidecar.is_symlink():
+                # Preserve an older unrelated sidecar; attach a distinct local manifest.
+                sidecar = output.with_name(output.name+'.manifest-'+uuid.uuid4().hex+'.json')
+            write_json(sidecar, manifest)
+            entry.update(manifest_path=str(sidecar.relative_to(case.root)),
+                         manifest_sha256=file_sha256(sidecar),
+                         manifest_status=manifest.get('status', 'available'))
+            changed = True
+        if changed:
+            evidence_root = case.root / ('attempts' if detail.get('historical_validation') else 'work')
+            evidence_root.mkdir(exist_ok=True)
+            evidence = evidence_root / ('fragment-manifest-backfill-'+uuid.uuid4().hex+'.json')
+            detail['detail_path'] = str(evidence.relative_to(case.root))
+            write_json(evidence, detail)
+            detail['evidence_sha256'] = file_sha256(evidence)
+            case.result(job['key'], job['status'], detail, kind='fragmented')
+
+
 def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool = False) -> int:
     """Recover bounded fMP4 sections through the canonical read and job owners.
 
@@ -329,12 +442,17 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
     max_segments = options.max_segments
     timeout = options.timeout
     reconstruct_only = bool(getattr(options, 'reconstruct_only', False))
+    include_recovered = bool(getattr(options, 'include_recovered', False))
     check_options(options)
     verify_completed(case)
+    _backfill_fragment_manifests(case, pool)
     allocation_scope = pool.allocation_scope.digest if pool.allocation_scope is not None else None
     policy_changed = _bind_search_policy(case, tools, options, retry, allocation_scope)
+    tiers = CandidateTiers(case, pool)
     search_policy = {'max_segments': max_segments, 'indexed_starts': 'through_next_initialization',
                      'allocation_scope': allocation_scope}
+    search_policy['candidate_tiers'] = 'unclaimed_first'
+    search_policy['include_recovered'] = include_recovered
     if reconstruct_only:
         search_policy['reconstruct_only'] = True
     if policy_changed:
@@ -391,7 +509,11 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                       'tracks': {str(k): asdict(v) for k, v in init.tracks.items()},
                       'outputs': [], 'output_evidence': [], 'segments': [], 'gaps': [],
                       'reconstruct_only': reconstruct_only, 'decode_checked': False,
-                      'timing_note': 'Decode times are media ticks, not wall-clock dates.'}
+                      'timing_note': 'Decode times are media ticks, not wall-clock dates.',
+                      'search_tiers': {'policy': 'unclaimed_first', 'searched': [1],
+                                       'include_recovered': include_recovered,
+                                       'second_tier_unsearched': True,
+                                       'uniqueness_scope': 'searched_tiers_only'}}
             # Existing validated clips are immutable. Retry searches uncovered
             # starts without replacing a previously published bounded section.
             if old is not None and old['detail'].get('outputs'):
@@ -400,175 +522,198 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                 for name in ('historical_allocation_scope', 'current_allocation_scope', 'historical_outputs'):
                     if name in old['detail']:
                         detail[name] = old['detail'][name]
-            published = iter(sorted((segment['logical_start'], segment['logical_end'])
-                                   for segment in detail['segments'] if segment.get('output') and
-                                   bool(segment.get('reconstruct_only', False)) == reconstruct_only))
-            published_range = next(published, None)
             read_bytes = 0
 
             def read_section(at: int, size: int) -> bytes:
                 nonlocal read_bytes
                 if size < 0 or size > max_bytes-len(init.data):
                     raise FormatError('invalid_section_read_size')
-                raw = pool.read(sid, at, size)
+                raw = media_pool.read(sid, at, size)
                 read_bytes += size
                 section_task.heartbeat(read_bytes=read_bytes, starts_considered=considered)
                 return raw
 
-            # Intervals describe availability, without shifting logical coordinates.
-            intervals = iter(pool.available_ranges(sid, init_end, end))
-            interval = next(intervals, None)
-            consumed = init_end
             considered = 0
             with phase('Fragmented section starts considered', unit='candidates') as section_task:
-                for start in _candidate_starts(case, sid, init_end, end):
-                    while published_range is not None and published_range[1] <= start:
-                        published_range = next(published, None)
-                    if published_range is not None and published_range[0] <= start < published_range[1]:
-                        consumed = max(consumed, published_range[1])
-                        continue
-                    if start < consumed:
-                        continue
-                    while interval is not None and interval[0]+interval[1] <= start:
-                        interval = next(intervals, None)
-                    if interval is None:
-                        break
-                    if start < interval[0]:
-                        detail['gaps'].append({'start': start, 'end': interval[0], 'reason': 'unavailable_source_bytes'})
-                        continue
-                    if max_segments is not None and considered >= max_segments:
-                        detail['limit_reason'] = 'segment_attempt_budget'
-                        break
-                    # Count malformed and non-IDR starts before any prefilter read.
-                    considered += 1
-                    section_task.update(considered, read_bytes=read_bytes)
-                    pair_data = b''
-                    readable_end = min(end, interval[0]+interval[1], start+max_bytes-len(init.data))
-                    later = start != init_end
-                    if later:
-                        # Reject non-random-access starts using one bounded pair before
-                        # parsing an entire section or launching external decoders.
-                        try:
-                            header = read_section(start, min(16, readable_end-start))
-                            moof_size = int.from_bytes(header[:4], 'big')
-                            if moof_size == 1:
-                                moof_size = int.from_bytes(header[8:16], 'big')
-                            if header[4:8] != b'moof' or not 8 <= moof_size <= MAX_MOOF:
-                                continue
-                            mdat_head = read_section(start+moof_size, min(16, readable_end-start-moof_size))
-                            mdat_size = int.from_bytes(mdat_head[:4], 'big')
-                            if mdat_size == 1:
-                                mdat_size = int.from_bytes(mdat_head[8:16], 'big')
-                            length = moof_size+mdat_size
-                            if not moof_size+8 <= length <= readable_end-start:
-                                continue
-                            pair_data = read_section(start, length)
-                            first = parse_fragment(pair_data, 0, init)
-                            if not _restart_is_idr(first, init):
-                                continue
-                            if any(base is None for base in first.decode_times.values()):
-                                # A track already present cannot acquire its missing
-                                # restart origin from a later fragment. Tracks absent
-                                # here may still appear later with explicit timing.
-                                counts = defaultdict(int)
-                                for sample in first.samples:
-                                    counts[sample.track_id] += 1
-                                detail['segments'].append({
-                                    'logical_start': start, 'logical_end': start+len(pair_data),
-                                    'later_section': True, 'fragment_count': 1,
-                                    'sample_counts': dict(counts), 'allocation_scope': allocation_scope,
-                                    'status': 'blocked', 'reason': 'missing_restart_track_timing',
-                                    'stop_reason': 'missing_restart_track_timing'})
-                                continue
-                        except (FormatError, struct.error):
+                for tier in (1, 2):
+                    if tier == 2:
+                        if not include_recovered or detail['outputs'] or detail.get('limit_reason'):
+                            break
+                        detail['search_tiers']['searched'].append(2)
+                        detail['search_tiers']['second_tier_unsearched'] = False
+                    media_pool = tiers.view(owner=('fragmented', key)) if tier == 1 else pool
+                    published = iter(sorted((segment['logical_start'], segment['logical_end'])
+                                            for segment in detail['segments'] if segment.get('output') and
+                                            bool(segment.get('reconstruct_only', False)) == reconstruct_only))
+                    published_range = next(published, None)
+                    # Intervals describe availability, without shifting logical coordinates.
+                    intervals = iter(media_pool.available_ranges(sid, init_end, end))
+                    interval = next(intervals, None)
+                    consumed = init_end
+                    for start in _candidate_starts(case, sid, init_end, end):
+                        while published_range is not None and published_range[1] <= start:
+                            published_range = next(published, None)
+                        if published_range is not None and published_range[0] <= start < published_range[1]:
+                            consumed = max(consumed, published_range[1])
                             continue
-                    payload = pair_data+read_section(start+len(pair_data), readable_end-start-len(pair_data))
-                    data = init.data+payload
-                    prefix = walk_prefix(data, len(init.data), allow_later_start=later)
-                    if (not later and not prefix.fragments and
-                            prefix.stop_reason.startswith('missing_initial_fragments_sequence_starts_at_')):
-                        # A logical file may begin at a surviving later fragment. Keep
-                        # the same restart checks and label; never call it a prefix.
-                        later = True
-                        prefix = walk_prefix(data, len(init.data), allow_later_start=True)
-                    segment = {'logical_start': start, 'logical_end': start+prefix.end-len(init.data),
-                               'stop_reason': prefix.stop_reason, 'fragment_count': len(prefix.fragments),
-                               'sample_counts': prefix.counts, 'later_section': later,
-                               'allocation_scope': allocation_scope,
-                               'read_window_end': readable_end,
-                               'window_limited': readable_end < min(end, interval[0]+interval[1]),
-                               'source_ranges': pool.provenance(sid, offset, len(init.data)),
-                               'starts': prefix.starts}
-                    error = prefix.eligibility_error()
-                    if not error and later and not _restart_has_timing(prefix):
-                        error = 'missing_restart_track_timing'
-                    if error:
-                        segment.update(status='blocked', reason=error)
-                        detail['segments'].append(segment)
-                        continue
-                    retained = data[:prefix.end]
-                    source_length = prefix.end-len(init.data)
-                    segment['source_ranges'] += pool.provenance(sid, start, source_length)
-                    if len(retained) > options.max_output_bytes:
-                        segment.update(status='search_limited', reason='output_size_budget')
-                        detail['segments'].append(segment)
-                        continue
-                    if shutil.disk_usage(case.root).free < len(retained)*2+1024*1024:
-                        raise SafetyError('Insufficient free space for fragmented candidate and publication')
-                    candidate = attempt / f'section-{start}.mp4'
-                    with phase('Write fragmented candidate', total=len(retained), unit='bytes') as write_task, candidate.open('xb') as stream:
-                        stream.write(retained)
-                        write_task.update(len(retained))
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    checked = ({'ok': True, 'decode_checked': False,
-                                'scope': 'structural_reconstruction_only',
-                                'reason': 'structural_reconstruction_only'} if reconstruct_only else
-                               validate_prefix(candidate, data, prefix, tools, timeout))
-                    # Exact packet comparison needs a bounded large probe response, but
-                    # failed responses must not accumulate that response per section.
-                    for command in ('probe', 'decode'):
-                        evidence = checked.get(command, {})
-                        for channel in ('stdout', 'stderr'):
-                            value = evidence.get(channel, '')
-                            if len(value) > 65536:
-                                evidence[channel] = value[:65536]
-                                evidence[channel+'_retained_truncated'] = True
-                    segment['validation'] = checked
-                    if not checked['ok']:
-                        segment.update(status='decode_failed', reason=checked['reason'])
-                        detail['segments'].append(segment)
-                        continue
-                    output = case.root / 'reconstructed' / f'fragment-{sid}-{offset}-{start}.mp4'
-                    digest = hashlib.sha256(retained).hexdigest()
-                    if output.exists() or output.is_symlink():
-                        if output.is_symlink() or not output.is_file() or file_sha256(output) != digest:
-                            raise SafetyError(f'Conflicting existing fragmented output: {output}')
-                    else:
-                        with phase('Publish fragmented section', total=len(retained), unit='bytes') as publish_task, output.open('xb') as stream:
+                        if start < consumed:
+                            continue
+                        while interval is not None and interval[0]+interval[1] <= start:
+                            interval = next(intervals, None)
+                        if interval is None:
+                            break
+                        if start < interval[0]:
+                            detail['gaps'].append({'start': start, 'end': interval[0], 'reason': 'unavailable_source_bytes'})
+                            continue
+                        if max_segments is not None and considered >= max_segments:
+                            detail['limit_reason'] = 'segment_attempt_budget'
+                            break
+                        # Count malformed and non-IDR starts before any prefilter read.
+                        considered += 1
+                        section_task.update(considered, read_bytes=read_bytes)
+                        pair_data = b''
+                        readable_end = min(end, interval[0]+interval[1], start+max_bytes-len(init.data))
+                        later = start != init_end
+                        if later:
+                            # Reject non-random-access starts using one bounded pair before
+                            # parsing an entire section or launching external decoders.
+                            try:
+                                header = read_section(start, min(16, readable_end-start))
+                                moof_size = int.from_bytes(header[:4], 'big')
+                                if moof_size == 1:
+                                    moof_size = int.from_bytes(header[8:16], 'big')
+                                if header[4:8] != b'moof' or not 8 <= moof_size <= MAX_MOOF:
+                                    continue
+                                mdat_head = read_section(start+moof_size, min(16, readable_end-start-moof_size))
+                                mdat_size = int.from_bytes(mdat_head[:4], 'big')
+                                if mdat_size == 1:
+                                    mdat_size = int.from_bytes(mdat_head[8:16], 'big')
+                                length = moof_size+mdat_size
+                                if not moof_size+8 <= length <= readable_end-start:
+                                    continue
+                                pair_data = read_section(start, length)
+                                first = parse_fragment(pair_data, 0, init)
+                                if not _restart_is_idr(first, init):
+                                    continue
+                                if any(base is None for base in first.decode_times.values()):
+                                    # A track already present cannot acquire its missing
+                                    # restart origin from a later fragment. Tracks absent
+                                    # here may still appear later with explicit timing.
+                                    counts = defaultdict(int)
+                                    for sample in first.samples:
+                                        counts[sample.track_id] += 1
+                                    detail['segments'].append({
+                                        'logical_start': start, 'logical_end': start+len(pair_data),
+                                        'later_section': True, 'fragment_count': 1,
+                                        'sample_counts': dict(counts), 'allocation_scope': allocation_scope,
+                                        'status': 'blocked', 'reason': 'missing_restart_track_timing',
+                                        'stop_reason': 'missing_restart_track_timing'})
+                                    continue
+                            except (FormatError, struct.error):
+                                continue
+                        payload = pair_data+read_section(start+len(pair_data), readable_end-start-len(pair_data))
+                        data = init.data+payload
+                        prefix = walk_prefix(data, len(init.data), allow_later_start=later)
+                        if (not later and not prefix.fragments and
+                                prefix.stop_reason.startswith('missing_initial_fragments_sequence_starts_at_')):
+                            # A logical file may begin at a surviving later fragment. Keep
+                            # the same restart checks and label; never call it a prefix.
+                            later = True
+                            prefix = walk_prefix(data, len(init.data), allow_later_start=True)
+                        segment = {'logical_start': start, 'logical_end': start+prefix.end-len(init.data),
+                                   'stop_reason': prefix.stop_reason, 'fragment_count': len(prefix.fragments),
+                                   'sample_counts': prefix.counts, 'later_section': later,
+                                   'allocation_scope': allocation_scope, 'candidate_tier': tier,
+                                   'read_window_end': readable_end,
+                                   'window_limited': readable_end < min(end, interval[0]+interval[1]),
+                                   'source_ranges': pool.provenance(sid, offset, len(init.data)),
+                                   'starts': prefix.starts}
+                        error = prefix.eligibility_error()
+                        if not error and later and not _restart_has_timing(prefix):
+                            error = 'missing_restart_track_timing'
+                        if error:
+                            segment.update(status='blocked', reason=error)
+                            detail['segments'].append(segment)
+                            continue
+                        retained = data[:prefix.end]
+                        source_length = prefix.end-len(init.data)
+                        segment['source_ranges'] += pool.provenance(sid, start, source_length)
+                        if len(retained) > options.max_output_bytes:
+                            segment.update(status='search_limited', reason='output_size_budget')
+                            detail['segments'].append(segment)
+                            continue
+                        if shutil.disk_usage(case.root).free < len(retained)*2+1024*1024:
+                            raise SafetyError('Insufficient free space for fragmented candidate and publication')
+                        candidate = attempt / f'section-{start}-tier-{tier}.mp4'
+                        with phase('Write fragmented candidate', total=len(retained), unit='bytes') as write_task, candidate.open('xb') as stream:
                             stream.write(retained)
-                            publish_task.update(len(retained))
+                            write_task.update(len(retained))
                             stream.flush()
                             os.fsync(stream.fileno())
-                    relative = str(output.relative_to(case.root))
-                    segment.update(status=('reconstructed_segment' if later else 'reconstructed_prefix') if reconstruct_only else
-                                          ('decoded_segment' if later else 'decoded_prefix'),
-                                   reason='structural_reconstruction_only' if reconstruct_only else 'packet_hashes_timing_and_decode_passed',
-                                   reconstruct_only=reconstruct_only, output=relative,
-                                   first_sequence=prefix.fragments[0].sequence,
-                                   last_sequence=prefix.fragments[-1].sequence,
-                                   durations_seconds={str(tid): (clock-prefix.starts[tid])/init.tracks[tid].timescale
-                                                      for tid, clock in prefix.clocks.items()})
-                    if start > consumed:
-                        detail['gaps'].append({'start': consumed, 'end': start,
-                                               'reason': 'not_exported_between_sections'})
-                    detail['segments'] = [saved for saved in detail['segments'] if saved.get('output') != relative]
-                    detail['output_evidence'] = [saved for saved in detail['output_evidence'] if saved['path'] != relative]
-                    if relative not in detail['outputs']:
-                        detail['outputs'].append(relative)
-                    detail['output_evidence'].append({'path': relative, 'size': len(retained), 'sha256': digest})
-                    detail['segments'].append(segment)
-                    consumed = max(consumed, segment['logical_end'])
+                        checked = ({'ok': True, 'decode_checked': False,
+                                    'scope': 'structural_reconstruction_only',
+                                    'reason': 'structural_reconstruction_only'} if reconstruct_only else
+                                   validate_prefix(candidate, data, prefix, tools, timeout))
+                        # Exact packet comparison needs a bounded large probe response, but
+                        # failed responses must not accumulate that response per section.
+                        for command in ('probe', 'decode'):
+                            evidence = checked.get(command, {})
+                            for channel in ('stdout', 'stderr'):
+                                value = evidence.get(channel, '')
+                                if len(value) > 65536:
+                                    evidence[channel] = value[:65536]
+                                    evidence[channel+'_retained_truncated'] = True
+                        segment['validation'] = checked
+                        if not checked['ok']:
+                            segment.update(status='decode_failed', reason=checked['reason'])
+                            detail['segments'].append(segment)
+                            continue
+                        output = case.root / 'reconstructed' / f'fragment-{sid}-{offset}-{start}.mp4'
+                        digest = hashlib.sha256(retained).hexdigest()
+                        if output.exists() or output.is_symlink():
+                            if output.is_symlink() or not output.is_file() or file_sha256(output) != digest:
+                                raise SafetyError(f'Conflicting existing fragmented output: {output}')
+                        else:
+                            with phase('Publish fragmented section', total=len(retained), unit='bytes') as publish_task, output.open('xb') as stream:
+                                stream.write(retained)
+                                publish_task.update(len(retained))
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                        manifest = _fragment_manifest(pool, sid, offset, start, retained, prefix)
+                        manifest['decode_checked'] = not reconstruct_only
+                        manifest['validation_scope'] = 'structural_reconstruction_only' if reconstruct_only else 'strict_decode'
+                        manifest['source_sha256'] = source.get('sha256')
+                        sidecar = output.with_suffix('.json')
+                        write_json(sidecar, manifest)
+                        relative = str(output.relative_to(case.root))
+                        segment.update(status=('reconstructed_segment' if later else 'reconstructed_prefix') if reconstruct_only else
+                                              ('decoded_segment' if later else 'decoded_prefix'),
+                                       reason='structural_reconstruction_only' if reconstruct_only else 'packet_hashes_timing_and_decode_passed',
+                                       reconstruct_only=reconstruct_only, output=relative,
+                                       first_sequence=prefix.fragments[0].sequence,
+                                       last_sequence=prefix.fragments[-1].sequence,
+                                       durations_seconds={str(tid): (clock-prefix.starts[tid])/init.tracks[tid].timescale
+                                                          for tid, clock in prefix.clocks.items()})
+                        if start > consumed:
+                            detail['gaps'].append({'start': consumed, 'end': start,
+                                                   'reason': 'not_exported_between_sections'})
+                        detail['segments'] = [saved for saved in detail['segments'] if saved.get('output') != relative]
+                        detail['output_evidence'] = [saved for saved in detail['output_evidence'] if saved['path'] != relative]
+                        if relative not in detail['outputs']:
+                            detail['outputs'].append(relative)
+                        detail['output_evidence'].append({'path': relative, 'size': len(retained), 'sha256': digest,
+                                                               'manifest_path': str(sidecar.relative_to(case.root)),
+                                                               'manifest_sha256': file_sha256(sidecar)})
+                        detail['segments'].append(segment)
+                        consumed = max(consumed, segment['logical_end'])
+                        # Commit publication evidence before it can demote candidate references.
+                        detail['search_policy'] = search_policy
+                        publication = attempt / f'publication-{start}.json'
+                        detail['detail_path'] = str(publication.relative_to(case.root))
+                        write_json(publication, detail)
+                        detail['evidence_sha256'] = file_sha256(publication)
+                        case.result(key, segment['status'], detail, kind='fragmented')
+                        tiers.refresh()
                 if detail.get('limit_reason'):
                     section_task.outcome('limited', detail=detail['limit_reason'])
             pool.check(sid)

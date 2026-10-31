@@ -166,7 +166,8 @@ def intake(case: Case, args) -> None:
 
 def reconstruct(case: Case, args) -> None:
     from .image_recovery import recover_fragmented
-    fields = {name: getattr(args, name) for name in Options.__dataclass_fields__}
+    fields = {name: (getattr(args, name, False) if name == 'include_recovered' else getattr(args, name))
+              for name in Options.__dataclass_fields__}
     policy_path = getattr(args, 'allocation_map', None)
     allocation_scope = load_allocation_scope(policy_path, case.physical_sources()) if policy_path else None
     if allocation_scope is not None:
