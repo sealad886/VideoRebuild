@@ -187,8 +187,8 @@ class _TierView:
             for record in self.tiers.records:
                 if self.owner is not None and tuple(record['owner']) == self.owner:
                     continue
-                identity = record['source_identity']
-                values.setdefault((identity['dev'], identity['ino']), []).append((record['offset'], record['offset'] + record['length']))
+                key = self.tiers.pool.physical_key(record['source_id'])
+                values.setdefault(key, []).append((record['offset'], record['offset'] + record['length']))
             self._intervals = {key: _merge(spans) for key, spans in values.items()}
             self.tiers._indexes[self.owner] = self._intervals
             self._generation = self.tiers.generation
@@ -211,8 +211,7 @@ class _TierView:
         else:
             parts = self.tiers.pool._ranges(sid, offset, length)
         for part in parts:
-            physical = self.physical[part.source_id]
-            values = intervals.get((physical['dev'], physical['ino']), [])
+            values = intervals.get(self.tiers.pool.physical_key(part.source_id), [])
             start, end = part.source_offset, part.source_offset + part.length
             index = max(0, bisect_right(values, start, key=lambda item: item[0]) - 1)
             while index < len(values) and values[index][0] < end:

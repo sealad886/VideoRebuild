@@ -9,6 +9,7 @@ import re
 from .progress import phase
 from .engine import Options, recover
 from .ranges import Extent, iter_dfxml, load_allocation_scope
+from .paths import is_ignored_path, is_ignored_source
 from .storage import Case, ReaderPool, SafetyError, file_sha256, input_files, regular, scan_logical
 from .validate import doctor
 
@@ -18,7 +19,11 @@ LOG = logging.getLogger(__name__)
 def _metadata(path: Path | None) -> dict | None:
     if path is None:
         return None
+    if is_ignored_path(path):
+        raise SafetyError('.DS_Store is ignored and cannot be used as intake metadata')
     path = path.expanduser().resolve()
+    if is_ignored_path(path):
+        raise SafetyError('.DS_Store is ignored and cannot be used as intake metadata')
     stat = regular(path)
     return {'path': str(path), 'size': stat.st_size, 'sha256': file_sha256(path)}
 
@@ -45,8 +50,10 @@ def _recovered_header(report: Path, roots: list[Path], name: str) -> Path:
 
 
 def intake(case: Case, args) -> None:
-    roots = [p.expanduser().resolve() for p in args.input]
-    images = [p.expanduser().resolve() for p in args.image]
+    roots = [p.expanduser().resolve() for p in args.input if not is_ignored_path(p)]
+    images = [p.expanduser().resolve() for p in args.image if not is_ignored_path(p)]
+    roots = [p for p in roots if not is_ignored_path(p)]
+    images = [p for p in images if not is_ignored_path(p)]
     if not roots and not images:
         raise SafetyError('Provide at least one --input or --image')
     if any((args.report, args.extents, args.mapfile)) and len(images) != 1:
@@ -82,6 +89,8 @@ def intake(case: Case, args) -> None:
                 for record in iter_dfxml(args.extents, images[0].stat().st_size):
                     records += 1
                     task.update(records, usable=usable, blocked=blocked)
+                    if is_ignored_path(record.name):
+                        continue
                     if record.reason and record.reason != 'unmapped_ranges':
                         blocked += 1
                         case.db.execute('INSERT INTO events(created,kind,detail) VALUES '
@@ -107,8 +116,9 @@ def intake(case: Case, args) -> None:
                 case.invalidate_results()
             task.update(records, usable=usable, blocked=blocked)
             case.event('filesystem_mapping_imported', {'objects': records, 'usable': usable, 'blocked': blocked})
-            for row in case.db.execute("SELECT id FROM sources WHERE kind='logical' ORDER BY id"):
-                scan_logical(case, row['id'])
+            for row in case.db.execute("SELECT * FROM sources WHERE kind='logical' ORDER BY id"):
+                if not is_ignored_source(dict(row)):
+                    scan_logical(case, row['id'])
     else:
         # PhotoRec mappings establish verified initialization locations; the
         # image is indexed once so discovery need not trust carve lengths.

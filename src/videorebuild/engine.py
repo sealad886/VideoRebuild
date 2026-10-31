@@ -131,8 +131,8 @@ def validate_ranges(movie: Movie, mapping: Mapping, pool: ReaderPool) -> None:
     physical = []
     for sid, off, n in ranges:
         for extent in pool.provenance(sid,off,n):
-            row = pool.physical[extent['source_id']]
-            physical.append((row['dev'],row['ino'],extent['source_offset'],extent['length']))
+            key = pool.physical_key(extent['source_id'])
+            physical.append((*key,extent['source_offset'],extent['length']))
     for a, b in zip(ranges, ranges[1:]):
         if a[0] == b[0] and a[1]+a[2] > b[1]:
             raise FormatError('source byte ranges reused or overlapped')
@@ -1093,8 +1093,8 @@ def _group_physical_ranges(group, choice, pool):
     sid, start = choice
     for chunk in group.chunks:
         for part in pool.provenance(sid, start + chunk.offset - group.start, chunk.size):
-            row = pool.physical[part['source_id']]
-            yield (row['dev'], row['ino'], part['source_offset'], part['source_offset'] + part['length'])
+            key = pool.physical_key(part['source_id'])
+            yield (*key, part['source_offset'], part['source_offset'] + part['length'])
 
 
 def _content_assemblies(search, groups, pool, stats, task):

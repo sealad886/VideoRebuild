@@ -8,6 +8,20 @@ Recovered files and optional image/map/DFXML → physical source catalogue → l
 
 `workflow.py` imports inputs, verifies PhotoRec headers, stages DFXML imports transactionally, and invokes the separate format strategies. `reports.py` streams case reports without collecting every job in memory. `cli.py` owns command dispatch only. The former independent fragmented database, lock and resume/report runner are removed.
 
+`.DS_Store` is excluded through a shared path/source predicate before discovery,
+registration, logical mapping intake, recovery reads and browser selection.
+Historical catalogue rows are retained rather than deleting evidence or touching
+the metadata file on disk.
+
+Persisted source validation checks size, modification time and inode. A stored
+operating-system device number is historical metadata, since a reboot/remount
+can renumber it. A reader pins the current full filesystem identity and checks
+path versus opened descriptor, including the current device number; changes
+during that reader's lifetime still fail closed. Physical alias/overlap and tier
+membership use the validated current device/inode pair. Historical sidecars
+continue to describe their indexed source rows. Indexed full-file hashes remain
+provenance; normal resume does not imply a new full-content hash of every source.
+
 ## Extents and acquisition
 
 An extent records logical offset, physical source ID, physical offset and length. Mappings are sorted by logical position and validated for overlap, source-range reuse and bounds. Lookup is indexed with binary search; work is proportional to the intersecting extents. Gaps remain unavailable.

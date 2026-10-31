@@ -19,6 +19,7 @@ import time
 from typing import Iterator, TextIO
 
 from .progress import phase
+from .paths import is_ignored_path, is_ignored_source
 from .bmff import MAX_METADATA, FormatError, boxes, parse_movie
 from .ranges import Extent, RescueMap, UnavailableRange, resolve_extents, validate_extents
 
@@ -82,6 +83,8 @@ def create_private_json(path: Path, value: object) -> None:
 
 
 def file_sha256(path: Path) -> str:
+    if is_ignored_path(path):
+        raise SafetyError('Finder metadata is not recovery evidence')
     digest = hashlib.sha256()
     with phase('Hashing '+path.name, total=path.stat().st_size, unit='bytes') as task, path.open('rb') as f:
         completed = 0
@@ -144,6 +147,23 @@ def source_identity(path: Path) -> dict:
     return dict(path=str(path),size=s.st_size,mtime_ns=s.st_mtime_ns,dev=s.st_dev,ino=s.st_ino)
 
 
+def _source_stamp(s: os.stat_result) -> tuple[int, int, int]:
+    """Persisted continuity checks; mount-assigned device numbers are transient."""
+    return s.st_size, s.st_mtime_ns, s.st_ino
+
+
+def _live_stamp(s: os.stat_result) -> tuple[int, int, int, int]:
+    """Same-run path/descriptor identity still includes the current device."""
+    return s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino
+
+
+def _binding_identity(binding: dict) -> dict:
+    value = dict(binding)
+    if 'mapfile' in value:
+        value['mapfile'] = {key: item for key, item in value['mapfile'].items() if key != 'dev'}
+    return value
+
+
 class Case:
     def __init__(self, root: Path):
         if root.expanduser().is_symlink():
@@ -172,7 +192,8 @@ class Case:
             if (self.root / 'fragmented.sqlite3').exists() and not dbpath.exists():
                 raise SafetyError('Legacy fragmented case: run migrate-case before recovery')
             if not dbpath.exists():
-                unknown = [p.name for p in self.root.iterdir() if p.name != '.lock']
+                unknown = [p.name for p in self.root.iterdir()
+                           if p.name != '.lock' and not is_ignored_path(p)]
                 if unknown:
                     raise SafetyError(f'New case must be empty; found {unknown[:5]}')
             self.db = sqlite3.connect(dbpath)
@@ -239,14 +260,20 @@ class Case:
         self.db.commit()
 
     def sources(self) -> dict[int, dict]:
-        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE complete=1 ORDER BY id')}
+        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE complete=1 ORDER BY id')
+                if not is_ignored_source(r)}
 
     def physical_sources(self) -> dict[int, dict]:
-        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE extents IS NULL ORDER BY id')}
+        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE extents IS NULL ORDER BY id')
+                if not is_ignored_source(r)}
 
     def register_source(self, path: Path, kind: str = 'file', *, mapfile: Path | None = None,
                         image_offset: int = 0) -> int:
+        if is_ignored_path(path):
+            raise SafetyError('Finder metadata is not recovery evidence')
         path = path.expanduser().resolve()
+        if is_ignored_path(path):
+            raise SafetyError('Finder metadata is not recovery evidence')
         if within(path,self.root):
             raise SafetyError('Source must be outside the case')
         identity = source_identity(path)
@@ -255,6 +282,8 @@ class Case:
             if kind != 'image':
                 raise SafetyError('A rescue map must be bound to an image')
             mapfile = mapfile.expanduser().resolve()
+            if is_ignored_path(mapfile):
+                raise SafetyError('Finder metadata is not an acquisition map')
             if within(mapfile,self.root):
                 raise SafetyError('Rescue map must be outside the case')
             bound = source_identity(mapfile)
@@ -269,9 +298,9 @@ class Case:
         if row:
             if row['extents'] is not None or row['kind'] != kind:
                 raise SafetyError('The same input was supplied with different source roles')
-            if any(row[k] != identity[k] for k in ('size','mtime_ns','dev','ino')):
+            if any(row[k] != identity[k] for k in ('size','mtime_ns','ino')):
                 raise SafetyError(f'Previously indexed source changed: {path}; use a new case')
-            if row['binding'] != json_text(binding):
+            if _binding_identity(json.loads(row['binding'])) != _binding_identity(binding):
                 raise SafetyError('Source acquisition settings changed; use a new case')
             return row['id']
         self.invalidate_results()
@@ -284,6 +313,8 @@ class Case:
 
     def add_stream(self, name: str, extents, *, size: int,
                    association: str = 'filesystem_metadata') -> int:
+        if is_ignored_path(name):
+            raise SafetyError('Finder metadata is not recovery evidence')
         transaction = self.db.in_transaction
         physical = self.physical_sources()
         extents = validate_extents(size,extents,{sid:r['size'] for sid,r in physical.items()})
@@ -332,17 +363,20 @@ class ReaderPool:
                  allocation_scope=None):
         if limit < 1:
             raise ValueError('Reader handle limit must be positive')
-        self.sources = sources
+        self.sources = {sid: row for sid, row in sources.items() if not is_ignored_source(row)}
         self.allocation_scope = allocation_scope
-        self.physical = dict(physical_sources or {})
-        self.physical.update({sid:r for sid,r in sources.items() if not r.get('extents')})
+        self.physical = {sid: row for sid, row in (physical_sources or {}).items()
+                         if not is_ignored_source(row)}
+        self.physical.update({sid:r for sid,r in self.sources.items() if not r.get('extents')})
         self.limit = limit
         self.handles = OrderedDict()
         self.extents = {}
         self.physical_ids = {}
         self.maps = {}
+        self._identities = {}
+        self._map_identities = {}
         sizes = {sid:r['size'] for sid,r in self.physical.items()}
-        for sid,row in sources.items():
+        for sid,row in self.sources.items():
             if row.get('extents'):
                 raw = row['extents']
                 raw = json.loads(raw) if isinstance(raw,str) else raw
@@ -355,12 +389,15 @@ class ReaderPool:
             if 'mapfile' in binding:
                 bound = binding['mapfile']
                 path = Path(bound['path'])
-                self._check_identity(bound)
+                before = self._check_identity(bound)
                 rescue = RescueMap.from_file(path,image_offset=binding.get('image_offset',0))
                 if file_sha256(path) != bound['sha256']:
                     raise SafetyError('Rescue map changed since registration')
-                self._check_identity(bound)
+                after = self._check_identity(bound)
+                if _live_stamp(before) != _live_stamp(after):
+                    raise SafetyError('Rescue map changed while hashing')
                 self.maps[sid] = (rescue,bound)
+                self._map_identities[sid] = _live_stamp(after)
 
     def close(self) -> None:
         for f in self.handles.values():
@@ -374,23 +411,49 @@ class ReaderPool:
         self.close()
 
     @staticmethod
-    def _check_identity(row: dict) -> None:
+    def _check_identity(row: dict) -> os.stat_result:
+        if is_ignored_source(row):
+            raise SafetyError('Finder metadata is not recovery evidence')
         s = regular(row['path'])
-        if (s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino) != (row['size'], row['mtime_ns'], row['dev'], row['ino']):
+        if _source_stamp(s) != (row['size'], row['mtime_ns'], row['ino']):
             raise SafetyError(f'Source changed since indexing: {row["path"]}. Start a new case for changed evidence.')
+        return s
+
+    def _checked_stat(self, sid: int) -> os.stat_result:
+        if sid not in self.physical:
+            raise SafetyError('Source is unavailable or ignored Finder metadata')
+        s = self._check_identity(self.physical[sid])
+        stamp = _live_stamp(s)
+        previous = self._identities.setdefault(sid, stamp)
+        if stamp != previous:
+            raise SafetyError('Source changed during this run')
+        return s
+
+    def _check_map(self, sid: int) -> None:
+        if sid in self.maps:
+            state = self._check_identity(self.maps[sid][1])
+            if _live_stamp(state) != self._map_identities[sid]:
+                raise SafetyError('Rescue map changed during this run')
+
+    def physical_key(self, sid: int) -> tuple[int, int]:
+        """Live physical alias key, separate from historical manifest stamps."""
+        if sid not in self._identities:
+            self._checked_stat(sid)
+        stamp = self._identities[sid]
+        return stamp[2], stamp[3]
 
     def check(self, sid: int) -> None:
         ids = self.physical_ids.get(sid,(sid,))
         for physical in ids:
-            self._check_identity(self.physical[physical])
-            if physical in self.maps:
-                self._check_identity(self.maps[physical][1])
+            self._checked_stat(physical)
+            self._check_map(physical)
 
     def handle(self, sid: int):
-        self._check_identity(self.physical[sid])
-        if sid in self.maps:
-            self._check_identity(self.maps[sid][1])
+        current = self._checked_stat(sid)
+        self._check_map(sid)
         if sid in self.handles:
+            if _live_stamp(os.fstat(self.handles[sid].fileno())) != _live_stamp(current):
+                raise SafetyError('Source changed while its descriptor was cached')
             self.handles.move_to_end(sid)
             return self.handles[sid]
         # A buffered reader may fetch beyond the permitted extent even when
@@ -398,8 +461,7 @@ class ReaderPool:
         f = Path(self.physical[sid]['path']).open('rb', buffering=0)
         # Verify the opened inode too, not only the path checked before open().
         s = os.fstat(f.fileno())
-        row = self.physical[sid]
-        if (s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino) != (row['size'], row['mtime_ns'], row['dev'], row['ino']):
+        if _live_stamp(s) != _live_stamp(current):
             f.close()
             raise SafetyError('Source changed during open')
         self.handles[sid] = f
@@ -441,9 +503,8 @@ class ReaderPool:
             data = f.read(e.length)
             if len(data) != e.length:
                 raise SafetyError(f'Short read from {self.physical[e.source_id]["path"]}')
-            self._check_identity(self.physical[e.source_id])
-            if e.source_id in self.maps:
-                self._check_identity(self.maps[e.source_id][1])
+            self._checked_stat(e.source_id)
+            self._check_map(e.source_id)
             parts.append(data)
         return b''.join(parts)
 
@@ -451,9 +512,8 @@ class ReaderPool:
         result = []
         for e in self._ranges(sid,offset,size):
             row = self.physical[e.source_id]
-            self._check_identity(row)
-            if e.source_id in self.maps:
-                self._check_identity(self.maps[e.source_id][1])
+            self._checked_stat(e.source_id)
+            self._check_map(e.source_id)
             result.append(dict(logical_offset=e.logical_offset,source_id=e.source_id,
                                source_path=row['path'],source_offset=e.source_offset,length=e.length,
                                acquisition='rescued' if e.source_id in self.maps else 'unknown'))
@@ -520,7 +580,13 @@ def input_files(roots: list[Path], case_root: Path, all_files: bool) -> Iterator
         seen = set()
         discovered = skipped = 0
         for root in roots:
+            if is_ignored_path(root):
+                skipped += 1
+                continue
             root = root.expanduser().resolve()
+            if is_ignored_path(root):
+                skipped += 1
+                continue
             if not root.exists():
                 raise SafetyError(f'Input does not exist: {root}')
             if root.is_dir():
@@ -530,7 +596,7 @@ def input_files(roots: list[Path], case_root: Path, all_files: bool) -> Iterator
                     raise SafetyError(f'Cannot enumerate input directory: {error}') from error
                 def walk_paths():
                     for folder, dirs, names in os.walk(root, followlinks=False, onerror=onerror):
-                        dirs.sort()
+                        dirs[:] = sorted(name for name in dirs if not is_ignored_path(name))
                         for name in sorted(names):
                             yield Path(folder)/name
                 paths = walk_paths()
@@ -540,6 +606,9 @@ def input_files(roots: list[Path], case_root: Path, all_files: bool) -> Iterator
                 discovered += 1
                 if discovered % 256 == 0:
                     task.heartbeat(discovered=discovered, skipped=skipped)
+                if is_ignored_path(p):
+                    skipped += 1
+                    continue
                 if p.is_symlink():
                     LOG.warning('Skipping symlink: %s', p)
                     skipped += 1
@@ -580,6 +649,9 @@ def scan_logical(case: Case, sid: int) -> None:
     row = case.db.execute('SELECT * FROM sources WHERE id=?',(sid,)).fetchone()
     if row is None:
         raise SafetyError('Unknown source')
+    if is_ignored_source(row):
+        LOG.info('Ignoring Finder metadata source: %s', row['path'])
+        return
     sources = {sid:dict(row)}
     if row['extents'] is None:
         physical = sources

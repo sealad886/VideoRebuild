@@ -21,6 +21,7 @@ class AssemblyPruningTests(unittest.TestCase):
             for rank, (sid, start) in enumerate(locations):
                 db.execute('INSERT INTO hits VALUES(?,?,?,?,?)', ('fixture', index, str(rank), sid, start))
         pool = SimpleNamespace(physical={sid: dict(dev=1, ino=ino) for sid, ino in identities.items()},
+                               physical_key=lambda sid: (1, identities[sid]),
                                provenance=lambda sid, start, size: [dict(source_id=sid, source_offset=start, length=size)])
         stats = dict(partial_assignments_checked=0, partial_assignments_rejected=0)
         actual = set(engine._assemblies(db, groups, pool, counts=list(map(len, choices)), stats=stats))
@@ -53,7 +54,8 @@ class AssemblyPruningTests(unittest.TestCase):
         def provenance(sid, start, size):
             calls.append(sid)
             return [dict(source_id=sid, source_offset=start, length=size)]
-        pool = SimpleNamespace(physical={i+1: dict(dev=1, ino=i+1) for i in range(count)}, provenance=provenance)
+        pool = SimpleNamespace(physical={i+1: dict(dev=1, ino=i+1) for i in range(count)},
+                               physical_key=lambda sid: (1, sid), provenance=provenance)
         stats = dict(partial_assignments_checked=0, partial_assignments_rejected=0,
                      content_prefixes_checked=0, content_prefixes_rejected=0, content_tuples_considered=0)
         with phase('test') as task:
@@ -74,6 +76,7 @@ class AssemblyPruningTests(unittest.TestCase):
         groups = [SimpleNamespace(key=('fixture', i), chunks=[Chunk(0, i, 0, (size,), 0)], start=0)
                   for i, size in enumerate((16, 24))]
         pool = SimpleNamespace(physical={1: dict(dev=1, ino=1)},
+                               physical_key=lambda sid: (1, 1),
                                provenance=lambda sid, start, size: [dict(source_id=sid, source_offset=start, length=size)])
         stats = dict(partial_assignments_checked=0, partial_assignments_rejected=0,
                      content_prefixes_checked=0, content_prefixes_rejected=0, content_tuples_considered=0)
