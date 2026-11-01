@@ -1,5 +1,41 @@
 # Executed validation — VideoRebuild
 
+## Full-stack integration repair validation — November 1, 2026
+
+The integration branch includes the eight earlier local prerequisite commits,
+optimization snapshot `ad5f0b6`, and the review repairs described here. Fresh
+net-change review against main `bf5d230` reproduced and repaired three recovery
+correctness defects plus one terminal preference defect:
+
+- Incomplete first-tier ordinary searches retain `search_limited` and cannot
+  publish a second-tier fallback as unique. Search scope changes only when
+  fallback starts; internal matching revision 4 reopens earlier decision caches
+  without rebuilding source/atom indexes.
+- Fragmented revalidation preserves referenced manifests and commits pointers
+  to distinct new sidecars, keeping prior evidence verifiable after interruption.
+- Explicit retries revisit failed or limited requested-mode validation despite
+  preserved outputs; accepted same-mode ranges remain complete.
+- Both accepted TUI positions for `--no-progress` propagate to foreground recovery.
+
+The complete repaired source suite passed **378 tests in 111.212 seconds**,
+with two optional real-fiwalk integration tests skipped because fiwalk was
+unavailable. Python 3.13.18 and FFmpeg/ffprobe 9.0.2 ran on macOS 27.2 arm64.
+Fresh independent verification passed **60 focused tests** and compared
+**1,000 fixtures / 60,665 exhaustive physical assignments** against a reference
+oracle. Syntax compilation, whitespace checks and local Graphify refresh passed.
+
+Before these repairs, a wheel built from the committed optimization snapshot's
+sdist passed 370 tests with the same two optional skips; all 19 installed runtime
+modules matched that snapshot. Its installation, version, doctor and TUI-help
+checks passed. This earlier wheel result is not evidence for the repaired source.
+Hosted CI and external PR review are separate integration gates. No private
+recordings, existing recovery cases, deployment, or release were processed.
+
+Existing historical publications remain preserved; the matching repair does not
+bulk-migrate or revoke them. The existing owner-revalidation and whole-before-deep
+search model still determines their scope. Performance measurements below remain
+bound to snapshot `ad5f0b6`, rather than later integration revisions.
+
 ## Whole-codebase performance optimization — November 1, 2026
 
 Baseline `c3b41f6`, local branch `codex/performance-optimization`; macOS 27.2
@@ -23,8 +59,8 @@ coverage, reproducible commands and limitations. Raw source-bound receipts live
 under ignored `test-results/performance-20261101/`.
 
 No Linux/Python 3.14 execution, wheel/sdist installation, hosted CI, private
-image processing, or real-camera acceptance occurred. Changes remain local and
-uncommitted; no push, pull request, publication, deployment, or release occurred.
+image processing, or real-camera acceptance occurred. This validation preceded signed local commit `ad5f0b6`; no publication,
+deployment, or release was part of the optimization validation.
 
 ## Performance and exhaustive matching repairs — October 30, 2026
 

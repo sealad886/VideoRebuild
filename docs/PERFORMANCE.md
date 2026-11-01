@@ -8,8 +8,9 @@ paths. Preserve candidate enumeration and ordering, acquisition/allocation rules
 source identity checks, exact encoded bytes, ambiguity reporting, packet timing,
 strict decoding, and interruption/resume behavior.
 
-Baseline is commit `c3b41f63b9a33d2a80cfa2d6e1b4cc66a3b49199`. Work uses local
-branch `codex/performance-optimization` in the existing checkout. Inputs are
+Baseline is commit `c3b41f63b9a33d2a80cfa2d6e1b4cc66a3b49199`; the measured
+optimization snapshot is commit `ad5f0b6`. Work uses branch
+`codex/performance-optimization` in the existing checkout. Inputs are
 synthetic bytes and locally generated test media. Existing recovery cases and
 private recordings are outside this work.
 
@@ -100,7 +101,8 @@ SQLite native allocations, decoder memory, or total disk usage.
 Executed on macOS 27.2 arm64, Python 3.13.18. Each revision ran five trials
 serially, baseline first, using the same harness and workload parameters.
 Source hashes in both JSON receipts were independently checked against the
-baseline commit and the final source. Medians were independently recomputed.
+baseline commit and optimization snapshot `ad5f0b6`. Medians were independently
+recomputed.
 
 | Synthetic workload | Baseline median | Optimized median | Ratio |
 | --- | ---: | ---: | ---: |
@@ -124,10 +126,10 @@ two-section recovery probe reduced traced peak from 41,998,592 to 37,796,998
 bytes while preserving both 4,194,795-byte outputs and the source hash. That
 single memory probe is additional mechanism evidence, not a speed measurement.
 
-Verification against the final source:
+Verification against optimization snapshot `ad5f0b6`:
 
 - Baseline suite: 352 tests in 109.886 s; two optional fiwalk tests skipped.
-- Final source suite: **370 tests in 76.526 s; two optional fiwalk tests skipped**.
+- Optimization source suite: **370 tests in 76.526 s; two optional fiwalk tests skipped**.
   FFmpeg/ffprobe 9.0.2 performed the generated-media codec checks.
 - Isolated fresh zipapp: **176 relevant regression/recovery tests passed in
   46.962 s**, no skips. Version, doctor and TUI-help smoke checks passed. All 19
@@ -153,8 +155,11 @@ Raw local logs, baseline snapshots, probes and JSON live under ignored
 The benchmark harness SHA-256 is
 `6ca52b98a62c5ab6da8ebbe5e6b5a116d25355939ae230484580b32d32117a07`.
 
-Changes are local and uncommitted on the named branch. No worktree, dependency,
-version, push, pull request, publication, deployment, or release was created.
+This report records the optimization validation before integration. Commit
+`ad5f0b6` contains the measured snapshot; subsequent full-stack integration
+checks and review repairs are recorded in [TEST_REPORT.md](../TEST_REPORT.md).
+No worktree, dependency, package-version change, deployment, or release was
+needed for the optimization.
 
 ## API references
 
