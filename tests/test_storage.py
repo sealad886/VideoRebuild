@@ -17,6 +17,47 @@ from videorebuild.ranges import Extent, UnavailableRange
 
 
 class StorageTests(unittest.TestCase):
+    def test_dense_atom_headers_reuse_bounded_scan_reads(self):
+        from videorebuild.bmff import make_box
+        data = make_box(b'mdat', b'DATA') * 1000
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'image.bin'
+            source.write_bytes(data)
+            with Case(root / 'case') as case:
+                sid = case.register_source(source, 'image')
+                read = ReaderPool.read
+                with patch.object(ReaderPool, 'read', autospec=True, side_effect=read) as reads:
+                    scan_logical(case, sid)
+                self.assertLessEqual(reads.call_count, 2)
+                atoms = case.db.execute('SELECT offset,size FROM atoms ORDER BY offset').fetchall()
+                self.assertEqual([tuple(atom) for atom in atoms], [(i * 12, 12) for i in range(1000)])
+                self.assertEqual(case.sources()[sid]['sha256'], hashlib.sha256(data).hexdigest())
+                self.assertEqual(source.read_bytes(), data)
+
+    def test_cached_scans_detect_source_mutation_before_committing_block(self):
+        from videorebuild import storage
+        from videorebuild.bmff import make_box
+        for data in (b'no atom signatures here', make_box(b'mdat', b'DATA')):
+            with self.subTest(atoms=data[4:8] == b'mdat'), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / 'image.bin'
+                source.write_bytes(data)
+                signatures = storage.SIGNATURES
+
+                class MutatingSignatures:
+                    def finditer(self, block):
+                        yield from signatures.finditer(block)
+                        with source.open('ab') as stream:
+                            stream.write(b'changed')
+
+                with Case(root / 'case') as case:
+                    sid = case.register_source(source, 'image')
+                    with patch.object(storage, 'SIGNATURES', MutatingSignatures()):
+                        with self.assertRaises(SafetyError):
+                            scan_logical(case, sid)
+                    self.assertEqual(case.db.execute('SELECT complete FROM sources WHERE id=?', (sid,)).fetchone()[0], 0)
+
     def test_report_formats_preserve_source_hardlinks(self):
         for report_name in ('summary.json', 'results.csv', 'index.html'):
             with self.subTest(report=report_name), tempfile.TemporaryDirectory() as directory:

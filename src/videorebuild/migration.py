@@ -12,6 +12,7 @@ import sqlite3
 import time
 import uuid
 
+from .progress import phase
 from .storage import SCHEMA, SafetyError, file_sha256, initialize_database, json_text, regular
 
 
@@ -50,27 +51,31 @@ def _ordinary(db: sqlite3.Connection, root: Path) -> int:
     db.execute('ALTER TABLE results RENAME TO legacy_results')
     initialize_database(db)
     count = 0
-    for row in db.execute('SELECT * FROM legacy_results'):
-        detail = json.loads(row['detail'])
-        if not isinstance(detail,dict):
-            raise SafetyError('Invalid legacy result detail')
-        candidates = detail.get('candidates',[])
-        for candidate in candidates:
-            _verify_output(root,candidate['path'],candidate['sha256'],candidate.get('bytes'))
-        for output in detail.get('outputs',[]):
-            if len(candidates) != 1:
-                raise SafetyError('Legacy publication has no unique validated candidate')
-            _verify_output(root,output,candidates[0]['sha256'],candidates[0].get('bytes'))
-        detail['historical_validation'] = True
-        detail['legacy_validation_contract'] = 'ordinary-schema-1'
-        detail.pop('run_key',None)
-        db.execute('INSERT INTO jobs VALUES(?,?,?,?,?)',
-                   ('ordinary',row['movie_digest'],row['status'],json_text(detail),row['updated']))
-        count += 1
-    for row in db.execute('SELECT id,detail FROM attempts'):
-        detail = json.loads(row['detail'])
-        detail['historical_validation'] = True
-        db.execute('UPDATE attempts SET detail=? WHERE id=?',(json_text(detail),row['id']))
+    with phase('Verifying and converting ordinary jobs', total=db.execute('SELECT COUNT(*) FROM legacy_results').fetchone()['COUNT(*)'], unit='jobs') as task:
+        for row in db.execute('SELECT * FROM legacy_results'):
+            detail = json.loads(row['detail'])
+            if not isinstance(detail,dict):
+                raise SafetyError('Invalid legacy result detail')
+            candidates = detail.get('candidates',[])
+            for candidate in candidates:
+                _verify_output(root,candidate['path'],candidate['sha256'],candidate.get('bytes'))
+            for output in detail.get('outputs',[]):
+                if len(candidates) != 1:
+                    raise SafetyError('Legacy publication has no unique validated candidate')
+                _verify_output(root,output,candidates[0]['sha256'],candidates[0].get('bytes'))
+            detail['historical_validation'] = True
+            detail['legacy_validation_contract'] = 'ordinary-schema-1'
+            detail.pop('run_key',None)
+            db.execute('INSERT INTO jobs VALUES(?,?,?,?,?)',
+                       ('ordinary',row['movie_digest'],row['status'],json_text(detail),row['updated']))
+            count += 1
+            task.update(count)
+    with phase('Converting historical attempts', total=db.execute('SELECT COUNT(*) FROM attempts').fetchone()['COUNT(*)'], unit='records') as task:
+        for row in db.execute('SELECT id,detail FROM attempts'):
+            detail = json.loads(row['detail'])
+            detail['historical_validation'] = True
+            db.execute('UPDATE attempts SET detail=? WHERE id=?',(json_text(detail),row['id']))
+            task.advance()
     db.execute('DROP TABLE legacy_results')
     return count
 
@@ -89,28 +94,30 @@ def _fragmented(source: sqlite3.Connection, target: sqlite3.Connection, root: Pa
     sid = cur.lastrowid
     target.execute('INSERT INTO settings VALUES(?,?)',('legacy_fragmented_binding',json_text(binding)))
     count = 0
-    for row in source.execute('SELECT * FROM results ORDER BY offset'):
-        evidence = _artifact(root,row['detail_path'])
-        if evidence.stat().st_size > 64*1024*1024:
-            raise SafetyError('Legacy validation evidence exceeds migration size limit')
-        detail = json.loads(evidence.read_text(encoding='utf-8'))
-        if not isinstance(detail,dict):
-            raise SafetyError('Invalid legacy fragmented evidence')
-        outputs = detail.get('outputs',[])
-        verified = []
-        if row['status'] == 'decoded_prefix' and not outputs:
-            raise SafetyError('Legacy decoded prefix has no publication')
-        if outputs and (type(detail.get('output_bytes')) is not int or detail['output_bytes'] <= 0):
-            raise SafetyError('Legacy publication lacks a valid byte length')
-        for name in outputs:
-            verified.append(_verify_output(root,name,detail.get('candidate_sha256'),detail.get('output_bytes')))
-        detail.update(historical_validation=True,legacy_validation_contract='fragmented-0.2',
-                      detail_path=row['detail_path'],evidence_sha256=file_sha256(evidence),
-                      output_evidence=verified)
-        detail.setdefault('reason',row['reason'])
-        target.execute('INSERT INTO jobs VALUES(?,?,?,?,?)',
-                       ('fragmented',f'legacy:{sid}:{row["offset"]}',row['status'],json_text(detail),row['updated']))
-        count += 1
+    with phase('Verifying and converting fragmented jobs', total=source.execute('SELECT COUNT(*) FROM results').fetchone()['COUNT(*)'], unit='jobs') as task:
+        for row in source.execute('SELECT * FROM results ORDER BY offset'):
+            evidence = _artifact(root,row['detail_path'])
+            if evidence.stat().st_size > 64*1024*1024:
+                raise SafetyError('Legacy validation evidence exceeds migration size limit')
+            detail = json.loads(evidence.read_text(encoding='utf-8'))
+            if not isinstance(detail,dict):
+                raise SafetyError('Invalid legacy fragmented evidence')
+            outputs = detail.get('outputs',[])
+            verified = []
+            if row['status'] == 'decoded_prefix' and not outputs:
+                raise SafetyError('Legacy decoded prefix has no publication')
+            if outputs and (type(detail.get('output_bytes')) is not int or detail['output_bytes'] <= 0):
+                raise SafetyError('Legacy publication lacks a valid byte length')
+            for name in outputs:
+                verified.append(_verify_output(root,name,detail.get('candidate_sha256'),detail.get('output_bytes')))
+            detail.update(historical_validation=True,legacy_validation_contract='fragmented-0.2',
+                          detail_path=row['detail_path'],evidence_sha256=file_sha256(evidence),
+                          output_evidence=verified)
+            detail.setdefault('reason',row['reason'])
+            target.execute('INSERT INTO jobs VALUES(?,?,?,?,?)',
+                           ('fragmented',f'legacy:{sid}:{row["offset"]}',row['status'],json_text(detail),row['updated']))
+            count += 1
+            task.update(count)
     return count
 
 
@@ -152,9 +159,11 @@ def migrate_case(root: Path) -> dict:
         backup = backup_dir/source_path.name
         backup.touch(mode=0o600)
         with closing(sqlite3.connect(backup)) as destination:
-            source.backup(destination)
-            if destination.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-                raise SafetyError('Legacy database failed integrity check; backup retained')
+            with phase('Backing up legacy database', unit='pages') as task:
+                source.backup(destination, pages=256, progress=lambda status, remaining, total: task.update(total-remaining, total=total))
+            with phase('Checking backup integrity'):
+                if destination.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise SafetyError('Legacy database failed integrity check; backup retained')
         binding = None
         if source_path == fragmented:
             metadata = _artifact(root,'fragmented-case.json')
@@ -170,7 +179,8 @@ def migrate_case(root: Path) -> dict:
             with closing(sqlite3.connect(staging)) as target:
                 target.row_factory = lambda cursor,row: dict(zip((c[0] for c in cursor.description),row))
                 if source_path == ordinary:
-                    source.backup(target)
+                    with phase('Staging legacy database', unit='pages') as task:
+                        source.backup(target, pages=256, progress=lambda status, remaining, total: task.update(total-remaining, total=total))
                     count = _ordinary(target,root)
                 else:
                     count = _fragmented(source,target,root,binding)
@@ -178,28 +188,31 @@ def migrate_case(root: Path) -> dict:
                                migrated_jobs=count,schema=SCHEMA,historical_validation=True)
                 target.execute('INSERT INTO settings VALUES(?,?)',('migration',json_text(receipt)))
                 target.commit()
-                if target.execute('PRAGMA integrity_check').fetchone()['integrity_check'] != 'ok':
-                    raise SafetyError('Converted database failed integrity check')
-                if target.execute('PRAGMA foreign_key_check').fetchone() is not None:
-                    raise SafetyError('Converted database failed foreign-key check')
+                with phase('Checking converted database integrity'):
+                    if target.execute('PRAGMA integrity_check').fetchone()['integrity_check'] != 'ok':
+                        raise SafetyError('Converted database failed integrity check')
+                    if target.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                        raise SafetyError('Converted database failed foreign-key check')
                 target.execute('PRAGMA journal_mode=DELETE')
             source.close()
             with staging.open('rb') as stream:
                 os.fsync(stream.fileno())
-            moved = []
-            try:
-                for path in (source_path,Path(str(source_path)+'-wal'),Path(str(source_path)+'-shm')):
-                    if path.exists():
-                        if path.is_symlink():
-                            raise SafetyError('Unsafe legacy journal')
-                        retired = backup_dir/('retired-'+path.name)
-                        os.replace(path,retired)
-                        moved.append((path,retired))
-                os.replace(staging,ordinary)
-            except BaseException:
-                for path,retired in reversed(moved):
-                    os.replace(retired,path)
-                raise
+            with phase('Publishing migrated database', total=1, unit='files') as task:
+                moved = []
+                try:
+                    for path in (source_path,Path(str(source_path)+'-wal'),Path(str(source_path)+'-shm')):
+                        if path.exists():
+                            if path.is_symlink():
+                                raise SafetyError('Unsafe legacy journal')
+                            retired = backup_dir/('retired-'+path.name)
+                            os.replace(path,retired)
+                            moved.append((path,retired))
+                    os.replace(staging,ordinary)
+                    task.advance()
+                except BaseException:
+                    for path,retired in reversed(moved):
+                        os.replace(retired,path)
+                    raise
             receipt['status'] = 'migrated'
             return receipt
         finally:

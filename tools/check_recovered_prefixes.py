@@ -17,12 +17,14 @@ from videorebuild.fragmented import walk_prefix
 from videorebuild.image_recovery import signature, validate_prefix
 from videorebuild.storage import Case, ReaderPool, SafetyError, create_private_json, file_sha256
 from videorebuild.validate import doctor
+from videorebuild.progress import phase, reporting
 
 
 def audit(case: Path, image: Path) -> dict:
     """Sample canonical publications through their original logical source map."""
     started = time.monotonic()
-    tools = doctor()
+    with phase('Check audit runtime'):
+        tools = doctor()
     image_before = signature(image)
     db = sqlite3.connect((case/'case.sqlite3').resolve().as_uri()+'?mode=ro', uri=True)
     db.row_factory = sqlite3.Row
@@ -37,11 +39,15 @@ def audit(case: Path, image: Path) -> dict:
         count = db.execute('SELECT COUNT(*) FROM jobs WHERE '+condition).fetchone()[0]
         selected = sorted({i * (count-1)//8 for i in range(9)}) if count else []
         results = []
-        with ReaderPool(owner.sources(), physical_sources=physical) as pool:
+        skipped = 0
+        with phase('Verify selected publications', total=len(selected), unit='samples') as task, \
+                ReaderPool(owner.sources(), physical_sources=physical) as pool:
             for index in selected:
                 row = db.execute('SELECT detail FROM jobs WHERE '+condition+' ORDER BY key LIMIT 1 OFFSET ?', (index,)).fetchone()
                 saved = json.loads(row['detail'])
                 if saved.get('historical_validation'):
+                    skipped += 1
+                    task.advance(skipped=skipped)
                     continue
                 sid, offset = saved['source_id'], saved['logical_offset']
                 # Sample one section per selected initialization. The report
@@ -87,6 +93,7 @@ def audit(case: Path, image: Path) -> dict:
                     result.update(published_sha256=None,validation_ok=False,validation_reason='missing_publication',
                                   output_unchanged=False,ok=False)
                 results.append(result)
+                task.advance(checked=len(results), failed=sum(not row['ok'] for row in results))
     finally:
         db.close()
     result = {'tools': tools, 'image_signature': image_before, 'case_status_counts': counts,
@@ -105,14 +112,18 @@ def main():
     parser.add_argument('case', type=Path, help='Existing fragmented recovery case (read-only)')
     parser.add_argument('image', type=Path, help='Original regular raw image (read-only)')
     parser.add_argument('output', type=Path, help='New JSON report outside the case; never overwritten')
+    parser.add_argument('--no-progress', action='store_true', help='Disable progress messages on stderr')
     args = parser.parse_args()
     try:
         if args.output.resolve().is_relative_to(args.case.resolve()):
             raise ValueError('Report must be outside the read-only recovery case')
         if args.output.exists():
             raise ValueError('Report already exists; choose a new output filename')
-        result = audit(args.case, args.image)
-        create_private_json(args.output, result)
+        with reporting(enabled=not args.no_progress):
+            result = audit(args.case, args.image)
+            with phase('Write audit report', total=1, unit='files') as task:
+                create_private_json(args.output, result)
+                task.advance()
         print(f"Audit {'passed' if result['ok'] else 'failed'}. Report: {args.output}")
         return 0 if result['ok'] else 1
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, SafetyError) as error:

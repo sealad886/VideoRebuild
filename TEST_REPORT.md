@@ -1,4 +1,104 @@
-# Executed validation — VideoRebuild 0.2.0
+# Executed validation — VideoRebuild
+
+## Full-stack integration repair validation — November 1, 2026
+
+The integration branch includes the eight earlier local prerequisite commits,
+optimization snapshot `ad5f0b6`, and the review repairs described here. Fresh
+net-change review against main `bf5d230` reproduced and repaired three recovery
+correctness defects plus one terminal preference defect:
+
+- Incomplete first-tier ordinary searches retain `search_limited` and cannot
+  publish a second-tier fallback as unique. Search scope changes only when
+  fallback starts; internal matching revision 4 reopens earlier decision caches
+  without rebuilding source/atom indexes.
+- Fragmented revalidation preserves referenced manifests and commits pointers
+  to distinct new sidecars, keeping prior evidence verifiable after interruption.
+- Explicit retries revisit failed or limited requested-mode validation despite
+  preserved outputs; accepted same-mode ranges remain complete.
+- Both accepted TUI positions for `--no-progress` propagate to foreground recovery.
+
+The complete repaired source suite passed **378 tests in 111.212 seconds**,
+with two optional real-fiwalk integration tests skipped because fiwalk was
+unavailable. Python 3.13.18 and FFmpeg/ffprobe 9.0.2 ran on macOS 27.2 arm64.
+Fresh independent verification passed **60 focused tests** and compared
+**1,000 fixtures / 60,665 exhaustive physical assignments** against a reference
+oracle. Syntax compilation, whitespace checks and local Graphify refresh passed.
+
+Before these repairs, a wheel built from the committed optimization snapshot's
+sdist passed 370 tests with the same two optional skips; all 19 installed runtime
+modules matched that snapshot. Its installation, version, doctor and TUI-help
+checks passed. This earlier wheel result is not evidence for the repaired source.
+Hosted CI and external PR review are separate integration gates. No private
+recordings, existing recovery cases, deployment, or release were processed.
+
+Existing historical publications remain preserved; the matching repair does not
+bulk-migrate or revoke them. The existing owner-revalidation and whole-before-deep
+search model still determines their scope. Performance measurements below remain
+bound to snapshot `ad5f0b6`, rather than later integration revisions.
+
+## Whole-codebase performance optimization — November 1, 2026
+
+Baseline `c3b41f6`, local branch `codex/performance-optimization`; macOS 27.2
+arm64, Python 3.13.18, FFmpeg/ffprobe 9.0.2. Final source completed **370 tests
+in 76.526 s**, with two optional real-fiwalk integration tests skipped because
+the executable was unavailable. An isolated fresh standalone archive passed
+**176 relevant regression/recovery tests in 46.962 s**, with no skips; all 19
+runtime module bytes match tested source. Version, doctor, TUI help, syntax
+compilation and `git diff --check` passed. The checkout's existing archive was
+preserved. Independent review found and verified corrections to lazy logical
+extent bounds and retained-buffer lifetime; no reviewed blocker remains.
+
+Same-harness, serial five-trial synthetic medians improved sparse screening
+48.01×, narrow unclaimed extent checks 680.84×, dense atom indexing 6.09×,
+catalogue generation 1.94×, and Python packet-evidence validation 2.03×.
+Manifest startup's traced Python peak fell from 17,845,694 to 76,944 bytes,
+with about 4.2 ms extra time in the 2,000-job fixture. These measurements do
+not establish full-image recovery throughput or yield. See
+[PERFORMANCE.md](docs/PERFORMANCE.md) for exact workloads, invariants, audit
+coverage, reproducible commands and limitations. Raw source-bound receipts live
+under ignored `test-results/performance-20261101/`.
+
+No Linux/Python 3.14 execution, wheel/sdist installation, hosted CI, private
+image processing, or real-camera acceptance occurred. This validation preceded signed local commit `ad5f0b6`; no publication,
+deployment, or release was part of the optimization validation.
+
+## Performance and exhaustive matching repairs — October 30, 2026
+
+Source and rebuilt standalone archive each passed all **271 tests** on macOS
+with Python 3.13.18: 128.199 seconds for source and 106.416 seconds for the
+archive. The archive's 14 source modules were also compared byte-for-byte
+with the tested source. These runs used generated fixtures; no recovered-file
+codec quality checks or playback were performed.
+
+New regressions cover physical-witness multiplicity and ambiguity, allocation
+and rescue-map exclusions, historical negative-cache promotion, feasible-only
+assembly budgets, physical conflict pruning, repeated identical content,
+long singleton-group recordings, shared discovery across metadata/group
+batches, source mutation (including zero-hit and completed-skip sources),
+fragmented timing, publication integrity and resume limits.
+
+Independent exhaustive comparisons preserved the complete feasible content
+sets for 70 generated fixtures (35 allocation-restricted), and physical
+assignment sets for 80 fixtures. The 512-singleton-group proof used 512
+partial checks and 1,024 provenance calls; ten identical groups/copies needed
+one content attempt and 55 partial checks. The known ambiguity counterexample
+retained both byte-distinct outputs.
+
+A bounded negative-candidate benchmark reduced cold source-identity checks
+from 262,192 to 64 while reading the same 96 bytes. Profiled CPU time changed
+from 9.989 to 0.222 seconds. Eight uncapped deep batches shared one source
+pass. Completed fragmented-job resumes eliminated initialization reads and
+parses, while the missing-timing fixture reduced requested bytes from
+34,591,393 to 1,052,097 with unchanged zero-output behavior. These are
+synthetic operation counts/timings, not physical-I/O measurements or
+production throughput guarantees.
+
+Private reproduction scripts, independent review and operational receipts
+remain under ignored `test-results/performance-audit-20261030/`. The completed
+source index is reused for reconstruction; no raw reindex is required.
+Real-image completeness, historical association and decoded quality are not
+established by these tests. The dated evidence below retains its original
+scope.
 
 ## PR preparation — October 30, 2026
 
@@ -203,3 +303,25 @@ Published release SHA-256:
 751d93402b754267eccb58c598e3ed1a0d84ba8003a50c66b9fda8ff8cb6e207  videorebuild-0.3.0.tar.gz
 047b0ac29ef01ff33d3bccb20283246a981519df8b8a015f9d5170e46b230ee7  videorebuild-0.3.0-py3-none-any.whl
 ```
+
+## Search policy and allocated-reference assessment — 2026-10-30
+
+Local branch `codex/search-matching`, based on `60f1167`; Python 3.13.18 and FFmpeg/ffprobe 9.0.2 on macOS. The integrated source suite passed **233 tests in 90.699 s**, with no skips. A rebuilt standalone zipapp passed doctor/help smoke checks and all **23 new regression tests in 4.760 s**. This includes new allocation-boundary, uncapped-enumeration, explicit-limit, fragmented retry/policy-transition, duplicate-media summary and index-preserving CLI-resume regressions. Independent review also reproduced and repaired buffered physical-read prefetch beyond an allocation boundary. Search hypotheses spill to temporary SQLite; summaries still grow with genuinely distinct validated alternatives. Removing default cutoffs does not establish practical completion time or historical uniqueness.
+
+An optional, independently supplied unallocated-range policy constrains `recover` against an existing index. Synthetic integration verifies unchanged source/atom rows, preserved encoded media and no intake call. The flag is intentionally unavailable on `run`, whose intake can scan unrestricted image bytes before reconstruction. Parser, per-section buffer, output-size, disk-space and subprocess guards remain. Historical outputs retain their original scope when an allocation policy changes.
+
+Private allocated-reference assessment used installed Sleuth Kit 4.14.0 read-only filesystem metadata, independent `icat` extraction and canonical extent reads. The two extraction methods agreed exactly. Five typical allocated controls contain periodically stored standalone AVC SEI packets: their picture-bearing NALs pass strict independent decoding after a temporary diagnostic conversion, with unchanged VCL NAL hashes; their audio also passes strict decoding. These results do not qualify the original whole-file inputs under the current validator, which requires a picture in each video sample and one decoded frame per packet. No generic error suppression, SEI acceptance change or source repair was applied. This demonstrates a validation-model limitation rather than establishing filesystem corruption.
+
+A separately labelled three-second packet-copy prefix from an allocated reference qualified under the existing strict contract. Both pinned baseline and current matching implementations recovered it from metadata plus shuffled fragments, without receiving the true extent map. Encoded media bytes, independent packet hashes/timing and strict decode agreed. Current matching took 0.988 s in this small fixture; this is not full-image throughput evidence or whole-original acceptance.
+
+An image-bound unallocated policy was prepared from the actual exFAT allocation bitmap, with independent allocated/free boundary samples. Production reconstruction remains paused at the whole-file control gate, with its existing index and SQLite backup preserved; the new policy has not yet been applied to the production case. Local private receipts are retained under ignored `test-results/search-reevaluation/`. No private media or source-volume writes, archive imports, Git publication or release occurred in this assessment.
+
+## Standalone-SEI reconstruction without codec checks — 2026-10-30
+
+The user selected reconstruction without recovered-file quality checks. `--reconstruct-only` now bypasses FFmpeg/ffprobe discovery and validation while retaining structural sample/NAL framing, source identity, mapped-range overlap and allocation/acquisition constraints. Valid standalone AVC SEI metadata is preserved alongside all video/audio samples. Unique ordinary exports use `reconstructed`; fragmented exports use `reconstructed_prefix` / `reconstructed_segments`, with explicit `decode_checked: false`. Default strict validation remains unchanged and can still reject nonstandard packet/frame relationships.
+
+The integrated source suite passed **243 tests in 63.436 s**. A subsequently added mode-cache regression also passed; all three revision/cache tests passed in **3.756 s**. The rebuilt standalone zipapp passed **11 reconstruction/mode/cache tests in 2.887 s** and CLI-help smoke checks. Tests prove codec-tool entry points are not invoked in reconstruction-only mode, mode/revision changes revisit earlier decisions without index changes, structural malformed input remains blocked, and reconstructed bytes are preserved. Independent source review found no remaining blockers. Existing default-mode tests use generated synthetic media; no new quality checks were run on recovered recordings after the user's steering.
+
+Five privately retained whole allocated references were exported in reconstruction-only mode. All video samples, including 14–15 standalone SEI samples per file, and all audio samples matched by exact bytes, ordered hashes and counts. Full original hashes remained unchanged. Decoder, probe and subprocess entry points were patched to fail if called. These checks establish byte-preserving reconstruction under the supplied mapping, not playability or codec quality. A separate full-original blind-fragment experiment was interrupted during a large assembly search and remains inconclusive; no success or accuracy-failure claim is made for it.
+
+Before production reprocessing, the running job stopped gracefully with exit 130; its completed reports and **145,627 prior attempt records** were preserved in a consistent SQLite backup whose `quick_check` passed. The **23,466 sources, 159,375 atoms and 29,592 metadata records** remained unchanged. A validation revision and explicit mode enter both cache eligibility and job coverage, so old rejections cannot silently bypass the new reconstruction rules. Private evidence and the deferred, unused decoder-validation work are preserved under ignored `test-results/sei-validation/`. No original-media or archive writes, uploads or Git publication occurred in this implementation.

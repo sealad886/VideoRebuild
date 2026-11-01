@@ -189,3 +189,13 @@ pyrightconfig.json
 # source paths. Keep them on the operator's machine, outside version control.
 /test-results/
 /SHA256SUMS.txt
+
+# Rebuildable standalone archive and local code-intelligence state. These must
+# stay excluded even when an operator has no personal/global ignore rules.
+/videorebuild.pyz
+/.codanna/
+/.codannaignore
+/.codegraph/
+/graphify-out/
+/.fastembed_cache
+/.codex/hooks.json

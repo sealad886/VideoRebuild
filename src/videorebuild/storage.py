@@ -18,6 +18,8 @@ import tempfile
 import time
 from typing import Iterator, TextIO
 
+from .progress import phase
+from .paths import is_ignored_path, is_ignored_source
 from .bmff import MAX_METADATA, FormatError, boxes, parse_movie
 from .ranges import Extent, RescueMap, UnavailableRange, resolve_extents, validate_extents
 
@@ -81,15 +83,20 @@ def create_private_json(path: Path, value: object) -> None:
 
 
 def file_sha256(path: Path) -> str:
+    if is_ignored_path(path):
+        raise SafetyError('Finder metadata is not recovery evidence')
     digest = hashlib.sha256()
-    with path.open('rb') as f:
+    with phase('Hashing '+path.name, total=path.stat().st_size, unit='bytes') as task, path.open('rb') as f:
+        completed = 0
         while data := f.read(1024 * 1024):
             digest.update(data)
+            completed += len(data)
+            task.update(completed)
     return digest.hexdigest()
 
 
-def regular(path: Path) -> os.stat_result:
-    s = path.stat()
+def regular(path: Path | str) -> os.stat_result:
+    s = os.stat(path)
     if not stat.S_ISREG(s.st_mode):
         raise SafetyError(f'Not a regular file: {path}. Use a disk image, not a live block device.')
     return s
@@ -140,6 +147,23 @@ def source_identity(path: Path) -> dict:
     return dict(path=str(path),size=s.st_size,mtime_ns=s.st_mtime_ns,dev=s.st_dev,ino=s.st_ino)
 
 
+def _source_stamp(s: os.stat_result) -> tuple[int, int, int]:
+    """Persisted continuity checks; mount-assigned device numbers are transient."""
+    return s.st_size, s.st_mtime_ns, s.st_ino
+
+
+def _live_stamp(s: os.stat_result) -> tuple[int, int, int, int]:
+    """Same-run path/descriptor identity still includes the current device."""
+    return s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino
+
+
+def _binding_identity(binding: dict) -> dict:
+    value = dict(binding)
+    if 'mapfile' in value:
+        value['mapfile'] = {key: item for key, item in value['mapfile'].items() if key != 'dev'}
+    return value
+
+
 class Case:
     def __init__(self, root: Path):
         if root.expanduser().is_symlink():
@@ -168,7 +192,8 @@ class Case:
             if (self.root / 'fragmented.sqlite3').exists() and not dbpath.exists():
                 raise SafetyError('Legacy fragmented case: run migrate-case before recovery')
             if not dbpath.exists():
-                unknown = [p.name for p in self.root.iterdir() if p.name != '.lock']
+                unknown = [p.name for p in self.root.iterdir()
+                           if p.name != '.lock' and not is_ignored_path(p)]
                 if unknown:
                     raise SafetyError(f'New case must be empty; found {unknown[:5]}')
             self.db = sqlite3.connect(dbpath)
@@ -235,14 +260,20 @@ class Case:
         self.db.commit()
 
     def sources(self) -> dict[int, dict]:
-        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE complete=1 ORDER BY id')}
+        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE complete=1 ORDER BY id')
+                if not is_ignored_source(r)}
 
     def physical_sources(self) -> dict[int, dict]:
-        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE extents IS NULL ORDER BY id')}
+        return {r['id']: dict(r) for r in self.db.execute('SELECT * FROM sources WHERE extents IS NULL ORDER BY id')
+                if not is_ignored_source(r)}
 
     def register_source(self, path: Path, kind: str = 'file', *, mapfile: Path | None = None,
                         image_offset: int = 0) -> int:
+        if is_ignored_path(path):
+            raise SafetyError('Finder metadata is not recovery evidence')
         path = path.expanduser().resolve()
+        if is_ignored_path(path):
+            raise SafetyError('Finder metadata is not recovery evidence')
         if within(path,self.root):
             raise SafetyError('Source must be outside the case')
         identity = source_identity(path)
@@ -251,6 +282,8 @@ class Case:
             if kind != 'image':
                 raise SafetyError('A rescue map must be bound to an image')
             mapfile = mapfile.expanduser().resolve()
+            if is_ignored_path(mapfile):
+                raise SafetyError('Finder metadata is not an acquisition map')
             if within(mapfile,self.root):
                 raise SafetyError('Rescue map must be outside the case')
             bound = source_identity(mapfile)
@@ -265,9 +298,9 @@ class Case:
         if row:
             if row['extents'] is not None or row['kind'] != kind:
                 raise SafetyError('The same input was supplied with different source roles')
-            if any(row[k] != identity[k] for k in ('size','mtime_ns','dev','ino')):
+            if any(row[k] != identity[k] for k in ('size','mtime_ns','ino')):
                 raise SafetyError(f'Previously indexed source changed: {path}; use a new case')
-            if row['binding'] != json_text(binding):
+            if _binding_identity(json.loads(row['binding'])) != _binding_identity(binding):
                 raise SafetyError('Source acquisition settings changed; use a new case')
             return row['id']
         self.invalidate_results()
@@ -280,6 +313,8 @@ class Case:
 
     def add_stream(self, name: str, extents, *, size: int,
                    association: str = 'filesystem_metadata') -> int:
+        if is_ignored_path(name):
+            raise SafetyError('Finder metadata is not recovery evidence')
         transaction = self.db.in_transaction
         physical = self.physical_sources()
         extents = validate_extents(size,extents,{sid:r['size'] for sid,r in physical.items()})
@@ -324,19 +359,24 @@ class Case:
 
 class ReaderPool:
     """Bounded read-only access to files and logical streams through one path."""
-    def __init__(self, sources: dict[int, dict], limit: int = 32, *, physical_sources=None):
+    def __init__(self, sources: dict[int, dict], limit: int = 32, *, physical_sources=None,
+                 allocation_scope=None):
         if limit < 1:
             raise ValueError('Reader handle limit must be positive')
-        self.sources = sources
-        self.physical = dict(physical_sources or {})
-        self.physical.update({sid:r for sid,r in sources.items() if not r.get('extents')})
+        self.sources = {sid: row for sid, row in sources.items() if not is_ignored_source(row)}
+        self.allocation_scope = allocation_scope
+        self.physical = {sid: row for sid, row in (physical_sources or {}).items()
+                         if not is_ignored_source(row)}
+        self.physical.update({sid:r for sid,r in self.sources.items() if not r.get('extents')})
         self.limit = limit
         self.handles = OrderedDict()
         self.extents = {}
         self.physical_ids = {}
         self.maps = {}
+        self._identities = {}
+        self._map_identities = {}
         sizes = {sid:r['size'] for sid,r in self.physical.items()}
-        for sid,row in sources.items():
+        for sid,row in self.sources.items():
             if row.get('extents'):
                 raw = row['extents']
                 raw = json.loads(raw) if isinstance(raw,str) else raw
@@ -349,12 +389,15 @@ class ReaderPool:
             if 'mapfile' in binding:
                 bound = binding['mapfile']
                 path = Path(bound['path'])
-                self._check_identity(bound)
+                before = self._check_identity(bound)
                 rescue = RescueMap.from_file(path,image_offset=binding.get('image_offset',0))
                 if file_sha256(path) != bound['sha256']:
                     raise SafetyError('Rescue map changed since registration')
-                self._check_identity(bound)
+                after = self._check_identity(bound)
+                if _live_stamp(before) != _live_stamp(after):
+                    raise SafetyError('Rescue map changed while hashing')
                 self.maps[sid] = (rescue,bound)
+                self._map_identities[sid] = _live_stamp(after)
 
     def close(self) -> None:
         for f in self.handles.values():
@@ -368,30 +411,57 @@ class ReaderPool:
         self.close()
 
     @staticmethod
-    def _check_identity(row: dict) -> None:
-        s = regular(Path(row['path']))
-        if (s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino) != (row['size'], row['mtime_ns'], row['dev'], row['ino']):
+    def _check_identity(row: dict) -> os.stat_result:
+        if is_ignored_source(row):
+            raise SafetyError('Finder metadata is not recovery evidence')
+        s = regular(row['path'])
+        if _source_stamp(s) != (row['size'], row['mtime_ns'], row['ino']):
             raise SafetyError(f'Source changed since indexing: {row["path"]}. Start a new case for changed evidence.')
+        return s
+
+    def _checked_stat(self, sid: int) -> os.stat_result:
+        if sid not in self.physical:
+            raise SafetyError('Source is unavailable or ignored Finder metadata')
+        s = self._check_identity(self.physical[sid])
+        stamp = _live_stamp(s)
+        previous = self._identities.setdefault(sid, stamp)
+        if stamp != previous:
+            raise SafetyError('Source changed during this run')
+        return s
+
+    def _check_map(self, sid: int) -> None:
+        if sid in self.maps:
+            state = self._check_identity(self.maps[sid][1])
+            if _live_stamp(state) != self._map_identities[sid]:
+                raise SafetyError('Rescue map changed during this run')
+
+    def physical_key(self, sid: int) -> tuple[int, int]:
+        """Live physical alias key, separate from historical manifest stamps."""
+        if sid not in self._identities:
+            self._checked_stat(sid)
+        stamp = self._identities[sid]
+        return stamp[2], stamp[3]
 
     def check(self, sid: int) -> None:
         ids = self.physical_ids.get(sid,(sid,))
         for physical in ids:
-            self._check_identity(self.physical[physical])
-            if physical in self.maps:
-                self._check_identity(self.maps[physical][1])
+            self._checked_stat(physical)
+            self._check_map(physical)
 
     def handle(self, sid: int):
-        self._check_identity(self.physical[sid])
-        if sid in self.maps:
-            self._check_identity(self.maps[sid][1])
+        current = self._checked_stat(sid)
+        self._check_map(sid)
         if sid in self.handles:
+            if _live_stamp(os.fstat(self.handles[sid].fileno())) != _live_stamp(current):
+                raise SafetyError('Source changed while its descriptor was cached')
             self.handles.move_to_end(sid)
             return self.handles[sid]
-        f = Path(self.physical[sid]['path']).open('rb')
+        # A buffered reader may fetch beyond the permitted extent even when
+        # read() requests only allowed bytes. Keep physical reads exact.
+        f = Path(self.physical[sid]['path']).open('rb', buffering=0)
         # Verify the opened inode too, not only the path checked before open().
         s = os.fstat(f.fileno())
-        row = self.physical[sid]
-        if (s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino) != (row['size'], row['mtime_ns'], row['dev'], row['ino']):
+        if _live_stamp(s) != _live_stamp(current):
             f.close()
             raise SafetyError('Source changed during open')
         self.handles[sid] = f
@@ -403,23 +473,38 @@ class ReaderPool:
         if sid not in self.sources or offset < 0 or size < 0 or offset+size > self.sources[sid]['size']:
             raise FormatError('source range exceeds file bounds')
         if sid in self.extents:
-            yield from resolve_extents(self.extents[sid],offset,size)
+            parts = tuple(resolve_extents(self.extents[sid],offset,size))
         elif size:
-            yield Extent(offset,sid,offset,size)
+            parts = (Extent(offset,sid,offset,size),)
+        else:
+            parts = ()
+        # Check the entire request before any caller can consume its first bytes.
+        for e in parts:
+            if self.allocation_scope is not None and self.physical[e.source_id].get('kind') == 'image':
+                self.allocation_scope.require(e.source_id,e.source_offset,e.length)
+            if e.source_id in self.maps:
+                self.maps[e.source_id][0].require_rescued(e.source_offset,e.length)
+        yield from parts
+
+    def permits(self, sid: int, offset: int, size: int) -> bool:
+        """Check availability and allocation policy without opening media bytes."""
+        try:
+            tuple(self._ranges(sid,offset,size))
+        except FormatError:
+            return False
+        self.check(sid)
+        return True
 
     def read(self, sid: int, offset: int, size: int) -> bytes:
         parts = []
         for e in self._ranges(sid,offset,size):
-            if e.source_id in self.maps:
-                self.maps[e.source_id][0].require_rescued(e.source_offset,e.length)
             f = self.handle(e.source_id)
             f.seek(e.source_offset)
             data = f.read(e.length)
             if len(data) != e.length:
                 raise SafetyError(f'Short read from {self.physical[e.source_id]["path"]}')
-            self._check_identity(self.physical[e.source_id])
-            if e.source_id in self.maps:
-                self._check_identity(self.maps[e.source_id][1])
+            self._checked_stat(e.source_id)
+            self._check_map(e.source_id)
             parts.append(data)
         return b''.join(parts)
 
@@ -427,10 +512,8 @@ class ReaderPool:
         result = []
         for e in self._ranges(sid,offset,size):
             row = self.physical[e.source_id]
-            self._check_identity(row)
-            if e.source_id in self.maps:
-                self.maps[e.source_id][0].require_rescued(e.source_offset,e.length)
-                self._check_identity(self.maps[e.source_id][1])
+            self._checked_stat(e.source_id)
+            self._check_map(e.source_id)
             result.append(dict(logical_offset=e.logical_offset,source_id=e.source_id,
                                source_path=row['path'],source_offset=e.source_offset,length=e.length,
                                acquisition='rescued' if e.source_id in self.maps else 'unknown'))
@@ -459,12 +542,19 @@ class ReaderPool:
             else:
                 spans = ((lo,hi-lo),)
             for offset,length in spans:
-                if pending is not None and pending[0]+pending[1] == offset:
-                    pending = (pending[0],pending[1]+length)
+                if self.allocation_scope is not None and self.physical[e.source_id].get('kind') == 'image':
+                    at = e.source_offset+offset-e.logical_offset
+                    allowed = ((e.logical_offset+position-e.source_offset, count)
+                               for position,count in self.allocation_scope.ranges(e.source_id,at,at+length))
                 else:
-                    if pending is not None:
-                        yield pending
-                    pending = (offset,length)
+                    allowed = ((offset,length),)
+                for position,count in allowed:
+                    if pending is not None and pending[0]+pending[1] == position:
+                        pending = (pending[0],pending[1]+count)
+                    else:
+                        if pending is not None:
+                            yield pending
+                        pending = (position,count)
         if pending is not None:
             yield pending
 
@@ -486,37 +576,55 @@ class ReaderPool:
 
 
 def input_files(roots: list[Path], case_root: Path, all_files: bool) -> Iterator[Path]:
-    seen = set()
-    for root in roots:
-        root = root.expanduser().resolve()
-        if not root.exists():
-            raise SafetyError(f'Input does not exist: {root}')
-        if root.is_dir():
-            if within(case_root, root) or within(root, case_root):
-                raise SafetyError('Case and input directories must not contain one another')
-            def onerror(error: OSError) -> None:
-                raise SafetyError(f'Cannot enumerate input directory: {error}') from error
-            def walk_paths():
-                for folder, dirs, names in os.walk(root, followlinks=False, onerror=onerror):
-                    dirs.sort()
-                    for name in sorted(names):
-                        yield Path(folder)/name
-            paths = walk_paths()
-        else:
-            paths = iter([root])
-        for p in paths:
-            if p.is_symlink():
-                LOG.warning('Skipping symlink: %s', p)
+    with phase('Discovering recovered files', unit='files') as task:
+        seen = set()
+        discovered = skipped = 0
+        for root in roots:
+            if is_ignored_path(root):
+                skipped += 1
                 continue
-            if not all_files and root.is_dir() and p.suffix.lower() not in EXTENSIONS:
+            root = root.expanduser().resolve()
+            if is_ignored_path(root):
+                skipped += 1
                 continue
-            p = p.resolve()
-            if within(p, case_root):
-                raise SafetyError('An input is inside the case directory')
-            regular(p)
-            if str(p) not in seen:
-                seen.add(str(p))
-                yield p
+            if not root.exists():
+                raise SafetyError(f'Input does not exist: {root}')
+            if root.is_dir():
+                if within(case_root, root) or within(root, case_root):
+                    raise SafetyError('Case and input directories must not contain one another')
+                def onerror(error: OSError) -> None:
+                    raise SafetyError(f'Cannot enumerate input directory: {error}') from error
+                def walk_paths():
+                    for folder, dirs, names in os.walk(root, followlinks=False, onerror=onerror):
+                        dirs[:] = sorted(name for name in dirs if not is_ignored_path(name))
+                        for name in sorted(names):
+                            yield Path(folder)/name
+                paths = walk_paths()
+            else:
+                paths = iter([root])
+            for p in paths:
+                discovered += 1
+                if discovered % 256 == 0:
+                    task.heartbeat(discovered=discovered, skipped=skipped)
+                if is_ignored_path(p):
+                    skipped += 1
+                    continue
+                if p.is_symlink():
+                    LOG.warning('Skipping symlink: %s', p)
+                    skipped += 1
+                    continue
+                if not all_files and root.is_dir() and p.suffix.lower() not in EXTENSIONS:
+                    skipped += 1
+                    continue
+                p = p.resolve()
+                if within(p, case_root):
+                    raise SafetyError('An input is inside the case directory')
+                regular(p)
+                if str(p) not in seen:
+                    seen.add(str(p))
+                    task.advance(detail=p.name, discovered=discovered, skipped=skipped)
+                    yield p
+        task.heartbeat(discovered=discovered, skipped=skipped)
 
 
 def _candidate_header(read, offset: int, size: int) -> tuple[int, bytes, int] | None:
@@ -541,6 +649,9 @@ def scan_logical(case: Case, sid: int) -> None:
     row = case.db.execute('SELECT * FROM sources WHERE id=?',(sid,)).fetchone()
     if row is None:
         raise SafetyError('Unknown source')
+    if is_ignored_source(row):
+        LOG.info('Ignoring Finder metadata source: %s', row['path'])
+        return
     sources = {sid:dict(row)}
     if row['extents'] is None:
         physical = sources
@@ -554,81 +665,90 @@ def scan_logical(case: Case, sid: int) -> None:
                 raise SafetyError('Logical stream references an unavailable physical source')
             physical[source_id] = dict(source)
     if row['complete']:
-        with ReaderPool(sources,physical_sources=physical) as pool:
+        with phase('Verifying indexed source', total=1, unit='files') as task, ReaderPool(sources,physical_sources=physical) as pool:
             pool.check(sid)
+            task.advance(detail=Path(row['path']).name)
         LOG.info('Already indexed: %s',row['path'])
         return
     case.db.execute('DELETE FROM atoms WHERE source_id=?',(sid,))
     case.db.commit()
     digest = hashlib.sha256()
     count = scanned = 0
-    last_log = time.monotonic()
-    with ReaderPool(sources,physical_sources=physical) as pool:
-        read = lambda offset,size: pool.read(sid,offset,size)
-        for base, data, owned in pool.iter_blocks(sid):
-            digest.update(data[:owned])
-            scanned += owned
-            for match in SIGNATURES.finditer(data):
-                # Type field may be in lookahead; ownership belongs to the size field.
-                start = base + match.start() - 4
-                if not base <= start < base + owned:
-                    continue
-                try:
-                    info = _candidate_header(read,start,row['size'])
-                except UnavailableRange:
-                    continue
-                if info is None:
-                    continue
-                n, tag, header = info
-                available = min(n, row['size'] - start)
-                mdigest = None
-                if tag in {b'moov', b'moof', b'ftyp'}:
-                    cap = 4096 if tag == b'ftyp' else MAX_METADATA
-                    if available != n or n > cap:
+    label = ('Scanning allocation-unfiltered image' if row['kind'] == 'image' else
+             'Scanning mapped stream' if row['kind'] == 'logical' else 'Scanning recovered file')
+    with phase(label, unit='bytes') as task:
+        with ReaderPool(sources,physical_sources=physical) as pool:
+            task.update(total=sum(length for _, length in pool.available_ranges(sid)), detail=Path(row['path']).name)
+            for base, data, owned in pool.iter_blocks(sid):
+                # The scan window already passed ReaderPool's range and identity
+                # checks. Reuse contained headers/metadata instead of seeking
+                # and checking the same physical source for every signature.
+                def read(offset, size):
+                    if base <= offset and offset + size <= base + len(data):
+                        return data[offset-base:offset-base+size]
+                    return pool.read(sid, offset, size)
+
+                digest.update(memoryview(data)[:owned])
+                scanned += owned
+                for match in SIGNATURES.finditer(data):
+                    # Type field may be in lookahead; ownership belongs to the size field.
+                    start = base + match.start() - 4
+                    if not base <= start < base + owned:
                         continue
                     try:
-                        raw = read(start,n)
+                        info = _candidate_header(read,start,row['size'])
                     except UnavailableRange:
                         continue
-                    if tag == b'ftyp':
-                        payload = raw[header:]
-                        if len(payload) < 8 or len(payload) % 4 or not all(32 <= x <= 126 for x in payload[:4]):
+                    if info is None:
+                        continue
+                    n, tag, header = info
+                    available = min(n, row['size'] - start)
+                    mdigest = None
+                    if tag in {b'moov', b'moof', b'ftyp'}:
+                        cap = 4096 if tag == b'ftyp' else MAX_METADATA
+                        if available != n or n > cap:
                             continue
-                    else:
                         try:
-                            root = next(boxes(raw))
-                            child = list(boxes(raw, root.payload, root.end))
-                            kinds = {b.kind for b in child}
-                            if tag == b'moov' and not {b'mvhd', b'trak'} <= kinds:
-                                continue
-                            if tag == b'moof' and not {b'mfhd', b'traf'} <= kinds:
-                                continue
-                        except (FormatError, StopIteration):
+                            raw = read(start,n)
+                        except UnavailableRange:
                             continue
-                        if tag == b'moov' and b'mvex' not in kinds:
-                            mdigest = hashlib.sha256(raw).hexdigest()
-                            error = summary = None
+                        if tag == b'ftyp':
+                            payload = raw[header:]
+                            if len(payload) < 8 or len(payload) % 4 or not all(32 <= x <= 126 for x in payload[:4]):
+                                continue
+                        else:
                             try:
-                                summary = json_text(parse_movie(raw).summary())
-                            except FormatError as e:
-                                error = str(e)
-                            case.db.execute('INSERT OR IGNORE INTO movies VALUES(?,?,?,?)',
-                                            (mdigest, raw, summary, error))
-                elif tag == b'mdat' and available <= header:
-                    continue
-                case.db.execute('''INSERT OR IGNORE INTO atoms
-                    (source_id,kind,offset,size,header,available,payload_size,movie_digest)
-                    VALUES(?,?,?,?,?,?,?,?)''',
-                    (sid, tag.decode(), start, n, header, available, available-header, mdigest))
-                count += 1
-            case.db.commit()
-            if time.monotonic() - last_log > 5:
-                LOG.info('Scanning %s: %.1f%%; %d atom candidates', row['path'],
-                         100 * min(base+owned, row['size']) / max(1, row['size']), count)
-                last_log = time.monotonic()
-        pool.check(sid)
-    scope = 'full' if scanned == row['size'] else 'available-ranges'
-    case.db.execute('UPDATE sources SET sha256=?,complete=1,hash_scope=? WHERE id=?',
-                    (digest.hexdigest(),scope,sid))
-    case.db.commit()
+                                root = next(boxes(raw))
+                                child = list(boxes(raw, root.payload, root.end))
+                                kinds = {b.kind for b in child}
+                                if tag == b'moov' and not {b'mvhd', b'trak'} <= kinds:
+                                    continue
+                                if tag == b'moof' and not {b'mfhd', b'traf'} <= kinds:
+                                    continue
+                            except (FormatError, StopIteration):
+                                continue
+                            if tag == b'moov' and b'mvex' not in kinds:
+                                mdigest = hashlib.sha256(raw).hexdigest()
+                                error = summary = None
+                                try:
+                                    summary = json_text(parse_movie(raw).summary())
+                                except FormatError as e:
+                                    error = str(e)
+                                case.db.execute('INSERT OR IGNORE INTO movies VALUES(?,?,?,?)',
+                                                (mdigest, raw, summary, error))
+                    elif tag == b'mdat' and available <= header:
+                        continue
+                    case.db.execute('''INSERT OR IGNORE INTO atoms
+                        (source_id,kind,offset,size,header,available,payload_size,movie_digest)
+                        VALUES(?,?,?,?,?,?,?,?)''',
+                        (sid, tag.decode(), start, n, header, available, available-header, mdigest))
+                    count += 1
+                pool.check(sid)
+                case.db.commit()
+                task.update(scanned, atoms=count)
+            pool.check(sid)
+        scope = 'full' if scanned == row['size'] else 'available-ranges'
+        case.db.execute('UPDATE sources SET sha256=?,complete=1,hash_scope=? WHERE id=?',
+                        (digest.hexdigest(),scope,sid))
+        case.db.commit()
     LOG.info('Indexed %s: %d candidate atoms; %d available bytes',row['path'],count,scanned)

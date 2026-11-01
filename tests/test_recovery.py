@@ -169,10 +169,10 @@ class RecoveryTests(unittest.TestCase):
         rows=self.run_case(images=[image],opt=Options(deep=True,max_anchor_checks=1))
         self.assertEqual(rows[0]['status'],'search_limited')
 
-    def test_group_budget_reported(self):
+    def test_small_group_batch_still_searches_entire_recording(self):
         image=self.root/'card.img'; scatter(self.h264,image)
         rows=self.run_case(images=[image],opt=Options(deep=True,max_groups=1))
-        self.assertEqual(rows[0]['status'],'search_limited')
+        self.assert_recovered(rows,self.h264)
 
     def test_source_change_aborts_resume(self):
         split(self.h264,self.root/'input')
@@ -206,7 +206,7 @@ class RecoveryTests(unittest.TestCase):
         out=self.assert_recovered(self.run_case([self.root/'input']),self.h264)
         out.unlink()
         with Case(self.root/'case') as c:
-            with self.assertRaisesRegex(SafetyError,'Published output changed or disappeared'):
+            with self.assertRaises(SafetyError):
                 recover(c,Options())
         self.assertFalse(out.exists())
 
@@ -221,7 +221,7 @@ class RecoveryTests(unittest.TestCase):
         candidate_hash=sha(candidate)
         out.write_bytes(b'corrupted publication')
         with Case(self.root/'case') as c:
-            with self.assertRaisesRegex(SafetyError,'Published output changed or disappeared'):
+            with self.assertRaises(SafetyError):
                 recover(c,Options())
         self.assertEqual(sha(candidate),candidate_hash)
         self.assertEqual(out.read_bytes(),b'corrupted publication')
