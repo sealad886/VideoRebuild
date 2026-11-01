@@ -49,13 +49,13 @@ def report(case: Case) -> dict:
         for index, job in enumerate(case.get_jobs()):
             if index:
                 stream.write(',')
-            json.dump(job, stream)
+            stream.write(json.dumps(job))
             task.advance()
         stream.write('],"sources":[')
         for index, row in enumerate(case.db.execute('SELECT * FROM sources ORDER BY id')):
             if index:
                 stream.write(',')
-            json.dump(dict(row), stream)
+            stream.write(json.dumps(dict(row)))
             task.advance()
         stream.write(']}\n')
     with phase('Writing intake issues', unit='records') as task, atomic_text(case.root/'reports'/'intake-issues.jsonl') as stream:

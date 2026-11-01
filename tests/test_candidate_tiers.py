@@ -12,6 +12,75 @@ from videorebuild.storage import Case, ReaderPool, SafetyError, file_sha256, wri
 
 
 class CandidateTierTests(unittest.TestCase):
+    def test_narrow_candidate_check_does_not_walk_unrelated_extents(self):
+        class Counted:
+            def __init__(self, values):
+                self.values, self.reads = values, 0
+
+            def __len__(self):
+                return len(self.values)
+
+            def __getitem__(self, index):
+                self.reads += 1
+                return self.values[index]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'image.bin'
+            source.write_bytes(b'x' * 20_000)
+            with Case(root / 'case') as case:
+                physical = case.register_source(source, 'image')
+                logical = case.add_stream('many.mp4',
+                    [Extent(i, physical, i * 2, 1) for i in range(10_000)], size=10_000)
+                rows = {r['id']: dict(r) for r in case.db.execute('SELECT * FROM sources')}
+                with ReaderPool(rows, physical_sources=case.physical_sources()) as pool:
+                    self.publish(case, pool, physical, 19_998, 1)
+                    view = CandidateTiers(case, pool).view()
+                    counted = Counted(pool.extents[logical])
+                    pool.extents[logical] = counted
+                    self.assertFalse(view.candidate_permits(logical, 9_999, 1))
+                    self.assertLess(counted.reads, 40)
+
+    def test_candidate_gap_boundaries_and_empty_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case, physical, _ = self.setup_case(Path(directory))
+            logical = case.add_stream('gapped.mp4',
+                [Extent(0, physical, 0, 10), Extent(20, physical, 20, 10),
+                 Extent(40, physical, 40, 10)], size=50)
+            rows = {r['id']: dict(r) for r in case.db.execute('SELECT * FROM sources')}
+            with ReaderPool(rows, physical_sources=case.physical_sources()) as pool:
+                self.publish(case, pool, physical, 20, 10)
+                view = CandidateTiers(case, pool).view()
+                self.assertTrue(view.candidate_permits(logical, 5, 10))
+                self.assertTrue(view.candidate_permits(logical, 15, 5))
+                self.assertFalse(view.candidate_permits(logical, 15, 6))
+                self.assertTrue(view.candidate_permits(logical, 30, 10))
+                self.assertTrue(view.candidate_permits(logical, 25, 0))
+                self.assertTrue(view.candidate_permits(logical, 50, 0))
+
+    def test_candidate_limits_stay_in_logical_coordinates_across_extents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'image.bin'
+            source.write_bytes(bytes(range(256)))
+            with Case(root / 'case') as case:
+                physical = case.register_source(source, 'image')
+                above = case.add_stream('physical-above.mp4',
+                    [Extent(0, physical, 100, 1), Extent(1, physical, 200, 1)], size=2)
+                below = case.add_stream('physical-below.mp4',
+                    [Extent(100, physical, 0, 1), Extent(101, physical, 1, 1)], size=102)
+                rows = {r['id']: dict(r) for r in case.db.execute('SELECT * FROM sources')}
+                with ReaderPool(rows, physical_sources=case.physical_sources()) as pool:
+                    self.publish(case, pool, physical, 200, 1, key='accepted-high')
+                    self.publish(case, pool, physical, 1, 1, key='accepted-low')
+                    view = CandidateTiers(case, pool).view()
+                    for sid, offset, length, expected in (
+                            (above, 0, 1, True), (above, 1, 1, False), (above, 0, 2, False),
+                            (below, 100, 2, False), (below, 99, 1, True),
+                            (below, 99, 2, True), (below, 99, 3, False)):
+                        with self.subTest(source=sid, offset=offset, length=length):
+                            self.assertEqual(view.candidate_permits(sid, offset, length), expected)
+
     def setup_case(self, root):
         source = root / 'image.bin'
         source.write_bytes(bytes(range(100)))

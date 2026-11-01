@@ -1,4 +1,30 @@
-# Executed validation — VideoRebuild 0.2.0
+# Executed validation — VideoRebuild
+
+## Whole-codebase performance optimization — November 1, 2026
+
+Baseline `c3b41f6`, local branch `codex/performance-optimization`; macOS 27.2
+arm64, Python 3.13.18, FFmpeg/ffprobe 9.0.2. Final source completed **370 tests
+in 76.526 s**, with two optional real-fiwalk integration tests skipped because
+the executable was unavailable. An isolated fresh standalone archive passed
+**176 relevant regression/recovery tests in 46.962 s**, with no skips; all 19
+runtime module bytes match tested source. Version, doctor, TUI help, syntax
+compilation and `git diff --check` passed. The checkout's existing archive was
+preserved. Independent review found and verified corrections to lazy logical
+extent bounds and retained-buffer lifetime; no reviewed blocker remains.
+
+Same-harness, serial five-trial synthetic medians improved sparse screening
+48.01×, narrow unclaimed extent checks 680.84×, dense atom indexing 6.09×,
+catalogue generation 1.94×, and Python packet-evidence validation 2.03×.
+Manifest startup's traced Python peak fell from 17,845,694 to 76,944 bytes,
+with about 4.2 ms extra time in the 2,000-job fixture. These measurements do
+not establish full-image recovery throughput or yield. See
+[PERFORMANCE.md](docs/PERFORMANCE.md) for exact workloads, invariants, audit
+coverage, reproducible commands and limitations. Raw source-bound receipts live
+under ignored `test-results/performance-20261101/`.
+
+No Linux/Python 3.14 execution, wheel/sdist installation, hosted CI, private
+image processing, or real-camera acceptance occurred. Changes remain local and
+uncommitted; no push, pull request, publication, deployment, or release occurred.
 
 ## Performance and exhaustive matching repairs — October 30, 2026
 

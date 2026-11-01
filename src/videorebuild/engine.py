@@ -14,6 +14,7 @@ from collections.abc import Mapping as MappingView
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
+from itertools import accumulate, islice
 import errno
 import json
 import logging
@@ -37,6 +38,22 @@ LOG = logging.getLogger(__name__)
 FTYP = make_box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso6')
 Mapping = MappingView[tuple[int, int], tuple[int, int]]
 MAX_DEEP_METADATA = 32 * 1024 * 1024
+
+
+def _quick_sample_ranges(chunk: Chunk) -> tuple[tuple[int, int], ...]:
+    """Keep the sparse screen's exact sample choices as relative byte ranges."""
+    count = len(chunk.sizes)
+    indexes = (sorted({0, 1, 2, count//2, count-2, count-1}) if count > 6 else range(count))
+    sizes = iter(chunk.sizes)
+    offset = previous = 0
+    ranges = []
+    for index in indexes:
+        offset += sum(islice(sizes, index - previous))
+        size = next(sizes)
+        ranges.append((offset, size))
+        offset += size
+        previous = index + 1
+    return tuple(ranges)
 
 
 @dataclass(frozen=True)
@@ -74,6 +91,7 @@ class _TranslationPlan:
             indexes = sorted({0, 1, 2, len(video)//2, len(video)-3, len(video)-2, len(video)-1})
             video = [video[i] for i in indexes]
         self.quick_chunks = video
+        self.quick_samples = {(c.track, c.index): _quick_sample_ranges(c) for c in video}
 
     def mapping(self, sid: int, translation: int):
         return _TranslatedMapping(self, sid, translation)
@@ -145,8 +163,10 @@ def validate_ranges(movie: Movie, mapping: Mapping, pool: ReaderPool) -> None:
 def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool = False,
                   chunks: Iterable[Chunk] | None = None, *, unavailable_raises: bool = False) -> bool:
     """Check AVC/HEVC access-unit framing against *metadata* sample boundaries."""
+    plan = None
     if quick and chunks is None and isinstance(mapping, _TranslatedMapping) and mapping.plan.movie is movie:
-        selected = mapping.plan.quick_chunks
+        plan = mapping.plan
+        selected = plan.quick_chunks
     else:
         selected = list(movie.chunks if chunks is None else chunks)
         selected = [c for c in selected if movie.tracks[c.track].handler == b'vide']
@@ -159,39 +179,39 @@ def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool 
         for chunk in selected:
             t = movie.tracks[chunk.track]
             sid, base = mapping[(chunk.track, chunk.index)]
-            sample_indexes = range(len(chunk.sizes))
-            if quick and len(sample_indexes) > 6:
-                sample_indexes = {0, 1, 2, len(chunk.sizes)//2, len(chunk.sizes)-2, len(chunk.sizes)-1}
-            off = base
-            chunk_end = base + sum(chunk.sizes)
+            if quick:
+                relative_ranges = (plan.quick_samples[(chunk.track, chunk.index)]
+                                   if plan is not None else _quick_sample_ranges(chunk))
+                sample_ranges = ((base + offset, size) for offset, size in relative_ranges)
+            else:
+                sample_ranges = zip(accumulate(chunk.sizes, initial=base), chunk.sizes)
+            chunk_end = base + chunk.size if not quick else 0
             window = memoryview(b'')
             window_start = base
-            for i, n in enumerate(chunk.sizes):
-                if i in sample_indexes:
-                    try:
-                        if quick:
-                            raw = pool.read(sid, off, n)
-                        else:
-                            if off + n > window_start + len(window):
-                                window = memoryview(pool.read(sid, off, min(
-                                    max(n, 4*1024*1024), chunk_end-off)))
-                                window_start = off
-                            raw = window[off-window_start:off-window_start+n]
-                    except FormatError:
-                        if unavailable_raises:
-                            raise
-                        if task is not None:
-                            task.outcome('failed', detail='sample bytes unavailable')
-                        return False
-                    checked += 1
-                    if task is not None and checked % 4096 == 0:
+            for off, n in sample_ranges:
+                try:
+                    if quick:
+                        raw = pool.read(sid, off, n)
+                    else:
+                        if off + n > window_start + len(window):
+                            window = memoryview(pool.read(sid, off, min(
+                                max(n, 4*1024*1024), chunk_end-off)))
+                            window_start = off
+                        raw = window[off-window_start:off-window_start+n]
+                except FormatError:
+                    if unavailable_raises:
+                        raise
+                    if task is not None:
+                        task.outcome('failed', detail='sample bytes unavailable')
+                    return False
+                checked += 1
+                if task is not None and checked % 4096 == 0:
+                    task.update(checked)
+                if not valid_sample(raw, t.codec, t.nal_length):
+                    if task is not None:
                         task.update(checked)
-                    if not valid_sample(raw, t.codec, t.nal_length):
-                        if task is not None:
-                            task.update(checked)
-                            task.outcome('failed', detail='sample boundaries do not match')
-                        return False
-                off += n
+                        task.outcome('failed', detail='sample boundaries do not match')
+                    return False
             # Cached bytes still require the source-identity gate after validation.
             pool.check(sid)
         if task is not None:

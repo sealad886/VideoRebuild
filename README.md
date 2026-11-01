@@ -303,6 +303,11 @@ Development uses an editable install in the project environment:
 
 Tests generate synthetic media locally; no private recordings are bundled. Recovery checks encoded packet bytes, counts, supported track layout, exact timing where the strategy supplies it, and strict full decoding. For reconstruction without codec quality checks, use `--reconstruct-only`; original AVC standalone SEI metadata is preserved and outputs are explicitly labelled as reconstructed without decode validation. Validator revisions and the selected mode recheck prior decisions on resume without rebuilding the index; see [ordinary format support](docs/SUPPORT.md). Source immutability, ambiguity, interruption/resume, malformed mappings, resource bounds and migration failures are regression requirements. Optional fiwalk integration tests need the installed tool and otherwise skip explicitly.
 
+For reproducible synthetic performance measurements, run
+`PYTHONPATH=src .venv/bin/python tools/benchmark_performance.py --trials 5`.
+See [performance evidence and workload limits](docs/PERFORMANCE.md) for baseline
+comparison, measured improvements, memory scope, and audited paths.
+
 Wheel/sdist builds use the pinned requirements in `requirements-build.txt` in a project-specific virtual environment. An optional standalone Python ZIP archive (`videorebuild.pyz`) can still be produced with `.venv/bin/python tools/build_zipapp.py`; the builder overwrites that local archive. Pip installation does not require or build it. See [TEST_REPORT.md](TEST_REPORT.md) for executed evidence and limits; configured CI coverage is separate from checks that actually ran.
 
 No missing-header inference, generated frames, automatic chronology, raw-device writes, source filesystem repairs, or automatic upload occurs. Private paths and diagnostic windows can reveal sensitive media information; review before sharing.

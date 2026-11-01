@@ -679,9 +679,16 @@ def scan_logical(case: Case, sid: int) -> None:
     with phase(label, unit='bytes') as task:
         with ReaderPool(sources,physical_sources=physical) as pool:
             task.update(total=sum(length for _, length in pool.available_ranges(sid)), detail=Path(row['path']).name)
-            read = lambda offset,size: pool.read(sid,offset,size)
             for base, data, owned in pool.iter_blocks(sid):
-                digest.update(data[:owned])
+                # The scan window already passed ReaderPool's range and identity
+                # checks. Reuse contained headers/metadata instead of seeking
+                # and checking the same physical source for every signature.
+                def read(offset, size):
+                    if base <= offset and offset + size <= base + len(data):
+                        return data[offset-base:offset-base+size]
+                    return pool.read(sid, offset, size)
+
+                digest.update(memoryview(data)[:owned])
                 scanned += owned
                 for match in SIGNATURES.finditer(data):
                     # Type field may be in lookahead; ownership belongs to the size field.
@@ -736,6 +743,7 @@ def scan_logical(case: Case, sid: int) -> None:
                         VALUES(?,?,?,?,?,?,?,?)''',
                         (sid, tag.decode(), start, n, header, available, available-header, mdigest))
                     count += 1
+                pool.check(sid)
                 case.db.commit()
                 task.update(scanned, atoms=count)
             pool.check(sid)

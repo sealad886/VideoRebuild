@@ -192,6 +192,85 @@ class SampleValidationPerformanceTests(unittest.TestCase):
                 self.assertEqual(read.call_count, 6)
                 self.assertTrue(all(call.args[2] == 1024 for call in read.call_args_list))
 
+    def test_translated_quick_screen_work_does_not_grow_with_sample_count(self):
+        # Each hypothesis must reuse metadata offsets while rereading source bytes.
+        from dataclasses import replace
+
+        class CountedSizes(tuple):
+            visits = 0
+
+            def __iter__(self):
+                for value in super().__iter__():
+                    self.visits += 1
+                    yield value
+
+        with tempfile.TemporaryDirectory() as directory:
+            _, movie, pool = self.fixture(directory, [8]*10000)
+            sizes = CountedSizes(movie.chunks[0].sizes)
+            movie.chunks[0] = replace(movie.chunks[0], sizes=sizes)
+            plan = engine._TranslationPlan(movie)
+            sizes.visits = 0
+            with pool, patch.object(pool, 'read', wraps=pool.read) as read:
+                for _ in range(3):
+                    self.assertTrue(engine.check_samples(movie, plan.mapping(1, 0), pool, quick=True))
+                self.assertEqual(read.call_count, 18)
+                self.assertEqual(sizes.visits, 0)
+
+    def test_translated_quick_screen_preserves_variable_size_sample_choices(self):
+        for count in (1, 6, 7, 13):
+            sizes = [5+i for i in range(count)]
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                _, movie, pool = self.fixture(directory, sizes)
+                plan = engine._TranslationPlan(movie)
+                indexes = (range(count) if count <= 6 else (0, 1, 2, count//2, count-2, count-1))
+                expected = [(1, sum(sizes[:i]), sizes[i]) for i in indexes]
+                with pool, patch.object(pool, 'read', wraps=pool.read) as read:
+                    self.assertTrue(engine.check_samples(movie, plan.mapping(1, 0), pool, quick=True))
+                    self.assertEqual([call.args for call in read.call_args_list], expected)
+
+    def test_translated_quick_screen_rechecks_selected_sample_bytes(self):
+        # Cached positions must never turn a previous byte-level success into proof.
+        for corrupt_index in (0, 1, 2, 6, 11, 12):
+            with self.subTest(index=corrupt_index), tempfile.TemporaryDirectory() as directory:
+                source, movie, pool = self.fixture(directory, [8]*13)
+                plan = engine._TranslationPlan(movie)
+                raw = bytearray(source.read_bytes())
+                raw[corrupt_index*8+4] = 0xe5
+                source.write_bytes(raw)
+                pool.sources[1]['mtime_ns'] = source.stat().st_mtime_ns
+                with pool:
+                    self.assertFalse(engine.check_samples(movie, plan.mapping(1, 0), pool, quick=True))
+
+    def test_translated_quick_screen_detects_source_mutation(self):
+        from videorebuild.storage import SafetyError
+        with tempfile.TemporaryDirectory() as directory:
+            source, movie, pool = self.fixture(directory, [8]*13)
+            plan = engine._TranslationPlan(movie)
+            validate_sample = engine.valid_sample
+
+            def mutate_after_read(raw, codec, length):
+                result = validate_sample(raw, codec, length)
+                with source.open('ab') as handle:
+                    handle.write(b'X')
+                return result
+
+            with pool, patch.object(engine, 'valid_sample', side_effect=mutate_after_read):
+                with self.assertRaises(SafetyError):
+                    engine.check_samples(movie, plan.mapping(1, 0), pool, quick=True)
+
+    def test_translated_full_screen_still_checks_unsampled_middle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, movie, pool = self.fixture(directory, [8]*13)
+            plan = engine._TranslationPlan(movie)
+            raw = bytearray(source.read_bytes())
+            raw[5*8+4] = 0xe5
+            source.write_bytes(raw)
+            pool.sources[1]['mtime_ns'] = source.stat().st_mtime_ns
+            with pool:
+                mapping = plan.mapping(1, 0)
+                self.assertTrue(engine.check_samples(movie, mapping, pool, quick=True))
+                self.assertFalse(engine.check_samples(movie, mapping, pool))
+
     def test_oversized_sample_and_final_window_clipped_to_chunk_end(self):
         # One legal sample exceeds the normal window; following tail remains exact.
         sizes = [4*1024*1024+37, 1024]

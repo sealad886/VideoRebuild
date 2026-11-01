@@ -7,6 +7,7 @@ samples. Unknown offset-bearing/encrypted layouts fail closed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import hashlib
 import struct
 from typing import Iterator
@@ -106,7 +107,7 @@ class Chunk:
     sizes: tuple[int, ...]
     sample_start: int
 
-    @property
+    @cached_property
     def size(self) -> int:
         return sum(self.sizes)
 

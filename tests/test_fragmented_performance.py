@@ -1,7 +1,10 @@
 """Structural recovery regressions for bounded reads and unchanged-job resume."""
 from pathlib import Path
+import hashlib
+import json
 import struct
 import tempfile
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -9,7 +12,7 @@ from unittest.mock import patch
 from fragmented_helpers import full, single_fragment
 from test_fragmented_reconstruct_only import structural_movie
 from videorebuild.bmff import make_box
-from videorebuild.fragmented import parse_initialization
+from videorebuild.fragmented import Fragment, FragmentSample, FragmentTrack, Initialization, Prefix, parse_initialization
 from videorebuild import image_recovery
 from videorebuild.image_recovery import recover_fragmented
 from videorebuild.ranges import AllocationScope
@@ -35,6 +38,112 @@ def with_audio(initialization):
     video_size = int.from_bytes(moov_payload[:4], 'big')
     defaults = b''.join(full(b'trex', 0, struct.pack('>IIIII', tid, 1, 100, 0, 0)) for tid in (1, 2))
     return initialization[:ftyp_size]+make_box(b'moov', moov_payload[:video_size]+audio+make_box(b'mvex', defaults))
+
+
+class PacketTimingTests(unittest.TestCase):
+    def validate_packet(self, *, scale='1/1000', start=0, sample_duration=3, composition=-2, **packet_values):
+        # These mocked probe responses exercise exact packet comparison without
+        # claiming codec acceptance for the synthetic six-byte sample.
+        data = b'\0\0\0\2\x65X'
+        track = FragmentTrack(1, 'vide', 'avc1', 1000, 4, 0, 0, 0, '')
+        init = Initialization(b'', {1: track})
+        sample = FragmentSample(1, 0, len(data), sample_duration, 0, composition, (5,))
+        prefix = Prefix(init, len(data), [Fragment(0, len(data), 1, (sample,), {1: start})],
+                        starts={1: start})
+        packet = dict(stream_index=0, dts=start, pts=start, duration=sample_duration,
+                      data_hash='SHA256:'+hashlib.sha256(data).hexdigest())
+        packet.update(packet_values)
+        # A None sentinel removes a field so malformed evidence stays rejected.
+        packet = {key: value for key, value in packet.items() if value is not None}
+        probe = {'returncode': 0, 'timeout': False, 'stderr': '', 'stdout_truncated': False,
+                 'stdout': json.dumps({'streams': [{'id': '0x1', 'index': 0, 'codec_name': 'h264',
+                     'time_base': scale, 'nb_read_packets': 1, 'nb_read_frames': 1}], 'packets': [packet]})}
+        decode = {'returncode': 0, 'timeout': False, 'stderr': ''}
+        with patch('videorebuild.image_recovery.run_tool', side_effect=[probe, decode]) as run:
+            result = image_recovery.validate_prefix(Path('synthetic.mp4'), data, prefix,
+                        {'ffprobe': {'path': 'ffprobe'}, 'ffmpeg': {'path': 'ffmpeg'}}, 30)
+        return result, run.call_count
+
+    def test_unit_scale_preserves_negative_composition_normalization(self):
+        result, calls = self.validate_packet(start=-6)
+        self.assertTrue(result['ok'], result.get('reason'))
+        self.assertEqual(calls, 2)
+
+    def test_nonunit_rational_scale_preserves_exact_negative_ticks(self):
+        result, calls = self.validate_packet(scale='3/2000', start=-6, dts=-4, pts=-4,
+                                             duration=2, composition=-3)
+        # Stream duration=2 at 3/2 source ticks equals parsed duration=3.
+        self.assertTrue(result['ok'], result.get('reason'))
+        self.assertEqual(calls, 2)
+
+    def test_nonintegral_or_changed_timing_prevents_decode(self):
+        for packet in ({'dts': -5}, {'pts': -5}, {'duration': 1}):
+            with self.subTest(packet=packet):
+                result, calls = self.validate_packet(scale='3/2000', start=-6,
+                    **dict({'dts': -4, 'pts': -4, 'duration': 2}, **packet))
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['reason'], 'packet_timing_mismatch')
+                self.assertEqual(calls, 1)
+
+    def test_malformed_packet_fields_prevent_decode(self):
+        for packet in ({'duration': None}, {'pts': 'invalid'}, {'stream_index': 9}, {'duration': []}):
+            with self.subTest(packet=packet):
+                result, calls = self.validate_packet(**packet)
+                self.assertFalse(result['ok'])
+                self.assertEqual(calls, 1)
+
+
+class ManifestBackfillTests(unittest.TestCase):
+    def test_many_mixed_jobs_backfill_each_legacy_publication_once(self):
+        with tempfile.TemporaryDirectory() as directory, Case(Path(directory)/'case') as case:
+            keys = ['', '2', '10', 'z', '\u03b1']+[f'fragment-{i}' for i in range(260)]
+            for index, key in enumerate(keys):
+                output = case.root/'reconstructed'/f'legacy-{index}.mp4'
+                output.write_bytes(b'unchanged media')
+                case.result(key, 'reconstructed_prefix', {
+                    'outputs': [str(output.relative_to(case.root))],
+                    'output_evidence': [{'path': str(output.relative_to(case.root)), 'size': output.stat().st_size,
+                                         'sha256': hashlib.sha256(output.read_bytes()).hexdigest()}],
+                    'padding': 'retained detail'}, kind='fragmented')
+            case.result('no-output', 'blocked', {'outputs': [], 'reason': 'unchanged'}, kind='fragmented')
+            case.result('ordinary', 'blocked', {'outputs': []}, kind='ordinary')
+            pool = SimpleNamespace(sources={})
+            image_recovery._backfill_fragment_manifests(case, pool)
+            first = list(case.get_jobs('fragmented'))
+            for job in first:
+                detail = job['detail']
+                if not detail.get('outputs'):
+                    continue
+                self.assertEqual(detail['padding'], 'retained detail')
+                self.assertEqual(job['status'], 'reconstructed_prefix')
+                entry = detail['output_evidence'][0]
+                self.assertEqual((case.root/entry['path']).read_bytes(), b'unchanged media')
+                manifest_path = case.root/entry['manifest_path']
+                self.assertEqual(hashlib.sha256(manifest_path.read_bytes()).hexdigest(), entry['manifest_sha256'])
+                self.assertEqual(json.loads(manifest_path.read_text())['status'], 'historical_manifest_unavailable')
+            self.assertEqual(len(list((case.root/'reconstructed').glob('*.json'))), len(keys))
+            # Current entries remain stable on resume, including pages changed
+            # by the first pass and keys with different lexical/numeric order.
+            image_recovery._backfill_fragment_manifests(case, pool)
+            self.assertEqual(list(case.get_jobs('fragmented')), first)
+            self.assertEqual(case.job('fragmented', 'no-output')['detail'], {'outputs': [], 'reason': 'unchanged'})
+            self.assertEqual(case.job('ordinary', 'ordinary')['detail'], {'outputs': []})
+
+    def test_completed_catalogue_startup_does_not_retain_all_job_details(self):
+        # Startup must stay bounded as a catalogue grows; this permits ample
+        # overhead while rejecting retention of the complete 8 MiB detail set.
+        with tempfile.TemporaryDirectory() as directory, Case(Path(directory)/'case') as case:
+            raw = json.dumps({'outputs': [], 'padding': 'X'*8192})
+            case.db.executemany('INSERT INTO jobs VALUES(?,?,?,?,?)',
+                (('fragmented', str(i), 'blocked', raw, 0) for i in range(1024)))
+            case.db.commit()
+            tracemalloc.start()
+            try:
+                image_recovery._backfill_fragment_manifests(case, SimpleNamespace())
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak, 2*1024*1024)
 
 
 class FragmentedPerformanceTests(unittest.TestCase):
@@ -88,6 +197,21 @@ class FragmentedPerformanceTests(unittest.TestCase):
             # The bounded mdat header peek may include up to 16 bytes; no
             # request may fetch the remaining large window after that pair.
             self.assertFalse(any(offset >= later and offset+size > later+len(pair)+16 for offset, size in requests))
+
+    def test_retained_prefix_excludes_window_tail_and_preserves_source(self):
+        data = self.movie+bytes(8192)
+        with Case(self.root/'case') as case:
+            sid = self.index(case, data)
+            self.assertEqual(self.recover(case), 1)
+            detail = case.job('fragmented', f'{sid}:0')['detail']
+            self.assertEqual(len(detail['outputs']), 1)
+            self.assertEqual((case.root/detail['outputs'][0]).read_bytes(), self.movie)
+            self.assertEqual((self.root/'source.img').read_bytes(), data)
+            entry = detail['output_evidence'][0]
+            digest = hashlib.sha256(self.movie).hexdigest()
+            self.assertEqual((entry['size'], entry['sha256']), (len(self.movie), digest))
+            manifest = json.loads((case.root/entry['manifest_path']).read_text())
+            self.assertEqual((manifest['output_size'], manifest['output_sha256']), (len(self.movie), digest))
 
     def test_track_absent_from_first_fragment_can_start_later_with_timing(self):
         init = with_audio(self.initialization)

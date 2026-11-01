@@ -112,7 +112,8 @@ def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: 
             if int(s['nb_read_packets']) != len(expected[tid]) or int(s['nb_read_frames']) != len(expected[tid]):
                 raise ValueError('packet_or_decoded_frame_count_mismatch')
             indices[s['index']] = tid
-            scales[tid] = Fraction(s['time_base']) * t.timescale
+            scale = Fraction(s['time_base']) * t.timescale
+            scales[tid] = (scale.numerator, scale.denominator)
         actual = defaultdict(list)
         compared = 0
         with phase('Compare packet hashes and timing', total=len(obj.get('packets', [])), unit='samples') as compare_task:
@@ -125,7 +126,11 @@ def validate_prefix(candidate: Path, data: bytes, prefix, tools: dict, timeout: 
                 sample = samples[tid][index]
                 dts = clocks[tid]
                 wanted = (dts, dts+sample.composition_offset+shifts[tid], sample.duration)
-                if tuple(int(packet[k])*scales[tid] for k in ('dts', 'pts', 'duration')) != wanted:
+                numerator, denominator = scales[tid]
+                # Compare exact rational ticks without allocating three Fraction
+                # products for every packet. Nonintegral values still fail.
+                actual_ticks = tuple(int(packet[k])*numerator for k in ('dts', 'pts', 'duration'))
+                if actual_ticks != tuple(ticks*denominator for ticks in wanted):
                     raise ValueError('packet_timing_mismatch')
                 clocks[tid] += sample.duration
                 actual[tid].append(packet['data_hash'].split(':',1)[1].lower())
@@ -362,7 +367,23 @@ def _fragment_manifest(pool, sid, initialization_offset, start, retained, prefix
 
 def _backfill_fragment_manifests(case, pool):
     """Add ordered evidence for existing outputs without recopying or decoding."""
-    for job in list(case.get_jobs('fragmented')):
+    def jobs():
+        # Keep only a bounded page of keys while backfill updates job details.
+        # No live SELECT cursor spans a commit or a mutation of the jobs table.
+        previous = None
+        while True:
+            if previous is None:
+                keys = case.db.execute("SELECT key FROM jobs WHERE kind='fragmented' ORDER BY key LIMIT 256").fetchall()
+            else:
+                keys = case.db.execute("SELECT key FROM jobs WHERE kind='fragmented' AND key>? ORDER BY key LIMIT 256",
+                                       (previous,)).fetchall()
+            if not keys:
+                return
+            for row in keys:
+                yield case.job('fragmented', row[0])
+            previous = keys[-1][0]
+
+    for job in jobs():
         detail = job['detail']
         changed = False
         segments = {segment.get('output'): segment for segment in detail.get('segments', [])}
@@ -551,6 +572,9 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     interval = next(intervals, None)
                     consumed = init_end
                     for start in _candidate_starts(case, sid, init_end, end):
+                        # A view must not pin the previous full read window
+                        # while a later candidate allocates its own window.
+                        retained = None
                         while published_range is not None and published_range[1] <= start:
                             published_range = next(published, None)
                         if published_range is not None and published_range[0] <= start < published_range[1]:
@@ -635,7 +659,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                             segment.update(status='blocked', reason=error)
                             detail['segments'].append(segment)
                             continue
-                        retained = data[:prefix.end]
+                        retained = memoryview(data)[:prefix.end]
                         source_length = prefix.end-len(init.data)
                         segment['source_ranges'] += pool.provenance(sid, start, source_length)
                         if len(retained) > options.max_output_bytes:

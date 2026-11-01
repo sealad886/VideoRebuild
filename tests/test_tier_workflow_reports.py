@@ -13,6 +13,26 @@ from videorebuild.workflow import reconstruct
 
 
 class TierWorkflowTests(unittest.TestCase):
+    def test_json_catalogue_preserves_empty_and_escaped_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with Case(root / 'case') as case:
+                report(case)
+                empty = json.loads((case.root / 'reports' / 'results.json').read_text())
+                self.assertEqual(empty['jobs'], [])
+                self.assertEqual(empty['sources'], [])
+                source = root / 'source-\u00e9.bin'
+                source.write_bytes(b'synthetic')
+                case.register_source(source)
+                detail = {'reason': 'quotes " newline\n Unicode \u00e9 <>&', 'outputs': [],
+                          'nested': [True, None, {'value': '\\'}]}
+                case.result('quoted"key', 'blocked', detail)
+                report(case)
+                values = json.loads((case.root / 'reports' / 'results.json').read_text())
+                self.assertEqual(values['jobs'], list(case.get_jobs()))
+                self.assertEqual(values['sources'], [dict(row) for row in case.db.execute('SELECT * FROM sources ORDER BY id')])
+                self.assertEqual(values['summary']['processed'], 1)
+
     def test_fallback_choice_reaches_both_recovery_strategies(self):
         for command in ('recover', 'run'):
             for enabled in (False, True):

@@ -4,6 +4,7 @@ Publications and their canonical job evidence are authoritative. The settings
 entry is an inspectable derived cache, never a reason to trust missing outputs.
 """
 from bisect import bisect_right
+from itertools import takewhile
 import json
 from pathlib import Path
 
@@ -201,11 +202,15 @@ class _TierView:
             # chunks. Tier preference tests physical intersections only; base
             # allocation/rescue requirements still gate every actual read.
             if sid in self.extents:
+                extents = self.extents[sid]
+                index = max(0, bisect_right(extents, offset, key=lambda e: e.logical_offset) - 1)
+                logical_end = offset + length
+                overlaps = takewhile(lambda e: e.logical_offset < logical_end,
+                                     (extents[i] for i in range(index, len(extents))))
                 parts = (Extent(max(offset, e.logical_offset), e.source_id,
                                 e.source_offset + max(offset, e.logical_offset) - e.logical_offset,
-                                min(offset + length, e.logical_offset + e.length) - max(offset, e.logical_offset))
-                         for e in self.extents[sid]
-                         if e.logical_offset < offset + length and e.logical_offset + e.length > offset)
+                                min(logical_end, e.logical_offset + e.length) - max(offset, e.logical_offset))
+                         for e in overlaps if e.logical_offset + e.length > offset)
             else:
                 parts = (Extent(offset, sid, offset, length),) if length else ()
         else:
