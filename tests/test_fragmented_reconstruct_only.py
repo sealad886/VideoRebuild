@@ -10,9 +10,9 @@ from unittest.mock import patch
 from fragmented_helpers import full, single_fragment
 from videorebuild.bmff import make_box
 from videorebuild.fragmented import parse_initialization
-from videorebuild.image_recovery import recover_fragmented
+from videorebuild.image_recovery import recover_fragmented, verify_completed
 from videorebuild.ranges import AllocationScope
-from videorebuild.storage import Case, ReaderPool, SafetyError, scan_logical
+from videorebuild.storage import Case, ReaderPool, SafetyError, file_sha256, scan_logical
 
 
 def structural_movie(idr=True):
@@ -139,3 +139,159 @@ class FragmentedReconstructOnlyTests(unittest.TestCase):
             backup = json.loads((case.root/event['backup']).read_text())
             self.assertEqual(backup['fragmented_settings']['tools'], tools)
             self.assertTrue(event['mode_changed'])
+
+    def test_failed_strict_upgrade_remains_retryable_until_requested_mode_is_accepted(self):
+        with Case(self.root/'case') as case:
+            sid = self.index(case)
+            source = self.root/'source.img'
+            identity = source.stat()
+            with ReaderPool(case.sources()) as pool:
+                recover_fragmented(case, pool, {}, self.options())
+            original = case.job('fragmented', f'{sid}:0')
+            entry = original['detail']['output_evidence'][0]
+            output = case.root/entry['path']
+            output_identity = output.stat()
+            manifest = case.root/entry['manifest_path']
+            original_manifest = manifest.read_bytes()
+            with ReaderPool(case.sources()) as pool, patch('videorebuild.image_recovery.validate_prefix',
+                    return_value={'ok': False, 'reason': 'temporary_decode_failure'}) as validate:
+                self.assertEqual(recover_fragmented(case, pool, {}, self.options(False), retry=True), 1)
+            self.assertEqual(validate.call_count, 1)
+            failed = case.job('fragmented', f'{sid}:0')
+            self.assertEqual(failed['detail']['outputs'], original['detail']['outputs'])
+            self.assertFalse(failed['detail']['decode_checked'])
+            self.assertFalse(failed['detail']['search_policy'].get('reconstruct_only', False))
+            verify_completed(case)
+            with ReaderPool(case.sources()) as pool, patch('videorebuild.image_recovery.validate_prefix',
+                    return_value={'ok': True, 'reason': 'mocked_strict_gate'}) as validate:
+                self.assertEqual(recover_fragmented(case, pool, {}, self.options(False), retry=True), 1)
+            self.assertEqual(validate.call_count, 1)
+            accepted = case.job('fragmented', f'{sid}:0')
+            self.assertEqual(accepted['status'], 'decoded_prefix')
+            self.assertTrue(accepted['detail']['decode_checked'])
+            self.assertEqual(manifest.read_bytes(), original_manifest)
+            self.assertEqual(output.read_bytes(), self.movie)
+            self.assertEqual((output.stat().st_ino, output.stat().st_mtime_ns),
+                             (output_identity.st_ino, output_identity.st_mtime_ns))
+            self.assertEqual(source.read_bytes(), self.movie)
+            current_identity = source.stat()
+            for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+                self.assertEqual(getattr(current_identity, field), getattr(identity, field))
+            verify_completed(case)
+            with ReaderPool(case.sources()) as pool, \
+                    patch.object(pool, 'read', side_effect=AssertionError('completed media reread')), \
+                    patch('videorebuild.image_recovery.validate_prefix') as validate:
+                self.assertEqual(recover_fragmented(case, pool, {}, self.options(False), retry=True), 0)
+            validate.assert_not_called()
+            self.assertEqual(case.job('fragmented', f'{sid}:0'), accepted)
+
+    def test_mode_transition_interruption_preserves_committed_manifest_and_resumes(self):
+        from videorebuild import image_recovery
+        for initial_mode in (True, False):
+            for boundary in ('manifest_written', 'before_job_commit'):
+                with self.subTest(initial_mode=initial_mode, boundary=boundary):
+                    case_root = self.root/f'case-{initial_mode}-{boundary}'
+                    with Case(case_root) as case:
+                        sid = self.index(case)
+                        source = self.root/'source.img'
+                        identity = source.stat()
+                        with ReaderPool(case.sources()) as pool, patch('videorebuild.image_recovery.validate_prefix',
+                                return_value={'ok': True, 'reason': 'mocked_strict_gate'}):
+                            recover_fragmented(case, pool, {}, self.options(initial_mode))
+                        original = case.job('fragmented', f'{sid}:0')
+                        entry = original['detail']['output_evidence'][0]
+                        output = case.root/entry['path']
+                        output_identity = output.stat()
+                        original_manifest = case.root/entry['manifest_path']
+                        original_bytes = original_manifest.read_bytes()
+                        write_json = image_recovery.write_json
+                        result = case.result
+                        new_manifests = []
+
+                        def write_and_interrupt(path, value):
+                            write_json(path, value)
+                            if value.get('kind') == 'ordered-fragment-manifest':
+                                new_manifests.append(path)
+                                if boundary == 'manifest_written':
+                                    raise KeyboardInterrupt('interrupted after manifest write')
+
+                        def commit_and_interrupt(*args, **kwargs):
+                            if boundary == 'before_job_commit' and kwargs.get('kind') == 'fragmented':
+                                raise KeyboardInterrupt('interrupted before job commit')
+                            return result(*args, **kwargs)
+
+                        with ReaderPool(case.sources()) as pool, \
+                                patch('videorebuild.image_recovery.validate_prefix',
+                                      return_value={'ok': True, 'reason': 'mocked_strict_gate'}), \
+                                patch('videorebuild.image_recovery.write_json', side_effect=write_and_interrupt), \
+                                patch.object(case, 'result', side_effect=commit_and_interrupt):
+                            with self.assertRaises(KeyboardInterrupt):
+                                recover_fragmented(case, pool, {}, self.options(not initial_mode), retry=True)
+                        self.assertEqual(len(new_manifests), 1)
+                    with Case(case_root) as case:
+                        self.assertEqual(case.job('fragmented', f'{sid}:0'), original)
+                        self.assertEqual(original_manifest.read_bytes(), original_bytes)
+                        self.assertEqual(file_sha256(original_manifest), entry['manifest_sha256'])
+                        self.assertNotEqual(new_manifests[0], original_manifest)
+                        verify_completed(case)
+                        with ReaderPool(case.sources()) as pool, patch('videorebuild.image_recovery.validate_prefix',
+                                return_value={'ok': True, 'reason': 'mocked_strict_gate'}) as validate:
+                            self.assertEqual(recover_fragmented(case, pool, {}, self.options(not initial_mode), retry=True), 1)
+                        self.assertEqual(validate.call_count, int(initial_mode))
+                        current = case.job('fragmented', f'{sid}:0')
+                        current_entry = current['detail']['output_evidence'][0]
+                        current_manifest = case.root/current_entry['manifest_path']
+                        self.assertNotEqual(current_manifest, original_manifest)
+                        self.assertEqual(json.loads(current_manifest.read_text())['decode_checked'], initial_mode)
+                        self.assertEqual(current['detail']['decode_checked'], initial_mode)
+                        self.assertEqual(original_manifest.read_bytes(), original_bytes)
+                        self.assertTrue(new_manifests[0].is_file())
+                        self.assertEqual(output.read_bytes(), self.movie)
+                        self.assertEqual((output.stat().st_ino, output.stat().st_mtime_ns),
+                                         (output_identity.st_ino, output_identity.st_mtime_ns))
+                        self.assertEqual(source.read_bytes(), self.movie)
+                        current_identity = source.stat()
+                        for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+                            self.assertEqual(getattr(current_identity, field), getattr(identity, field))
+                        verify_completed(case)
+
+    def test_partial_strict_job_retries_uncovered_failed_or_limited_section(self):
+        track = parse_initialization(self.initialization).tracks[1]
+        payload = b'\0\0\0\2\x41X'
+        sample = SimpleNamespace(duration=100, flags=0, size=len(payload))
+        following = single_fragment(2, track, sample, payload, tfdt=100)
+        later = len(self.movie)+3
+        data = self.movie+b'gap'+self.movie[len(self.initialization):]+following
+        for failure in ('decode_failed', 'search_limited'):
+            with self.subTest(failure=failure), Case(self.root/f'case-{failure}') as case:
+                sid = self.index(case, data)
+                options = self.options(False)
+                if failure == 'search_limited':
+                    options.max_output_bytes = len(self.movie)
+                outcomes = [{'ok': True, 'reason': 'mocked_strict_gate'}]
+                if failure == 'decode_failed':
+                    outcomes.append({'ok': False, 'reason': 'temporary_decode_failure'})
+                with ReaderPool(case.sources()) as pool, patch('videorebuild.image_recovery.validate_prefix',
+                        side_effect=outcomes) as validate:
+                    recover_fragmented(case, pool, {}, options)
+                self.assertEqual(validate.call_count, len(outcomes))
+                original = case.job('fragmented', f'{sid}:0')
+                self.assertEqual(len(original['detail']['outputs']), 1)
+                self.assertTrue(any(s['logical_start'] == later and s['status'] == failure
+                                    for s in original['detail']['segments']))
+                options.max_output_bytes = 1024*1024
+                with ReaderPool(case.sources()) as pool, patch('videorebuild.image_recovery.validate_prefix',
+                        return_value={'ok': True, 'reason': 'mocked_strict_gate'}) as validate:
+                    self.assertEqual(recover_fragmented(case, pool, {}, options, retry=True), 1)
+                self.assertEqual(validate.call_count, 1)
+                accepted = case.job('fragmented', f'{sid}:0')
+                self.assertEqual(accepted['status'], 'decoded_segments')
+                self.assertEqual(len(accepted['detail']['outputs']), 2)
+                self.assertEqual((case.root/original['detail']['outputs'][0]).read_bytes(), self.movie)
+                verify_completed(case)
+                with ReaderPool(case.sources()) as pool, \
+                        patch.object(pool, 'read', side_effect=AssertionError('completed media reread')), \
+                        patch('videorebuild.image_recovery.validate_prefix') as validate:
+                    self.assertEqual(recover_fragmented(case, pool, {}, options, retry=True), 0)
+                validate.assert_not_called()
+                self.assertEqual(case.job('fragmented', f'{sid}:0'), accepted)

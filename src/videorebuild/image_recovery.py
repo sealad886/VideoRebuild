@@ -365,6 +365,14 @@ def _fragment_manifest(pool, sid, initialization_offset, start, retained, prefix
             'decode_checked': False, 'ordered_fragments': pieces}
 
 
+def _fragment_manifest_path(output: Path) -> Path:
+    """Keep previous sidecars intact while a new evidence pointer is pending."""
+    sidecar = output.with_suffix('.json')
+    if sidecar.exists() or sidecar.is_symlink():
+        sidecar = output.with_name(output.name+'.manifest-'+uuid.uuid4().hex+'.json')
+    return sidecar
+
+
 def _backfill_fragment_manifests(case, pool):
     """Add ordered evidence for existing outputs without recopying or decoding."""
     def jobs():
@@ -433,10 +441,7 @@ def _backfill_fragment_manifests(case, pool):
                                 decode_checked=decoded, validation_scope=validation_scope)
             except (FormatError, StopIteration, KeyError, TypeError, ValueError) as error:
                 manifest['reason'] = str(error) or 'historical_layout_unavailable'
-            sidecar = output.with_suffix('.json')
-            if sidecar.exists() or sidecar.is_symlink():
-                # Preserve an older unrelated sidecar; attach a distinct local manifest.
-                sidecar = output.with_name(output.name+'.manifest-'+uuid.uuid4().hex+'.json')
+            sidecar = _fragment_manifest_path(output)
             write_json(sidecar, manifest)
             entry.update(manifest_path=str(sidecar.relative_to(case.root)),
                          manifest_sha256=file_sha256(sidecar),
@@ -450,6 +455,31 @@ def _backfill_fragment_manifests(case, pool):
             write_json(evidence, detail)
             detail['evidence_sha256'] = file_sha256(evidence)
             case.result(job['key'], job['status'], detail, kind='fragmented')
+
+
+def _fragment_retry_pending(job, reconstruct_only: bool) -> bool:
+    """Retained publications cannot complete failed requested-mode coverage."""
+    detail = job['detail']
+    outputs = set(detail.get('outputs', []))
+    if job['status'] == 'search_limited' or not outputs:
+        return True
+    accepted = [segment for segment in detail.get('segments', [])
+                if segment.get('output') in outputs]
+    if any(bool(segment.get('reconstruct_only', False)) != reconstruct_only for segment in accepted):
+        return True
+    # Match the search loop's interval coverage. Old failed attempts stay as
+    # evidence, but do not reopen starts already accepted in the requested mode.
+    covered = iter(sorted((segment['logical_start'], segment['logical_end']) for segment in accepted))
+    interval = next(covered, None)
+    pending = sorted(segment['logical_start'] for segment in detail.get('segments', [])
+                     if segment.get('status') in {'decode_failed', 'search_limited'} and
+                     segment.get('output') not in outputs)
+    for start in pending:
+        while interval is not None and interval[1] <= start:
+            interval = next(covered, None)
+        if interval is None or start < interval[0]:
+            return True
+    return False
 
 
 def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool = False) -> int:
@@ -501,7 +531,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             job_policy_changed = (old is not None and not old['detail'].get('historical_validation') and
                                   old['detail'].get('search_policy') != search_policy)
             if old is not None and not (policy_changed or job_policy_changed or retry and
-                    (old['status'] == 'search_limited' or not old['detail'].get('outputs'))):
+                    _fragment_retry_pending(old, reconstruct_only)):
                 pool.check(sid)
                 continue
             if limit is not None and processed >= limit:
@@ -707,7 +737,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                         manifest['decode_checked'] = not reconstruct_only
                         manifest['validation_scope'] = 'structural_reconstruction_only' if reconstruct_only else 'strict_decode'
                         manifest['source_sha256'] = source.get('sha256')
-                        sidecar = output.with_suffix('.json')
+                        sidecar = _fragment_manifest_path(output)
                         write_json(sidecar, manifest)
                         relative = str(output.relative_to(case.root))
                         segment.update(status=('reconstructed_segment' if later else 'reconstructed_prefix') if reconstruct_only else
