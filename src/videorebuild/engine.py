@@ -38,6 +38,7 @@ LOG = logging.getLogger(__name__)
 FTYP = make_box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso6')
 Mapping = MappingView[tuple[int, int], tuple[int, int]]
 MAX_DEEP_METADATA = 32 * 1024 * 1024
+MATCHING_REVISION = 4
 
 
 def _quick_sample_ranges(chunk: Chunk) -> tuple[tuple[int, int], ...]:
@@ -1267,7 +1268,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
     sources = case.sources()
     if not sources:
         raise SafetyError('No completed source scans; run scan or run first')
-    run_key = hashlib.sha256(json_text({'version': __version__, 'matching_revision': 3, 'validation_revision': VALIDATION_REVISION,
+    run_key = hashlib.sha256(json_text({'version': __version__, 'matching_revision': MATCHING_REVISION, 'validation_revision': VALIDATION_REVISION,
                          'allocation_scope': allocation_scope.digest if allocation_scope is not None else None,
                          'options': asdict(opt), 'tools': tools,
                          'sources': [(sid,s['sha256'],s['path'],s.get('extents'),s.get('binding'))
@@ -1358,18 +1359,21 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
         if deferred:
             deep_search(case, deferred, pool, tools, opt, run_key, incomplete=incomplete)
         if opt.include_recovered and tiers.has_recovered:
-            # Only targets without any first-tier result may search recovered references.
-            case._search_tiers = dict(case._search_tiers, searched=[1, 2], second_tier_unsearched=False)
+            # Recovered references are eligible only after a completed first-tier miss.
             pending.execute('DELETE FROM deferred')
             fallback = deferred
             for (digest,) in pending.execute('SELECT digest FROM visited_movies ORDER BY digest'):
                 job = case.job('ordinary', digest)
                 if not job or job['detail'].get('run_key') != run_key or job['detail'].get('candidates'):
                     continue
+                if job['status'] == 'search_limited' or job['detail'].get('search_limited'):
+                    # A fallback success cannot settle unexamined first-tier alternatives.
+                    continue
                 row = case.db.execute('SELECT data,error FROM movies WHERE digest=?', (digest,)).fetchone()
                 if row['error']:
                     continue
                 movie = parse_movie(row['data'])
+                case._search_tiers = dict(case._search_tiers, searched=[1, 2], second_tier_unsearched=False)
                 status, candidates, whole_limited = whole_payload(case, movie, base_pool, tools, opt, run_key)
                 if opt.deep and not candidates and status in {'unresolved', 'search_limited'}:
                     if whole_limited:

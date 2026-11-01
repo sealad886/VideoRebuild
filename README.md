@@ -99,7 +99,7 @@ Both strategies record output hashes and source provenance. Default mode also ap
 
 ### Recovered fragments and the two search tiers
 
-**Recovered references move to a second matching tier; source files and indexed evidence are not deleted.** Tier 1 prioritizes physical ranges not already used by accepted recovered outputs. Tier 2 retains those used ranges as fallback evidence. The default searches Tier 1 only. Use `--include-recovered` to check the lower-priority tier when Tier 1 finds no match for the target:
+**Recovered references move to a second matching tier; source files and indexed evidence are not deleted.** Tier 1 prioritizes physical ranges not already used by accepted recovered outputs. Tier 2 retains those used ranges as fallback evidence. The default searches Tier 1 only. Use `--include-recovered` to check the lower-priority tier after Tier 1 completes without a match for the target. An incomplete first-tier search remains `search_limited` and cannot fall back to an authoritative second-tier result:
 
 ```bash
 videorebuild recover --case /healthy/case --deep --retry --include-recovered
