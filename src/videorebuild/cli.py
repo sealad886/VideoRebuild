@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == 'tui':
         from .tui import run
-        return run(args.case, watch=args.watch)
+        return run(args.case, watch=args.watch, no_progress=args.no_progress)
     with reporting(enabled=not args.no_progress) as feedback:
         return _execute(args, feedback)
 

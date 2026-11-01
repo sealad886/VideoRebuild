@@ -17,9 +17,11 @@ def clean_text(value: object) -> str:
 
 
 class Application:
-    def __init__(self, screen, terminal, settings: Settings, *, watch: bool = False):
+    def __init__(self, screen, terminal, settings: Settings, *, watch: bool = False,
+                 no_progress: bool = False):
         self.screen, self.terminal, self.settings = screen, terminal, settings
         self.watching = watch
+        self.no_progress = no_progress
         self.selected = 11 if settings.case else 0
         self.message = ''
         self.highlight = terminal.A_REVERSE
@@ -207,7 +209,7 @@ class Application:
                     can_start = False
                 else:
                     can_start = True
-                self.write(height - 7, 'Recovery runs in the foreground with normal progress and run.log.')
+                self.write(height - 7, 'Recovery runs in the foreground and writes run.log.')
                 self.write(height - 6, 'Ctrl-C there interrupts this operation; run the same command to resume.')
                 self.write(height - 5, '[ Start ]' if start else '[ Cancel ]', selected=True)
                 self.screen.refresh()
@@ -243,6 +245,8 @@ class Application:
     def launch(self, action: str) -> None:
         try:
             arguments = build_arguments(self.settings, action)
+            if self.no_progress:
+                arguments.insert(0, '--no-progress')
             observed = snapshot(self.settings.case)
             if observed['busy']:
                 self.message = 'Another process owns this case. Choose Watch existing case to observe it.'
@@ -335,7 +339,7 @@ class Application:
                     return 0
 
 
-def run(case: Path | None = None, *, watch: bool = False) -> int:
+def run(case: Path | None = None, *, watch: bool = False, no_progress: bool = False) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print('ERROR: The TUI needs an interactive terminal. Use run/recover --help for scriptable commands.', file=sys.stderr)
         return 2
@@ -349,7 +353,7 @@ def run(case: Path | None = None, *, watch: bool = False) -> int:
         return 2
     try:
         return curses.wrapper(lambda screen: Application(screen, curses, Settings(case=str(case) if case else ''),
-                                                          watch=watch).loop())
+                                                          watch=watch, no_progress=no_progress).loop())
     except curses.error as error:
         print(f'ERROR: Could not use this terminal: {clean_text(error)}. Check TERM or use the regular CLI.', file=sys.stderr)
         return 2

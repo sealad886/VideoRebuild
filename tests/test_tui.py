@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from videorebuild import cli, tui
+from videorebuild.progress import phase
 from videorebuild.tui_model import Settings
 
 
@@ -61,7 +62,7 @@ class TerminalInterfaceTests(unittest.TestCase):
     def test_command_routes_to_tui_without_opening_case(self):
         with patch('videorebuild.tui.run', return_value=0) as run, patch.object(cli, 'Case') as case:
             self.assertEqual(cli.main(['tui', '--case', '/case folder', '--watch']), 0)
-        run.assert_called_once_with(Path('/case folder'), watch=True)
+        run.assert_called_once_with(Path('/case folder'), watch=True, no_progress=False)
         case.assert_not_called()
 
     def test_noninteractive_terminal_explains_cli_alternative(self):
@@ -132,6 +133,36 @@ class TerminalInterfaceTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 app.execute(['recover', '--case', '/case'])
         self.assertEqual(calls, ['save', 'leave', 'restore'])
+
+    def test_foreground_handoff_preserves_progress_preference(self):
+        def recover(args, feedback):
+            self.assertEqual(args.command, 'recover')
+            with phase('Synthetic recovery', total=1) as work:
+                work.advance()
+            return 0
+
+        def foreground(app):
+            app.launch('recover')
+            return 0
+
+        term = terminal()
+        term.wrapper = lambda callback: callback(Screen())
+        term.def_prog_mode = term.endwin = term.reset_prog_mode = lambda: None
+        for arguments in (['--no-progress', 'tui'], ['tui', '--no-progress'], ['tui']):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'case.sqlite3').touch()
+                output, errors = io.StringIO(), io.StringIO()
+                with patch.dict('sys.modules', {'curses': term}), \
+                     patch('sys.stdin.isatty', return_value=True), \
+                     patch('sys.stdout', output), patch.object(output, 'isatty', return_value=True), \
+                     patch('sys.stderr', errors), patch('builtins.input', return_value=''), \
+                     patch.object(tui.Application, 'loop', autospec=True, side_effect=foreground), \
+                     patch.object(tui.Application, 'review', return_value=True), \
+                     patch.object(tui, 'snapshot', return_value={'busy': False}), \
+                     patch.object(cli, '_execute', side_effect=recover) as recovery:
+                    self.assertEqual(cli.main([*arguments, '--case', directory]), 0)
+                recovery.assert_called_once()
+                self.assertEqual('Progress:' in errors.getvalue(), '--no-progress' not in arguments)
 
     def test_display_removes_terminal_control_sequences(self):
         app = self.app()
