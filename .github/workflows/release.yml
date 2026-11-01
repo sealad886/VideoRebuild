@@ -1,0 +1,153 @@
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Approved full commit SHA on main
+        required: true
+        type: string
+      version:
+        description: Approved stable X.Y.Z version from that revision
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: videorebuild-release-stable
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Validate dispatch identity
+        env:
+          RELEASE_REVISION: ${{ inputs.revision }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: python
+        run: |
+          import os, re
+          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['RELEASE_REVISION']), 'Full lowercase commit SHA required'
+          assert re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', os.environ['RELEASE_VERSION']), 'Stable X.Y.Z required'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check exact main revision and release notes
+        env:
+          RELEASE_REVISION: ${{ inputs.revision }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_REVISION"
+          git merge-base --is-ancestor "$RELEASE_REVISION" origin/main
+          test -f "docs/RELEASE_NOTES_$RELEASE_VERSION.md"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Install build and validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --require-hashes -r requirements-build.txt
+      - name: Tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+      - name: Build and verify release artifacts
+        env:
+          RELEASE_REVISION: ${{ inputs.revision }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
+          python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
+          python tools/build_zipapp.py --no-progress
+          cp videorebuild.pyz dist/
+          python tools/check_release.py --dist dist --version "$RELEASE_VERSION" --revision "$RELEASE_REVISION" --write-evidence
+          python -m venv "$RUNNER_TEMP/release-consumer"
+          "$RUNNER_TEMP/release-consumer/bin/python" -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/release-consumer/bin/python" -I -c 'import importlib.metadata, os, videorebuild; assert importlib.metadata.version("videorebuild") == videorebuild.__version__ == os.environ["RELEASE_VERSION"]'
+          "$RUNNER_TEMP/release-consumer/bin/videorebuild" --version
+          "$RUNNER_TEMP/release-consumer/bin/videorebuild" tui --help
+          "$RUNNER_TEMP/release-consumer/bin/videorebuild" doctor
+          python "$GITHUB_WORKSPACE/dist/videorebuild.pyz" --version
+          python "$GITHUB_WORKSPACE/dist/videorebuild.pyz" doctor
+      - name: Retain verified bytes before publication
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ inputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ inputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+      - name: Publish new immutable release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_REVISION: ${{ inputs.revision }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess, tempfile
+          dist = pathlib.Path('dist')
+          version, revision = os.environ['RELEASE_VERSION'], os.environ['RELEASE_REVISION']
+          tag, repo = 'v' + version, os.environ['GH_REPO']
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True).strip()
+          assert gh('api', f'repos/{repo}/commits/{revision}', '--jq', '.sha') == revision
+          assert (dist / 'source-revision.txt').read_text() == revision + '\n'
+          expected_names = {f'videorebuild-{version}-py3-none-any.whl', f'videorebuild-{version}.tar.gz',
+                            'videorebuild.pyz', 'source-revision.txt', 'SHA256SUMS.txt'}
+          assert {p.name for p in dist.iterdir()} == expected_names, 'Unexpected release assets'
+          sums = dict(line.split('  ', 1)[::-1] for line in (dist / 'SHA256SUMS.txt').read_text().splitlines())
+          assert set(sums) == expected_names - {'SHA256SUMS.txt'}, 'Incomplete checksums'
+          for name, digest in sums.items():
+              assert hashlib.sha256((dist / name).read_bytes()).hexdigest() == digest, f'Checksum mismatch: {name}'
+          refs = json.loads(gh('api', f'repos/{repo}/git/matching-refs/tags/{tag}'))
+          assert not any(ref['ref'] == 'refs/tags/' + tag for ref in refs), 'Tag exists; review recovery'
+          pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases'))
+          assert not any(item['tag_name'] == tag for page in pages for item in page), 'Release exists; review recovery'
+          notes = pathlib.Path(f'docs/RELEASE_NOTES_{version}.md')
+          assert notes.is_file(), 'Approved release notes required'
+          gh('api', '--method', 'POST', f'repos/{repo}/git/refs', '-f', 'ref=refs/tags/' + tag, '-f', 'sha=' + revision)
+          gh('release', 'create', tag, '--verify-tag', '--target', revision, '--draft',
+             '--title', f'VideoRebuild {version}', '--notes-file', str(notes),
+             *[str(dist / name) for name in sorted(expected_names)])
+          release_id = gh('release', 'view', tag, '--json', 'databaseId', '--jq', '.databaseId')
+          published = json.loads(gh('api', f'repos/{repo}/releases/{release_id}'))
+          assert published['draft'] and published['target_commitish'] == revision and published['tag_name'] == tag
+          assert {asset['name'] for asset in published['assets']} == expected_names
+          for asset in published['assets']:
+              digest = hashlib.sha256((dist / asset['name']).read_bytes()).hexdigest()
+              assert asset['state'] == 'uploaded' and asset['digest'] == 'sha256:' + digest
+          with tempfile.TemporaryDirectory() as directory:
+              gh('release', 'download', tag, '--dir', directory)
+              for name in expected_names:
+                  assert (pathlib.Path(directory) / name).read_bytes() == (dist / name).read_bytes(), f'Uploaded bytes differ: {name}'
+          tag_ref = json.loads(gh('api', f'repos/{repo}/git/ref/tags/{tag}'))
+          assert tag_ref['object']['type'] == 'commit' and tag_ref['object']['sha'] == revision, 'Tag target differs from approved revision'
+          gh('release', 'edit', tag, '--draft=false', '--latest')
+          result = json.loads(gh('api', f'repos/{repo}/releases/{release_id}'))
+          assert not result['draft'] and result['tag_name'] == tag
+          print(result['html_url'])

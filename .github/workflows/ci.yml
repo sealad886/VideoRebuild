@@ -50,7 +50,7 @@ jobs:
           python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
           python -m pip install --no-deps dist/*.whl
           cd "$SOURCE_CHECK"
-          python -c 'import pathlib, sys, videorebuild, videorebuild.tui; assert pathlib.Path(videorebuild.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())'
+          python -c 'import importlib.metadata, pathlib, sys, videorebuild, videorebuild.tui; assert pathlib.Path(videorebuild.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()); assert importlib.metadata.version("videorebuild") == videorebuild.__version__'
           videorebuild --version
           videorebuild tui --help
           python -m videorebuild --help
@@ -59,3 +59,6 @@ jobs:
         run: |
           python tools/build_zipapp.py
           python videorebuild.pyz doctor
+          cp videorebuild.pyz dist/
+          VERSION="$(PYTHONPATH=src python -c 'import videorebuild; print(videorebuild.__version__)')"
+          python tools/check_release.py --dist dist --version "$VERSION"

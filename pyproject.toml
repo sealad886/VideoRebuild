@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "videorebuild"
-version = "0.3.0"
+dynamic = ["version"]
 description = "MP4 reconstruction from recovered files and mapped image byte ranges"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -25,3 +25,6 @@ videorebuild = "videorebuild.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "videorebuild.__version__"}

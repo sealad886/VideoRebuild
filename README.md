@@ -6,6 +6,9 @@ Version 0.3.0 uses one case and byte-range model for ordinary and fragmented MP4
 
 A successful decode does not prove original recording identity or completeness. Reports distinguish acquisition status, association evidence and media validation. Missing bytes remain missing; later recoverable sections are separate clips.
 
+[Release ownership and verification](docs/RELEASING.md) documents the canonical
+agent-owned version source, package checks and authorized GitHub release procedure.
+
 ## Install
 
 From this checkout, install with pip in a virtual environment:
