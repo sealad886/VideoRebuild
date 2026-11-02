@@ -31,6 +31,17 @@ class TuiArgumentsTests(unittest.TestCase):
         self.assertEqual(build_arguments(settings, 'scan'),
                          ['scan', '--case', str(self.case), '--image', str(self.source)])
 
+    def test_search_workers_reach_canonical_cli_and_scan_omits_them(self):
+        settings = Settings(case=str(self.case), input=str(self.source), search_workers=3)
+        arguments = build_arguments(settings, 'run')
+        self.assertEqual(arguments[arguments.index('--search-workers') + 1], '3')
+        self.assertNotIn('--search-workers', build_arguments(settings, 'scan'))
+        for workers in (0, 9, True, 1.5, '2'):
+            settings.search_workers = workers
+            with self.subTest(workers=workers), self.assertRaises(ValueError):
+                build_arguments(settings, 'run')
+        self.assertFalse(self.case.exists())
+
     def test_resume_reuses_index_and_explicit_allocation_policy(self):
         with Case(self.case):
             pass

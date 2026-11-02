@@ -20,7 +20,8 @@ import uuid
 
 from . import __version__
 from .bmff import FormatError, boxes
-from .fragmented import MAX_INIT, MAX_MOOF, parse_fragment, parse_initialization, walk_prefix
+from .fragmented import (MAX_INIT, MAX_MOOF, FragmentCache,
+                         parse_initialization, walk_prefix, walk_prefix_reader)
 from .storage import SafetyError, file_sha256, write_json
 from .validate import run_tool
 from .progress import phase
@@ -500,6 +501,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
     allocation_scope = pool.allocation_scope.digest if pool.allocation_scope is not None else None
     policy_changed = _bind_search_policy(case, tools, options, retry, allocation_scope)
     tiers = CandidateTiers(case, pool)
+    fragment_cache = FragmentCache()
     search_policy = {'max_segments': max_segments, 'indexed_starts': 'through_next_initialization',
                      'allocation_scope': allocation_scope}
     search_policy['candidate_tiers'] = 'unclaimed_first'
@@ -574,6 +576,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     if name in old['detail']:
                         detail[name] = old['detail'][name]
             read_bytes = 0
+            parse_stats_before = dict(fragment_cache.stats)
 
             def read_section(at: int, size: int) -> bytes:
                 nonlocal read_bytes
@@ -646,7 +649,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                                 if not moof_size+8 <= length <= readable_end-start:
                                     continue
                                 pair_data = read_section(start, length)
-                                first = parse_fragment(pair_data, 0, init)
+                                first = fragment_cache.parse(pair_data, init)
                                 if not _restart_is_idr(first, init):
                                     continue
                                 if any(base is None for base in first.decode_times.values()):
@@ -665,15 +668,20 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                                     continue
                             except (FormatError, struct.error):
                                 continue
-                        payload = pair_data+read_section(start+len(pair_data), readable_end-start-len(pair_data))
-                        data = init.data+payload
-                        prefix = walk_prefix(data, len(init.data), allow_later_start=later)
+                        def read_payload(at, size):
+                            return read_section(start+at, size)
+
+                        data, prefix = walk_prefix_reader(init, read_payload, readable_end-start,
+                                                        allow_later_start=later, first_pair=pair_data,
+                                                        cache=fragment_cache)
                         if (not later and not prefix.fragments and
                                 prefix.stop_reason.startswith('missing_initial_fragments_sequence_starts_at_')):
                             # A logical file may begin at a surviving later fragment. Keep
                             # the same restart checks and label; never call it a prefix.
                             later = True
-                            prefix = walk_prefix(data, len(init.data), allow_later_start=True)
+                            data, prefix = walk_prefix_reader(init, read_payload, readable_end-start,
+                                                            allow_later_start=True, first_pair=pair_data,
+                                                            cache=fragment_cache)
                         segment = {'logical_start': start, 'logical_end': start+prefix.end-len(init.data),
                                    'stop_reason': prefix.stop_reason, 'fragment_count': len(prefix.fragments),
                                    'sample_counts': prefix.counts, 'later_section': later,
@@ -767,12 +775,14 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                         write_json(publication, detail)
                         detail['evidence_sha256'] = file_sha256(publication)
                         case.result(key, segment['status'], detail, kind='fragmented')
-                        tiers.refresh()
+                        tiers.refresh(('fragmented', key))
                 if detail.get('limit_reason'):
                     section_task.outcome('limited', detail=detail['limit_reason'])
             pool.check(sid)
             detail['candidate_starts_considered'] = considered
             detail['media_read_bytes_charged'] = read_bytes
+            detail['parse_counters'] = {name: value-parse_stats_before[name]
+                                        for name, value in fragment_cache.stats.items()}
             detail['section_window_bytes'] = max_bytes
             detail['search_policy'] = search_policy
             if detail.get('limit_reason'):

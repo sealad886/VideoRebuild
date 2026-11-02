@@ -22,7 +22,7 @@ class Application:
         self.screen, self.terminal, self.settings = screen, terminal, settings
         self.watching = watch
         self.no_progress = no_progress
-        self.selected = 11 if settings.case else 0
+        self.selected = len(self.menu_rows()) - 2 if settings.case else 0
         self.message = ''
         self.highlight = terminal.A_REVERSE
 
@@ -57,6 +57,7 @@ class Application:
             f'Codec validation         : {"OFF - structural export" if s.reconstruct_only else "ON - FFmpeg/ffprobe"}',
             f'Second-tier fallback     : {"ON" if s.include_recovered else "OFF"}',
             f'Retry unresolved jobs    : {"ON" if s.retry else "OFF"}',
+            f'Search workers           : {s.search_workers} (Enter cycles 1-8)',
             '[ Recover existing index ]',
             '[ Scan inputs only       ]',
             '[ Scan + recover         ]',
@@ -328,9 +329,11 @@ class Application:
                 elif self.selected < 8:
                     field = ('deep', 'reconstruct_only', 'include_recovered', 'retry')[self.selected - 4]
                     setattr(self.settings, field, not getattr(self.settings, field))
-                elif self.selected < 11:
-                    self.launch(('recover', 'scan', 'run')[self.selected - 8])
-                elif self.selected == 11:
+                elif self.selected == 8:
+                    self.settings.search_workers = self.settings.search_workers % 8 + 1
+                elif self.selected < 12:
+                    self.launch(('recover', 'scan', 'run')[self.selected - 9])
+                elif self.selected == 12:
                     if self.settings.case:
                         self.watching, observed = True, None
                     else:

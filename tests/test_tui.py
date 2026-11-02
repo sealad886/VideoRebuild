@@ -84,6 +84,31 @@ class TerminalInterfaceTests(unittest.TestCase):
         self.assertTrue(app.settings.reconstruct_only)
         execute.assert_not_called()
 
+    def test_search_worker_menu_cycles_bounded_values_without_launching(self):
+        app = self.app([1001] * 8 + ['\n'] * 8 + ['q'])
+        values = []
+        draw = app.draw_menu
+        def observe():
+            values.append(app.settings.search_workers)
+            draw()
+        with patch.object(app, 'draw_menu', side_effect=observe), patch.object(app, 'execute') as execute:
+            self.assertEqual(app.loop(), 0)
+        self.assertEqual(set(values), set(range(1, 9)))
+        self.assertEqual(app.settings.search_workers, 1)
+        execute.assert_not_called()
+
+    def test_cli_workers_are_bounded_before_case_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory) / 'not-created'
+            for workers in ('0', '9', 'bad'):
+                with self.subTest(workers=workers), patch('sys.stderr', io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        cli.parser().parse_args(['recover', '--case', str(case), '--search-workers', workers])
+                    self.assertEqual(error.exception.code, 2)
+            args = cli.parser().parse_args(['recover', '--case', str(case), '--search-workers', '3'])
+            self.assertEqual(args.search_workers, 3)
+            self.assertFalse(case.exists())
+
     def test_optional_path_prompt_preserves_literal_text(self):
         app = self.app(list('/tmp/case $(literal)') + ['\n'])
         self.assertEqual(app.prompt('Go to path'), '/tmp/case $(literal)')
@@ -206,7 +231,12 @@ class TerminalInterfaceTests(unittest.TestCase):
                     self.assertEqual(dict(os.environ), environment)
                 self.assertTrue(search_paths, 'Foreground recovery did not open search storage')
                 self.assertTrue(all(path.is_relative_to(case_root / 'work') for path in search_paths))
-                self.assertTrue(all(not path.exists() for path in search_paths))
+                ephemeral = [path for path in search_paths if path.parent.name.startswith('videorebuild-search-')]
+                durable = [path for path in search_paths if path.parent.name == 'structural-index']
+                self.assertTrue(ephemeral)
+                self.assertTrue(durable)
+                self.assertTrue(all(not path.exists() for path in ephemeral))
+                self.assertTrue(all(path.is_file() for path in durable))
                 self.assertEqual(list(ambient.iterdir()), [])
                 with Case(case_root) as case:
                     job = case.job('ordinary', movie.digest)

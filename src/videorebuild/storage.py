@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from bisect import bisect_right
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 import hashlib
 import json
@@ -378,6 +378,7 @@ class ReaderPool:
         self.maps = {}
         self._identities = {}
         self._map_identities = {}
+        self._matching_contexts = ExitStack()
         sizes = {sid:r['size'] for sid,r in self.physical.items()}
         for sid,row in self.sources.items():
             if row.get('extents'):
@@ -402,10 +403,36 @@ class ReaderPool:
                 self.maps[sid] = (rescue,bound)
                 self._map_identities[sid] = _live_stamp(after)
 
+    @property
+    def discovery_pool(self):
+        """Allocation/acquisition-scoped reader, independent of recovery tiers."""
+        return self
+
+    def fork(self, source_ids):
+        """Independent read handles with the same pinned evidence identity."""
+        ids = tuple(source_ids)
+        for sid in ids:
+            self.check(sid)
+        physical_ids = {physical for sid in ids for physical in self.physical_ids.get(sid, (sid,))}
+        child = ReaderPool({sid: self.sources[sid] for sid in ids}, limit=self.limit,
+                           physical_sources={sid: self.physical[sid] for sid in physical_ids},
+                           allocation_scope=self.allocation_scope)
+        child._identities = {sid: self._identities[sid] for sid in physical_ids}
+        child._map_identities = {sid: self._map_identities[sid] for sid in physical_ids if sid in self.maps}
+        for sid in ids:
+            child.check(sid)
+        return child
+
     def close(self) -> None:
-        for f in self.handles.values():
-            f.close()
-        self.handles.clear()
+        try:
+            self._matching_contexts.close()
+        finally:
+            # A final source-identity check can fail while cached matching
+            # contexts close. Media descriptors must still all be released.
+            with ExitStack() as descriptors:
+                for f in self.handles.values():
+                    descriptors.callback(f.close)
+                self.handles.clear()
 
     def __enter__(self) -> 'ReaderPool':
         return self

@@ -23,6 +23,7 @@ class Settings:
     reconstruct_only: bool = True
     include_recovered: bool = False
     retry: bool = False
+    search_workers: int = 1
 
 
 def _path(value: str, label: str) -> Path:
@@ -67,9 +68,13 @@ def build_arguments(settings: Settings, action: str) -> list[str]:
                 raise ValueError('Raw image must be an existing regular file, not a device')
             arguments.extend(['--image', str(image)])
     if action in {'run', 'recover'}:
+        if type(settings.search_workers) is not int or not 1 <= settings.search_workers <= 8:
+            raise ValueError('Search workers must be an integer from 1 to 8')
         for name in ('deep', 'reconstruct_only', 'include_recovered', 'retry'):
             if getattr(settings, name):
                 arguments.append('--' + name.replace('_', '-'))
+        if settings.search_workers != 1:
+            arguments.extend(['--search-workers', str(settings.search_workers)])
     return arguments
 
 
