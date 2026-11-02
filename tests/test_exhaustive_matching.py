@@ -92,7 +92,7 @@ class ExhaustiveMatchingTests(unittest.TestCase):
                         patch.object(engine, '_group_hash', side_effect=lambda g, m, p: str(m[(0, 0)][1])), \
                         patch.object(engine, 'attempt', return_value={'status': 'rejected', 'content_evaluated': True}) as attempted, \
                         patch.object(engine, 'finish') as finished:
-                    engine.deep_search(SimpleNamespace(), [movie], pool, {}, options, 'test')
+                    engine.deep_search(SimpleNamespace(root=Path(directory)), [movie], pool, {}, options, 'test')
                 self.assertEqual(attempted.call_count, expected)
                 self.assertEqual(finished.call_args.args[3], limited)
                 self.assertEqual(finished.call_args.args[6]['tested_assemblies'], expected)

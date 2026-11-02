@@ -2,6 +2,8 @@
 from pathlib import Path
 import io
 import os
+import sqlite3
+import struct
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -10,6 +12,8 @@ from unittest.mock import patch
 from videorebuild import cli, tui
 from videorebuild.progress import phase
 from videorebuild.tui_model import Settings
+from videorebuild.storage import Case, scan_logical
+from test_deep_witnesses import structural_movie
 
 
 class TerminalError(Exception):
@@ -163,6 +167,52 @@ class TerminalInterfaceTests(unittest.TestCase):
                     self.assertEqual(cli.main([*arguments, '--case', directory]), 0)
                 recovery.assert_called_once()
                 self.assertEqual('Progress:' in errors.getvalue(), '--no-progress' not in arguments)
+
+    def test_foreground_recovery_keeps_search_storage_in_each_selected_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ambient = root / 'ambient-temp'
+            ambient.mkdir()
+            movie = structural_movie([1000], [8])
+            source = root / 'source.bin'
+            source.write_bytes(movie.data + bytes(992 - len(movie.data)) +
+                               struct.pack('>I4s', 16, b'mdat') + b'\0\0\0\x04\x65ABC')
+            original = source.read_bytes()
+            connect = sqlite3.connect
+            for name in ('first-case', 'second-case'):
+                case_root = root / name
+                with Case(case_root) as case:
+                    scan_logical(case, case.register_source(source))
+                search_paths = []
+
+                def observe_connection(*args, **kwargs):
+                    connection = connect(*args, **kwargs)
+                    filename = connection.execute('PRAGMA database_list').fetchone()[2]
+                    if filename and Path(filename) != case_root / 'case.sqlite3':
+                        search_paths.append(Path(filename))
+                    return connection
+
+                app = self.app(settings=Settings(case=str(case_root)))
+                app.terminal.def_prog_mode = app.terminal.endwin = app.terminal.reset_prog_mode = lambda: None
+                with self.subTest(case=name), \
+                     patch.dict(os.environ, {'TMPDIR': str(ambient)}), \
+                     patch.object(tempfile, 'tempdir', str(ambient)), \
+                     patch.object(sqlite3, 'connect', side_effect=observe_connection), \
+                     patch.object(app, 'review', return_value=True), \
+                     patch('builtins.input', return_value=''), \
+                     patch('sys.stdout', io.StringIO()), patch('sys.stderr', io.StringIO()):
+                    environment = dict(os.environ)
+                    app.launch('recover')
+                    self.assertEqual(dict(os.environ), environment)
+                self.assertTrue(search_paths, 'Foreground recovery did not open search storage')
+                self.assertTrue(all(path.is_relative_to(case_root / 'work') for path in search_paths))
+                self.assertTrue(all(not path.exists() for path in search_paths))
+                self.assertEqual(list(ambient.iterdir()), [])
+                with Case(case_root) as case:
+                    job = case.job('ordinary', movie.digest)
+                    self.assertEqual(job['status'], 'reconstructed')
+                    self.assertFalse(job['detail']['decode_checked'])
+            self.assertEqual(source.read_bytes(), original)
 
     def test_display_removes_terminal_control_sequences(self):
         app = self.app()

@@ -198,6 +198,9 @@ class Case:
                     raise SafetyError(f'New case must be empty; found {unknown[:5]}')
             self.db = sqlite3.connect(dbpath)
             self.db.row_factory = sqlite3.Row
+            # Candidate-query sorts must not spill onto the system temp disk.
+            # Persistent case tables remain in the database on the output volume.
+            self.db.execute('PRAGMA temp_store=MEMORY')
             self.db.execute('PRAGMA foreign_keys=ON')
             version = self.db.execute('PRAGMA user_version').fetchone()[0]
             if version not in (0, SCHEMA):

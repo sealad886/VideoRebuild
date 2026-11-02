@@ -27,7 +27,7 @@ class DeepSearchPerformanceTests(unittest.TestCase):
             with ReaderPool(sources) as pool, \
                     patch.object(engine, 'attempt', return_value={'status': 'rejected'}) as attempt, \
                     patch.object(engine, 'finish'):
-                engine.deep_search(SimpleNamespace(), [movie], pool, {}, engine.Options(), 'synthetic')
+                engine.deep_search(SimpleNamespace(root=Path(directory)), [movie], pool, {}, engine.Options(), 'synthetic')
             self.assertEqual(attempt.call_count, 1)
             self.assertEqual(attempt.call_args.args[2], {(0, 0): (1, 0)})
 
@@ -88,7 +88,7 @@ class DeepSearchPerformanceTests(unittest.TestCase):
                     patch.object(engine, 'groups_for', return_value=[group]), \
                     patch.object(engine.re, 'compile', side_effect=instrument), \
                     patch.object(engine, 'finish'):
-                engine.deep_search(SimpleNamespace(), [movie], pool, {}, engine.Options(), 'synthetic')
+                engine.deep_search(SimpleNamespace(root=Path(directory)), [movie], pool, {}, engine.Options(), 'synthetic')
         self.assertEqual(candidates, [])
 
     def test_overlapping_nonzero_length_anchors_remain_visible(self):
@@ -116,7 +116,7 @@ class DeepSearchPerformanceTests(unittest.TestCase):
                     patch.object(engine, '_group_hash', side_effect=fingerprint), \
                     patch.object(engine, 'attempt', return_value={'status': 'valid', 'media_sha256': 'synthetic'}), \
                     patch.object(engine, 'finish'):
-                engine.deep_search(SimpleNamespace(), [movie], pool, {}, engine.Options(), 'synthetic')
+                engine.deep_search(SimpleNamespace(root=Path(directory)), [movie], pool, {}, engine.Options(), 'synthetic')
         self.assertEqual(starts, [0, 1])
 
 
