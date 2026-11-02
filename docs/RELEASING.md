@@ -28,8 +28,10 @@ The verified baseline is GitHub release `v0.3.0`, published 30 October 2026,
 whose annotated tag peels to commit
 `7adb2a1602d21772fe76a29eb36ad72c4e750825`. It contains wheel, sdist, zipapp and
 checksums. Subsequent `main` changes include new and breaking behavior; this
-configuration change deliberately leaves the pending source version at 0.3.0.
-An actual release requires a new cumulative assessment and an unused version.
+configuration initially left the pending source version at 0.3.0. The cumulative
+assessment for the next release selects 0.4.0: tiered defaults and terminal
+controls change the pre-1.0 consumer contract. See `RELEASE_NOTES_0.4.0.md`.
+Publication requires the checks and authorization below.
 
 While below 1.0, features and intentional breaking changes increment the minor
 component; compatible fixes increment patch. Compute a pending version from
