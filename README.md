@@ -164,6 +164,10 @@ Reports record the searched tiers. A first-tier success does not trigger a secon
 
 ### Outputs and evidence
 
+`CASE/candidates/` holds accepted reconstruction hypotheses and their JSON evidence, including alternatives that remain ambiguous or search-limited. `CASE/reconstructed/` exposes unique published ordinary results as case-internal hard links to those candidates. Both names refer to the same stored media bytes; adding the published name does not allocate a second media copy. A directory-size tool that counts each name separately can therefore overstate their combined use.
+
+On a filesystem without hard-link support, the validated candidate itself is the published output. Reports and the job's `outputs` field identify its canonical path; publication does not copy the payload into a second directory. Fragmented sections have their own scoped output paths and manifests.
+
 Each output's accompanying JSON contains `ordered_fragments`: assembly order, source locations, physical extents, destination offsets, lengths and hashes. Generated ordinary-container bytes, initialization bytes and copied fragment pairs are identified separately. Fragment entries also record sequence and per-track sample/timing metadata.
 
 With `--reconstruct-only`, outputs retain `decode_checked=false`. Strict mode additionally probes and decodes the result. Byte-distinct ordinary alternatives remain `ambiguous`; explicit search cutoffs produce `search_limited`; an exhausted search with no accepted result is `unresolved`. Fragmented outputs retain their prefix or segment scope.

@@ -211,11 +211,13 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(out.exists())
 
     def test_changed_independent_publication_aborts_resume(self):
-        import errno
         split(self.h264,self.root/'input')
-        with patch('videorebuild.engine.os.link',side_effect=OSError(errno.ENOTSUP,'no hardlinks')):
-            rows=self.run_case([self.root/'input'])
+        rows=self.run_case([self.root/'input'])
         out=self.assert_recovered(rows,self.h264)
+        # An independently copied publication still needs its own integrity check.
+        original=out.read_bytes()
+        out.unlink()
+        out.write_bytes(original)
         detail=json.loads(rows[0]['detail'])
         candidate=self.root/'case'/detail['candidates'][0]['path']
         candidate_hash=sha(candidate)
@@ -359,7 +361,7 @@ class RecoveryTests(unittest.TestCase):
             except FormatError:
                 pass
 
-    def test_filesystem_without_hardlinks_uses_logged_copy(self):
+    def test_filesystem_without_hardlinks_publishes_candidate_without_copy(self):
         import errno
         split(self.h264,self.root/'input',duplicate=True)
         with patch('videorebuild.engine.os.link',side_effect=OSError(errno.ENOTSUP,'no hardlinks')):
@@ -368,4 +370,5 @@ class RecoveryTests(unittest.TestCase):
         out=self.assert_recovered(rows,self.h264)
         self.assertTrue(any('Hard links unavailable' in x for x in logs.output))
         candidate=self.root/'case'/json.loads(rows[0]['detail'])['candidates'][0]['path']
-        self.assertNotEqual(out.stat().st_ino,candidate.stat().st_ino)
+        self.assertEqual(out,candidate)
+        self.assertFalse(list((self.root/'case'/'reconstructed').glob('*.mp4')))

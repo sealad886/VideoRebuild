@@ -227,34 +227,6 @@ def _link_unavailable(error: OSError) -> bool:
     return error.errno in {errno.EPERM, errno.EXDEV, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
 
 
-def _publish_link_or_copy(source: Path, destination: Path) -> str:
-    try:
-        os.link(source, destination)
-        return 'case_internal_hardlink'
-    except OSError as e:
-        if not _link_unavailable(e):
-            raise
-    # exFAT is common on recovery disks and does not support hard links. This is
-    # an explicit, logged storage fallback, not a change to matching semantics.
-    LOG.warning('Hard links unavailable; copying case artifact (extra disk space): %s', destination)
-    if shutil.disk_usage(destination.parent).free < source.stat().st_size + 64*1024*1024:
-        raise SafetyError('Insufficient space for publication copy on a filesystem without hard links')
-    try:
-        with source.open('rb') as r, destination.open('xb') as w:
-            with phase('Publish candidate copy', total=source.stat().st_size, unit='bytes') as task:
-                while data := r.read(4*1024*1024):
-                    w.write(data)
-                    task.advance(len(data))
-                task.heartbeat(detail='flushing publication')
-                w.flush()
-                os.fsync(w.fileno())
-    except BaseException:
-        if destination.exists():
-            destination.unlink()
-        raise
-    return 'independent_copy'
-
-
 def reconstruct(movie: Movie, mapping: Mapping, pool: ReaderPool, dest: Path,
                 max_output_bytes: int) -> dict:
     """Copy original encoded samples and relocate chunk offsets; no re-encoding."""
@@ -658,7 +630,7 @@ def _backfill_ordinary_publications(case):
 
 
 def _publish(case: Case, movie: Movie, successes: list[dict], status: str) -> list[str]:
-    """Published output is a case-internal hard link, never a source-file link."""
+    """Publish the canonical artifact, with a case-internal link when supported."""
     final = case.root / 'reconstructed' / f'{movie.digest[:24]}.mp4'
     sidecar = final.with_suffix('.json')
     if final.is_symlink() or sidecar.is_symlink():
@@ -677,7 +649,17 @@ def _publish(case: Case, movie: Movie, successes: list[dict], status: str) -> li
             return [successes[0]['path']]
         storage_mode = 'retained_existing_publication'
     else:
-        storage_mode = _publish_link_or_copy(candidate, final)
+        try:
+            os.link(candidate, final)
+        except OSError as error:
+            if not _link_unavailable(error):
+                raise
+            # The accepted candidate and its manifest already form a complete
+            # publication. Filesystems without links must not retain a second
+            # media allocation merely to provide a reconstructed/ directory name.
+            LOG.warning('Hard links unavailable; publishing the accepted candidate without copying: %s', candidate)
+            return [successes[0]['path']]
+        storage_mode = 'case_internal_hardlink'
     evidence = _backfill_candidate_manifest(case, successes[0])
     write_json(sidecar, {'status': status, 'candidate': successes[0]['path'], 'storage_mode': storage_mode,
                          'sha256': successes[0]['sha256'], 'provenance': evidence.get('provenance', {}),

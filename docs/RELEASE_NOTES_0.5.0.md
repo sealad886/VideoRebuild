@@ -17,6 +17,8 @@ increment under the project's pre-1.0 policy.
   preserve a local backup of the former derived JSON cache before conversion.
 - Expose `--search-workers 1..8` in CLI and TUI, default 1, with independent readers
   and deterministic coordinator writes.
+- Avoid a second publication payload on filesystems without hard-link support:
+  use the validated candidate as the canonical output instead of copying it.
 
 Existing source/container indexes and media remain intact. New matching revision
 invalidates obsolete search conclusions; structural-index coverage remains tied
