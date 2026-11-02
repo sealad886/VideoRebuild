@@ -1493,13 +1493,9 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                         if (not p.is_file() or p.is_symlink() or len(candidates) != 1 or
                                 file_sha256(p) != candidates[0]['sha256']):
                             raise SafetyError(f'Published output changed or disappeared: {p}')
-                        published_manifest = p.with_suffix('.json')
-                        evidence = json.loads(published_manifest.read_text()) if published_manifest.is_file() else {}
-                        candidate_evidence = _backfill_candidate_manifest(case, candidates[0])
-                        for field in ('ordered_fragments', 'historical_manifest_unavailable'):
-                            if field in candidate_evidence:
-                                evidence[field] = candidate_evidence[field]
-                        write_json(published_manifest, evidence)
+                        # Accepted publication manifests were backfilled before
+                        # tier construction. Keep that verified evidence stable
+                        # while other jobs use its cached identity in this pass.
                     continue
             if limit is not None and processed >= limit:
                 break

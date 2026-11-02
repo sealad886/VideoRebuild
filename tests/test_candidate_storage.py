@@ -67,6 +67,55 @@ class CandidateStorageTests(unittest.TestCase):
             with self.assertRaises(SafetyError):
                 engine.recover(case, options)
 
+    def test_resume_completed_candidate_output_then_publish_another_movie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case, _, _, _ = self.fixture(root)
+            token = b'\0\0\0\x05\x65ABCD'
+            prototype = structural_movie([0], [len(token)])
+            second = structural_movie([len(prototype.data)+8], [len(token)])
+            source = root/'second.bin'
+            source.write_bytes(second.data+make_box(b'mdat', token))
+            scan_logical(case, case.register_source(source))
+            options = engine.Options(reconstruct_only=True)
+            with patch.object(engine.os, 'link', side_effect=OSError(errno.ENOTSUP, 'links unavailable')):
+                engine.recover(case, options, limit=1)
+                first = list(case.get_jobs('ordinary'))
+                self.assertEqual(len(first), 1)
+                self.assertEqual(first[0]['status'], 'reconstructed')
+                engine.recover(case, options)
+            jobs = list(case.get_jobs('ordinary'))
+            self.assertEqual(len(jobs), 2)
+            self.assertEqual({job['status'] for job in jobs}, {'reconstructed'})
+            self.assertFalse(list((case.root/'reconstructed').glob('*.mp4')))
+
+    def test_changed_canonical_manifest_still_blocks_other_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case, _, _, _ = self.fixture(root)
+            token = b'\0\0\0\x05\x65ABCD'
+            prototype = structural_movie([0], [len(token)])
+            second = structural_movie([len(prototype.data)+8], [len(token)])
+            source = root/'second.bin'
+            source.write_bytes(second.data+make_box(b'mdat', token))
+            scan_logical(case, case.register_source(source))
+            options = engine.Options(reconstruct_only=True)
+            with patch.object(engine.os, 'link', side_effect=OSError(errno.ENOTSUP, 'links unavailable')):
+                engine.recover(case, options, limit=1)
+                first = next(case.get_jobs('ordinary'))
+                manifest = (case.root/first['detail']['outputs'][0]).with_suffix('.json')
+                whole_payload = engine.whole_payload
+
+                def changed_evidence(*args, **kwargs):
+                    evidence = json.loads(manifest.read_text())
+                    evidence['unexpected_change'] = True
+                    manifest.write_text(json.dumps(evidence))
+                    return whole_payload(*args, **kwargs)
+
+                with patch.object(engine, 'whole_payload', side_effect=changed_evidence):
+                    with self.assertRaisesRegex(SafetyError, 'Changed accepted reconstruction evidence'):
+                        engine.recover(case, options)
+
     def test_interruption_before_link_can_resume_from_one_validated_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
             case, movie, _, _ = self.fixture(Path(directory))
