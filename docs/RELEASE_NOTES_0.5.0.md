@@ -1,9 +1,8 @@
 # VideoRebuild 0.5.0
 
-Pending release, assessed from published v0.4.0 at
-`ee46785efa8df7adab7fc19bc7e755e785f70ef1`. The new discovery-worker option and
-durable structural-index behavior select a minor increment under the project's
-pre-1.0 policy. This file does not authorize publication.
+This release introduces indexed matching and reusable search coverage. The new
+discovery-worker option and durable structural-index behavior select a minor
+increment under the project's pre-1.0 policy.
 
 - Add reusable, scope-qualified structural postings and selective required-anchor
   matching, preserving canonical source/range validation and ambiguity handling.
