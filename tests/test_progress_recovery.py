@@ -146,7 +146,7 @@ class RecoveryProgressTests(unittest.TestCase):
                 stream = io.StringIO()
                 with ReaderPool(logical, physical_sources=physical) as pool, reporting(stream=stream), \
                         patch.object(engine, 'groups_for', return_value=[group]), patch.object(engine, 'finish'):
-                    engine.deep_search(SimpleNamespace(), [movie], pool, {},
+                    engine.deep_search(SimpleNamespace(root=Path(directory)), [movie], pool, {},
                                        engine.Options(max_anchor_checks=1), 'synthetic')
                 self.assertNotIn('/4,096 bytes', stream.getvalue())
                 if limited:

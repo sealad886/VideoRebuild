@@ -663,11 +663,20 @@ def finish(case: Case, movie: Movie, candidates: list[dict], limited: bool,
 
 
 @contextmanager
-def _search_store():
-    # Search cardinality must not become a RAM ceiling or a hypothesis cutoff.
-    with tempfile.TemporaryDirectory(prefix='videorebuild-search-') as directory:
+def _search_store(case: Case):
+    # Keep cardinality tables on the case volume, even when TMPDIR points to a
+    # smaller system disk. Do not change process-wide temp state: a TUI session
+    # can operate on more than one case.
+    work = case.root / 'work'
+    if work.is_symlink() or (work.exists() and not work.is_dir()):
+        raise SafetyError(f'Case search work path must be a real directory: {work}')
+    work.mkdir(mode=0o700, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='videorebuild-search-', dir=work) as directory:
         db = sqlite3.connect(Path(directory) / 'search.sqlite3')
         try:
+            # Main search tables stay disk-backed. Auxiliary SQLite TEMP/sort
+            # state must not create anonymous files on the system temp volume.
+            db.execute('PRAGMA temp_store=MEMORY')
             yield db
         finally:
             db.close()
@@ -680,7 +689,7 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
     tested = 0
     plan = _TranslationPlan(movie)
     metadata_pool = pool.tiers.pool if getattr(pool, 'tiers', None) else pool
-    with _search_store() as search:
+    with _search_store(case) as search:
         search.execute('CREATE TABLE translations (sid INTEGER,base INTEGER,PRIMARY KEY(sid,base)) WITHOUT ROWID')
         search.execute('CREATE TABLE origins (sid INTEGER,base INTEGER,PRIMARY KEY(sid,base)) WITHOUT ROWID')
         locations = case.db.execute('''SELECT a.* FROM atoms a JOIN sources s ON s.id=a.source_id
@@ -936,7 +945,7 @@ def deep_search(case: Case, movies: list[Movie] | _DeferredMovies, pool: ReaderP
     del first, second, batches
     # Discovery is scoped to this reader and invocation. SQLite keeps all
     # wanted sizes and physical locations on disk; no persistent stale cache.
-    with _search_store() as discovery:
+    with _search_store(case) as discovery:
         discovery.execute('CREATE TABLE lengths(length INTEGER PRIMARY KEY) WITHOUT ROWID')
         discovery.execute('CREATE TABLE locations(length INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(length,sid,start)) WITHOUT ROWID')
         for movie in movies:
@@ -990,7 +999,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                 anchors[length].append((g.key, relative))
     if not groups:
         return
-    with _search_store() as search:
+    with _search_store(case) as search:
         search.execute('CREATE TABLE visited (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
         search.execute('CREATE TABLE hits (movie TEXT,g INTEGER,fingerprint TEXT,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
         search.execute('CREATE INDEX hits_order ON hits(movie,g,fingerprint,sid,start)')
@@ -1277,7 +1286,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                  'validation_revision': VALIDATION_REVISION})
     incomplete = set()
     processed = 0
-    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store() as pending:
+    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store(case) as pending:
         # Snapshot only selected identities on disk, then load one metadata
         # BLOB at a time with a completed point query. Streaming the case SELECT
         # through attempt writes pins its WAL for the entire recovery.

@@ -209,6 +209,9 @@ lock prevents a second writer, and progress appends to the same case `run.log`.
 During a foreground operation, Ctrl-C uses the CLI's normal interruption/resume
 handling.
 
+Recovery launched from the menu uses the selected case's `work` directory for
+temporary search databases, just like the CLI. No `TMPDIR` setup is needed.
+
 The **watch** screen reads recent log lines, indexed-source and job counts,
 case-lock state, and available output space without opening the case for
 recovery. It refreshes automatically; quitting the viewer leaves any running
@@ -282,7 +285,7 @@ videorebuild report --case /healthy/case
 
 Ordinary MP4 matching can use `--deep` for scattered-sample searches. Candidate, trailing-padding, hit, assembly, anchor-check and fragmented-start cutoffs are disabled by default. Explicit `--max-candidates`, `--max-padding`, `--max-hits`, `--max-assemblies`, `--max-anchor-checks` and `--max-segments` remain optional search cutoffs; reaching one reports incomplete search rather than proving absence or uniqueness. A whole-payload cutoff does not prevent deep search when no valid candidate has been found. `--max-groups` controls batch capacity without omitting later recordings.
 
-Search hypotheses use private temporary SQLite storage and streaming traversal rather than unbounded in-memory hit combinations. Exhaustive enumeration within the supported model can still take substantial time and temporary disk space. Fragmented recovery searches indexed starts up to the next initialization or source boundary; each section retains a 16-MiB buffer ceiling (`--max-record-bytes`, maximum 256 MiB). Parser/sample bounds, output-size ceilings, disk-space guards and per-process validation timeouts remain enforced. Recovery may write candidates and publications, so allow space beyond the final encoded media size. No total-case retention quota is provided.
+Search hypotheses use private temporary SQLite storage under `CASE/work` and streaming traversal rather than unbounded in-memory hit combinations. Search storage stays on the case's output volume even when the system temporary directory or `TMPDIR` points elsewhere. Temporary search directories are removed when each search closes, including handled failures; an unavailable case work directory is an error rather than a fallback to the system disk. Exhaustive enumeration within the supported model can still take substantial time and temporary disk space. Fragmented recovery searches indexed starts up to the next initialization or source boundary; each section retains a 16-MiB buffer ceiling (`--max-record-bytes`, maximum 256 MiB). Parser/sample bounds, output-size ceilings, disk-space guards and per-process validation timeouts remain enforced. Recovery may write candidates and publications, so allow space beyond the final encoded media size. No total-case retention quota is provided.
 
 Changing source identity, metadata/map binding, coordinate transform or validation settings can require a new case. Completed publications and their evidence are checked before reuse. Old cases require explicit backed-up conversion:
 
