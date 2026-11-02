@@ -123,10 +123,10 @@ Each recovered file's accompanying JSON includes an `ordered_fragments` manifest
 | Stage | Failure or interpretation risk | Main cost / mitigation |
 | --- | --- | --- |
 | Metadata and source intake | Missing/split `moov`, unsupported tracks, unavailable bytes or an incorrect supplied allocation map can prevent or mis-scope recovery. No metadata or frames are fabricated. | Initial bounded scan and hashing; completed indexes are reused. Allocation policy gates reconstruction reads without rebuilding the index. |
-| Whole-payload matching | Layout compatibility is not historical recording identity. Unsupported layouts or overwritten bytes may never match. | Many metadata jobs × many eligible `mdat` translations; canonical mapping hashes and durable attempt-cache lookups/writes. Prepared offset plans reduce repeated work. Completed case reads avoid pinning SQLite WAL growth. |
-| Deep discovery | Size/NAL anchors can collide; required contiguous groups may be missing. Audio association follows the metadata/group model; reconstruction-only mode does not decode-check it. | Scanning permitted bytes, NAL-chain checks, candidate framing and hashing. Shared discovery avoids a separate source scan for every metadata batch. |
-| Assembly | Multiple feasible byte-distinct mappings remain ambiguous. Per-output non-overlap does not settle cross-output ownership. | Content combinations and physical-witness backtracking can grow rapidly. Selective group ordering and overlap pruning reduce work without discarding feasible alternatives. |
-| Fragmented sections | Unsupported addressing, missing IDR/timing, absent tracks, sequence gaps or byte-window bounds stop or block a section. A recovered prefix ending does not prove the original recording ended there. | Repeated bounded parsing and sample checks at eligible starts. Cheap restart prefilters and completed-job reuse avoid unnecessary full reads. |
+| Whole-payload matching | Layout compatibility is not historical recording identity. Unsupported layouts or overwritten bytes may never match. | Compact translation-cache keys avoid expanding every rejected mapping. A cold point-origin index shares structural checks across templates with the same anchor offset; complete warm postings also narrow origins. Capped or unsupported models retain the original hypotheses. Completed case reads avoid pinning SQLite WAL growth. |
+| Deep discovery | Size/NAL anchors can collide; required contiguous groups may be missing. Audio association follows the metadata/group model; reconstruction-only mode does not decode-check it. | Durable scope-bound structural postings reuse completed discovery. Rarest required anchors and relative-offset intersection reduce group checks. Partial or capped coverage cannot establish absence. |
+| Assembly | Multiple feasible byte-distinct mappings remain ambiguous. Per-output non-overlap does not settle cross-output ownership. | Content combinations and physical-witness backtracking can grow rapidly. Bounded sparse support propagation, selective ordering and overlap pruning reduce work while retaining alternate physical witnesses. |
+| Fragmented sections | Unsupported addressing, missing IDR/timing, absent tracks, sequence gaps or byte-window bounds stop or block a section. A recovered prefix ending does not prove the original recording ended there. | Incremental adjacent-pair reads stop at the actual boundary; bounded parsed-pair reuse avoids repeated parsing. Restart prefilters and completed-job reuse remain active. |
 | Output and validation | Disk exhaustion, changed sources/publications or explicit budgets can stop recovery. Structural success alone does not establish playability, chronology or camera identity. | Payload reads/copies, hashes, flush/fsync, and strict-mode probing/decoding. Temporary SQLite stores bound RAM, but search/evidence/output disk use still grows; there is no total-case retention quota. |
 
 See [ordinary support and grouping limits](docs/SUPPORT.md), [fragmented sequence/timing rules](docs/FRAGMENTED.md) and [shared source/range architecture](docs/ARCHITECTURE.md). Implementation entry points are [`whole_payload`, `deep_search`, `attempt`, `reconstruct` and `finish`](src/videorebuild/engine.py), [`recover_fragmented`](src/videorebuild/image_recovery.py) and [`walk_prefix`](src/videorebuild/fragmented.py). The [graphic generation brief](docs/images/recovery-process-prompt.md) records how the explanatory image was produced; code and the detailed contracts remain authoritative.
@@ -284,6 +284,23 @@ videorebuild report --case /healthy/case
 ```
 
 Ordinary MP4 matching can use `--deep` for scattered-sample searches. Candidate, trailing-padding, hit, assembly, anchor-check and fragmented-start cutoffs are disabled by default. Explicit `--max-candidates`, `--max-padding`, `--max-hits`, `--max-assemblies`, `--max-anchor-checks` and `--max-segments` remain optional search cutoffs; reaching one reports incomplete search rather than proving absence or uniqueness. A whole-payload cutoff does not prevent deep search when no valid candidate has been found. `--max-groups` controls batch capacity without omitting later recordings.
+
+Deep discovery can scan independent sources concurrently with `--search-workers`
+from 1 to 8 (default 1). The TUI exposes the same setting. Workers have separate
+read handles and bounded queues; the coordinator writes index coverage and
+publishes results in a deterministic order. More workers can help I/O overlap
+across sources, but may compete for the same storage or CPU. They do not change
+the candidate set or remove ambiguity. For example:
+
+```bash
+videorebuild recover --case /healthy/case --deep --reconstruct-only --search-workers 2
+```
+
+Completed structural discovery remains under `CASE/work/structural-index` for
+reuse across retries and restarts. Its coverage is bound to the source and range
+policy; changed scope creates different coverage. Incomplete sources resume
+without treating their partial postings as exhaustive. The original container
+index and published media are retained. See [matching design and complexity](docs/MATCHING.md).
 
 Search hypotheses use private temporary SQLite storage under `CASE/work` and streaming traversal rather than unbounded in-memory hit combinations. Search storage stays on the case's output volume even when the system temporary directory or `TMPDIR` points elsewhere. Temporary search directories are removed when each search closes, including handled failures; an unavailable case work directory is an error rather than a fallback to the system disk. Exhaustive enumeration within the supported model can still take substantial time and temporary disk space. Fragmented recovery searches indexed starts up to the next initialization or source boundary; each section retains a 16-MiB buffer ceiling (`--max-record-bytes`, maximum 256 MiB). Parser/sample bounds, output-size ceilings, disk-space guards and per-process validation timeouts remain enforced. Recovery may write candidates and publications, so allow space beyond the final encoded media size. No total-case retention quota is provided.
 

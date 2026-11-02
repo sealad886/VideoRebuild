@@ -192,8 +192,7 @@ class FragmentedPerformanceTests(unittest.TestCase):
             self.assertEqual(job['status'], 'blocked')
             self.assertEqual(job['detail']['outputs'], [])
             self.assertTrue(any(s.get('reason') == 'missing_restart_track_timing' for s in job['detail']['segments']))
-            # Initial-position discovery retains its existing full-window path;
-            # later prefilters must stop at the first complete pair.
+            # Both initial walking and later prefilters avoid the unused tail.
             # The bounded mdat header peek may include up to 16 bytes; no
             # request may fetch the remaining large window after that pair.
             self.assertFalse(any(offset >= later and offset+size > later+len(pair)+16 for offset, size in requests))

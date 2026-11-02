@@ -10,8 +10,8 @@ per-track timing eligibility to the recovery strategy.
 """
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass, field
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, field, replace
 import hashlib
 import struct
 
@@ -107,12 +107,19 @@ def box_at(data: bytes, pos: int, limit: int | None = None) -> Box:
     end = len(data) if limit is None else limit
     if not 0 <= pos <= end <= len(data) or end - pos < 8:
         raise FormatError(f'truncated_box_header_at_{pos}')
-    size, typ = struct.unpack_from('>I4s', data, pos)
+    return _box_header(data[pos:pos+16], pos, end)
+
+
+def _box_header(header: bytes, pos: int, end: int) -> Box:
+    """The same finite box bounds for memory and incremental source readers."""
+    if end-pos < 8 or len(header) < 8:
+        raise FormatError(f'truncated_box_header_at_{pos}')
+    size, typ = struct.unpack_from('>I4s', header)
     head = 8
     if size == 1:
-        if end - pos < 16:
+        if end - pos < 16 or len(header) < 16:
             raise FormatError(f'truncated_extended_header_at_{pos}')
-        size = struct.unpack_from('>Q', data, pos + 8)[0]
+        size = struct.unpack_from('>Q', header, 8)[0]
         head = 16
     if size == 0:
         raise FormatError(f'open_ended_{typ!r}_at_{pos}_requires_an_original_file_boundary')
@@ -369,11 +376,164 @@ def parse_fragment(data: bytes, pos: int, init: Initialization, *, sample_budget
     return Fragment(pos, mdat.end, seq, tuple(samples), decode_times)
 
 
+def _append_fragment(result: Prefix, fragment: Fragment, allow_later_start: bool) -> None:
+    """Advance shared sequence and per-track clock rules after canonical parsing."""
+    if not result.fragments and not allow_later_start and fragment.sequence not in (0, 1):
+        raise FormatError(f'missing_initial_fragments_sequence_starts_at_{fragment.sequence}')
+    if result.fragments and fragment.sequence != result.fragments[-1].sequence+1:
+        raise FormatError(f'fragment_sequence_gap_expected_{result.fragments[-1].sequence+1}_found_{fragment.sequence}')
+    proposed, starts = dict(result.clocks), dict(result.starts)
+    for tid, base in fragment.decode_times.items():
+        if tid in proposed and base is not None and base != proposed[tid]:
+            raise FormatError(f'decode_time_discontinuity_track_{tid}')
+        if tid not in proposed:
+            proposed[tid] = 0 if base is None else base
+            starts[tid] = proposed[tid]
+    for sample in fragment.samples:
+        proposed[sample.track_id] += sample.duration
+    result.clocks, result.starts = proposed, starts
+    result.fragments.append(fragment)
+    result.end = fragment.end
+
+
+class FragmentCache:
+    """Bounded successful parse facts; readers always recheck current permitted bytes.
+
+    Exact initialization and pair equality protect against hash collisions and
+    changed defaults/configuration. No negative result, source permission, clock,
+    sequence, or prefix budget is cached. Those are checked for every traversal.
+    """
+    def __init__(self, max_bytes: int = 8*1024*1024):
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self.entries = OrderedDict()
+        self.stats = {'fragment_parse_calls': 0, 'fragment_parse_cache_hits': 0}
+
+    def parse(self, raw: bytes, init: Initialization, sample_budget: int | None = None) -> Fragment:
+        # Python bytes keys cache their hash and compare exact content, so the
+        # prefilter's same byte object is reused without another full digest.
+        # Distinct objects still require equality; a hash collision is harmless.
+        if len(init.data)+len(raw) > self.max_bytes:
+            self.stats['fragment_parse_calls'] += 1
+            return parse_fragment(raw, 0, init, sample_budget=sample_budget)
+        key = (init.data, tuple(sorted(init.tracks.items())), raw)
+        saved = self.entries.get(key)
+        if saved is not None:
+            self.entries.move_to_end(key)
+            self.stats['fragment_parse_cache_hits'] += 1
+            fragment = saved[2]
+            if sample_budget is not None and len(fragment.samples) > sample_budget:
+                raise FormatError('prefix_sample_budget_exceeded')
+            return replace(fragment, decode_times=dict(fragment.decode_times))
+        self.stats['fragment_parse_calls'] += 1
+        fragment = parse_fragment(raw, 0, init, sample_budget=sample_budget)
+        # Bound both retained bytes and sample facts; a sample's Python object
+        # is larger than its encoded entry. Large pairs simply remain uncached.
+        size = (len(init.data)+len(raw)+len(fragment.samples)*512+len(init.tracks)*512+
+                sum(len(sample.nal_types)*8 for sample in fragment.samples))
+        if size <= self.max_bytes:
+            if saved is not None:
+                self.bytes -= saved[3]
+                del self.entries[key]
+            while self.entries and self.bytes+size > self.max_bytes:
+                _, removed = self.entries.popitem(last=False)
+                self.bytes -= removed[3]
+            self.entries[key] = (init.data, raw, fragment, size)
+            self.bytes += size
+        return replace(fragment, decode_times=dict(fragment.decode_times))
+
+
+def _fragment_error_reason(error: Exception, offset: int) -> str:
+    """Rebase the two nested BMFF box diagnostics without a padded byte buffer.
+
+    Pair headers are checked in output coordinates before parsing. Inside the
+    pair, bmff.boxes reports only these positions; other parse errors contain
+    durations, counts, flags or track IDs and must not have numbers rewritten.
+    """
+    reason = str(error)
+    prefix, separator, position = reason.rpartition(' at ')
+    if (separator and position.isdecimal() and
+            (prefix == 'trailing bytes' or prefix.startswith('invalid b') and ' size ' in prefix)):
+        return prefix+' at '+str(offset+int(position))
+    return reason
+
+
+def walk_prefix_reader(init: Initialization, read, payload_size: int, *, allow_later_start: bool = False,
+                       first_pair: bytes = b'', cache: FragmentCache | None = None) -> tuple[bytes, Prefix]:
+    """Walk adjacent bounded pairs without fetching an unparsed window tail.
+
+    ``read(offset, size)`` uses payload-relative offsets and must enforce source
+    identity, rescue/allocation scope, and the selected candidate tier. Successful
+    facts may be reused across sources only after their bytes are read again.
+    """
+    init_size = len(init.data)
+    end = init_size+payload_size
+    result = Prefix(init, init_size, stop_offset=init_size)
+    retained = bytearray(init.data)
+    pos, samples = init_size, 0
+
+    def section(at, size):
+        if first_pair and init_size <= at and at+size <= init_size+len(first_pair):
+            return first_pair[at-init_size:at-init_size+size]
+        return read(at-init_size, size)
+
+    def header(at):
+        return _box_header(section(at, min(16, end-at)), at, end)
+
+    while pos < end:
+        result.stop_offset = pos
+        try:
+            box = header(pos)
+            if box.kind in (b'free', b'skip'):
+                # Headers advance discovery. Read skipped payload only when a
+                # later accepted fragment actually includes it in the output.
+                pos = box.end
+                continue
+            if box.kind in (b'mfra', b'ftyp'):
+                result.stop_reason = 'terminal_index' if box.kind == b'mfra' else 'next_initialization'
+                break
+            if box.kind != b'moof':
+                raise FormatError(f'expected_moof_at_{pos}_found_{box.kind!r}')
+            if box.end-pos > MAX_MOOF:
+                raise FormatError('expected_bounded_moof')
+            mdat = header(box.end)
+            if mdat.kind != b'mdat':
+                raise FormatError('expected_mdat_immediately_after_moof')
+            raw = section(pos, mdat.end-pos)
+            try:
+                fragment = (cache.parse(raw, init, MAX_PREFIX_SAMPLES-samples) if cache is not None else
+                            parse_fragment(raw, 0, init, sample_budget=MAX_PREFIX_SAMPLES-samples))
+            except (FormatError, struct.error) as error:
+                raise FormatError(_fragment_error_reason(error, pos)) from error
+            fragment = replace(fragment, start=pos, end=pos+fragment.end,
+                               samples=tuple(replace(sample, offset=pos+sample.offset) for sample in fragment.samples))
+            previous_end, previous_clocks, previous_starts = result.end, result.clocks, result.starts
+            _append_fragment(result, fragment, allow_later_start)
+            try:
+                pending = section(len(retained), pos-len(retained)) if pos > len(retained) else b''
+            except (FormatError, struct.error):
+                result.fragments.pop()
+                result.end, result.clocks, result.starts = previous_end, previous_clocks, previous_starts
+                raise
+            retained.extend(pending)
+            retained.extend(raw)
+            samples += len(fragment.samples)
+            pos = fragment.end
+        except (FormatError, struct.error) as error:
+            result.stop_reason = str(error)
+            break
+    else:
+        result.stop_offset = end
+        result.stop_reason = 'end_of_bounded_window'
+    del retained[result.end:]
+    return bytes(retained), result
+
+
 def walk_prefix(data: bytes, init_size: int, *, allow_later_start: bool = False) -> Prefix:
     """Parse one sequence; restart mode relaxes only its first sequence number."""
     init = parse_initialization(data[:init_size])
     result = Prefix(init, init_size, stop_offset=init_size)
-    pos, previous = init_size, None
+    pos = init_size
     retained_samples = 0
     while pos < len(data):
         result.stop_offset = pos
@@ -389,25 +549,9 @@ def walk_prefix(data: bytes, init_size: int, *, allow_later_start: bool = False)
             if b.kind != b'moof':
                 raise FormatError(f'expected_moof_at_{pos}_found_{b.kind!r}')
             f = parse_fragment(data, pos, init, sample_budget=MAX_PREFIX_SAMPLES-retained_samples)
-            if previous is None and not allow_later_start and f.sequence not in (0, 1):
-                raise FormatError(f'missing_initial_fragments_sequence_starts_at_{f.sequence}')
-            if previous is not None and f.sequence != previous+1:
-                raise FormatError(f'fragment_sequence_gap_expected_{previous+1}_found_{f.sequence}')
-            proposed = dict(result.clocks)
-            starts = dict(result.starts)
-            for tid, base in f.decode_times.items():
-                if tid in proposed and base is not None and base != proposed[tid]:
-                    raise FormatError(f'decode_time_discontinuity_track_{tid}')
-                if tid not in proposed:
-                    proposed[tid] = 0 if base is None else base
-                    starts[tid] = proposed[tid]
-            for s in f.samples:
-                proposed[s.track_id] += s.duration
-            result.clocks, result.starts = proposed, starts
-            result.fragments.append(f)
+            _append_fragment(result, f, allow_later_start)
             retained_samples += len(f.samples)
-            result.end = f.end
-            previous, pos = f.sequence, f.end
+            pos = f.end
         except (FormatError, struct.error) as e:
             result.stop_reason = str(e)
             break

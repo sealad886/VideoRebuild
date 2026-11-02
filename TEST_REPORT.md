@@ -1,5 +1,53 @@
 # Executed validation — VideoRebuild
 
+## Indexed matching and incremental reconstruction — November 2, 2026
+
+Pending source version **0.5.0**, matching revision **5**, local branch
+`codex/indexed-matching`, assessed from published v0.4.0
+(`ee46785efa8df7adab7fc19bc7e755e785f70ef1`). The final local Python 3.13.18
+suite passed **449 tests in 125.298 seconds**, with no failures or skips.
+Independent reviews covered ordinary/indexed matching, physical-support pruning,
+fragmented incremental reads, worker ownership and tier interval updates.
+
+Executed synthetic operation counts, with equivalent nominations, encoded
+outputs or physical witnesses checked as appropriate:
+
+| Workload | Previous work | New work |
+| --- | ---: | ---: |
+| 5,000-chunk cold/warm translated negative | Full chunk-row digest | 0 canonical digest calls |
+| Required-anchor group sample checks | 200 | 2 |
+| 21 templates × 40 payload origins, one shared anchor offset | 840 first-sample comparisons | 40 origin starts; 60 NAL visits |
+| Four-source structural coverage | 96 bytes read cold | 0 bytes read warm |
+| Small physical assignment fixture | 6 partial assignments checked | 4, same feasible witnesses |
+| Fragmented fixture with unused trailing window | 131,194 bytes requested | 162 bytes, same prefix |
+
+The interval microbenchmark used 20,000 intervals and 100 owner queries, visiting
+1,403 tree nodes; adding one new owner required one interval update. Publication
+integrity checks and database work are excluded from that microbenchmark. Worker
+tests preserve ordered postings at counts 1, 2 and 4. A deliberate I/O-wait model
+benefited from parallel workers; the CPU-only scanner model did not materially
+scale. Default worker count remains one. These are synthetic measurements, not
+an end-to-end speedup or completeness result on private/live recordings.
+
+Regressions cover short AVC boundary discovery, multi-NAL samples, source/map
+identity changes, zero-hit and interrupted coverage, source/length-set receipt
+normalization, cold origin joins against an all-pairs oracle, allocation holes,
+aliases, alternate physical witnesses, capped fallback, overlapping accepted
+owners, context-close failures, and worker-count-only resume without invalidating
+completed jobs. Sparse propagation has comparison/edge budgets and falls back to
+unpruned domains; the global overlap-aware assembler remains authoritative.
+
+Wheel, source distribution and zipapp builds pass package-source identity and
+version checks. The wheel installs into an isolated consumer environment outside
+the source tree, with matching installed/runtime version and CLI/TUI help.
+Reconstruction-only evidence remains `decode_checked=false`. The existing
+recovery, its frozen runtime, SpeechForge and live media were untouched. Hosted
+Linux/Python 3.14 CI and a new live-corpus benchmark were not run for this change.
+
+Detailed local commands, counts, full test log and package checks are retained
+under the ignored `test-results/matching-efficiency-analysis-20261102/implementation/`.
+This validation does not authorize a release or active-run transition.
+
 ## Full-stack integration repair validation — November 1, 2026
 
 The integration branch includes the eight earlier local prerequisite commits,

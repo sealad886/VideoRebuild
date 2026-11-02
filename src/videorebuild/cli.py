@@ -57,6 +57,8 @@ def parser() -> argparse.ArgumentParser:
         if name in ('recover', 'run'):
             q.add_argument('--reconstruct-only', action='store_true', help='Export structurally reconstructed encoded bytes without FFmpeg/ffprobe quality checks; outputs are not decode-validated')
             q.add_argument('--deep', action='store_true', help='Search scattered sample-table extents when whole-payload matching fails')
+            q.add_argument('--search-workers', type=positive_int, choices=range(1, 9), default=1,
+                           help='Independent source-discovery workers (1-8; default: 1); publication remains ordered')
             q.add_argument('--include-recovered', action='store_true', help='If no first-tier match is found, also search second-tier ranges already used by recovered outputs; default searches first tier only')
             if name == 'recover':
                 q.add_argument('--allocation-map', type=Path, help='Image-bound filesystem-unallocated JSON policy for an existing index; rejects allocated image reads without reindexing')

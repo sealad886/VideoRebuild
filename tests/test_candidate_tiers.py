@@ -147,8 +147,8 @@ class CandidateTierTests(unittest.TestCase):
             with ReaderPool(case.sources()) as pool:
                 output = self.publish(case, pool, sid, 40, 10)
                 tiers = CandidateTiers(case, pool)
-                cache = json.loads(case.db.execute("SELECT value FROM settings WHERE name='candidate_tiers'").fetchone()[0])
-                self.assertEqual(cache['references'][0]['source_identity']['ino'], source.stat().st_ino)
+                reference = json.loads(case.db.execute('SELECT reference FROM candidate_references').fetchone()[0])
+                self.assertEqual(reference['source_identity']['ino'], source.stat().st_ino)
                 restarted = CandidateTiers(case, pool)
                 self.assertFalse(restarted.view().permits(sid, 40, 1))
                 with patch('videorebuild.candidate_tiers.file_sha256', side_effect=AssertionError('redundant hash')), \

@@ -11,7 +11,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Mapping as MappingView
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
 from itertools import accumulate, islice
@@ -28,7 +28,7 @@ import sqlite3
 import tempfile
 from typing import Iterable
 
-from . import __version__
+from . import __version__, nal_search
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
 from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
 from .validate import VALIDATION_REVISION, doctor, validate
@@ -38,7 +38,7 @@ LOG = logging.getLogger(__name__)
 FTYP = make_box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso6')
 Mapping = MappingView[tuple[int, int], tuple[int, int]]
 MAX_DEEP_METADATA = 32 * 1024 * 1024
-MATCHING_REVISION = 4
+MATCHING_REVISION = 5
 
 
 def _quick_sample_ranges(chunk: Chunk) -> tuple[tuple[int, int], ...]:
@@ -70,8 +70,11 @@ class Options:
     max_hits: int | None = None
     max_assemblies: int | None = None
     max_anchor_checks: int | None = None
+    search_workers: int = 1
 
     def check(self) -> None:
+        if type(self.search_workers) is not int or not 1 <= self.search_workers <= 8:
+            raise SafetyError('search_workers must be an integer from 1 to 8')
         for k, v in asdict(self).items():
             if k in {'deep', 'reconstruct_only', 'include_recovered'} or (v is None and k in {'max_candidates', 'max_padding', 'max_hits', 'max_assemblies', 'max_anchor_checks'}):
                 continue
@@ -368,17 +371,87 @@ def _scoped_result(case, key, status, detail):
     case.result(key, status, detail)
 
 
-def _refresh_tiers(case):
+def _refresh_tiers(case, owner=None):
     tiers = getattr(case, '_candidate_tiers', None)
     if tiers is not None:
-        tiers.refresh()
+        tiers.refresh(owner=owner)
+
+
+def _translation_key(movie, sid, translation, pool):
+    base = getattr(pool, 'discovery_pool', pool)
+    keys = getattr(base, '_translation_source_keys', None)
+    if keys is None:
+        keys = base._translation_source_keys = {}
+    if sid not in keys:
+        row = pool.sources[sid]
+        descriptor = {key: row.get(key) for key in
+                      ('path', 'size', 'mtime_ns', 'ino', 'sha256', 'extents', 'binding')}
+        from .structural_index import _plain
+        keys[sid] = hashlib.sha256(json_text(_plain(descriptor)).encode()).hexdigest()
+    descriptor = ['translated_negative', MATCHING_REVISION, VALIDATION_REVISION,
+                  movie.digest, sid, translation, keys[sid],
+                  getattr(getattr(pool, 'allocation_scope', None), 'digest', None)]
+    return hashlib.sha256(json_text(descriptor).encode()).hexdigest(), descriptor
 
 
 def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools: dict,
             opt: Options, stage: str) -> dict:
     if not _tier_eligible(movie, mapping, pool):
         return {'status': 'rejected', 'stage': stage, 'reason': 'recovered_reference_second_tier'}
-    md = mapping_digest(movie, mapping)
+    prechecked_quick = None
+    translated = isinstance(mapping, _TranslatedMapping) and mapping.plan.movie is movie
+    work = getattr(case, '_matching_work', None)
+    if work is None:
+        work = case._matching_work = dict(translated_compact_lookups=0, translated_cold_negative_screens=0,
+                                         translated_canonical_rows=0)
+    if translated:
+        try:
+            mapping.check_source(pool)
+        except FormatError as error:
+            return {'status': 'rejected', 'stage': stage, 'reason': str(error)}
+        compact, descriptor = _translation_key(movie, mapping.sid, mapping.translation, pool)
+        work['translated_compact_lookups'] += 1
+        alias = 'translated:' + compact
+        cached = case.db.execute('SELECT value FROM settings WHERE name=?', (alias,)).fetchone()
+        negative = None if cached else case.db.execute(
+            'SELECT detail FROM attempts WHERE movie_digest=? AND mapping_digest=?', (movie.digest, compact)).fetchone()
+        if negative:
+            old = json.loads(negative[0])
+            if (old.get('validation_revision') == VALIDATION_REVISION and
+                    old.get('reconstruct_only', False) == opt.reconstruct_only and
+                    old.get('tools') == tools and old.get('timeout') == opt.timeout and old.get('negative_screen')):
+                return old
+        if cached:
+            md = cached[0]
+        else:
+            try:
+                prechecked_quick = check_samples(movie, mapping, pool, quick=True, unavailable_raises=True)
+            except FormatError as error:
+                return {'status': 'rejected', 'stage': stage, 'reason': str(error)}
+            if not prechecked_quick:
+                work['translated_cold_negative_screens'] += 1
+                result = dict(status='rejected', mapping_digest=compact, mapping_kind='translated_negative',
+                              translated_descriptor=descriptor, stage=stage, tools=tools, timeout=opt.timeout,
+                              validation_revision=VALIDATION_REVISION, reconstruct_only=opt.reconstruct_only,
+                              reason='NAL_sample_boundaries_do_not_match', negative_screen=True,
+                              range_validation='not_evaluated', content_evaluated=True)
+                _record_attempt(case, movie, compact, stage, result)
+                return result
+            md = mapping_digest(movie, mapping)
+            work['translated_canonical_rows'] += len(movie.chunks)
+            case.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', (alias, md))
+    else:
+        md = mapping_digest(movie, mapping)
+        # An eager uniform mapping can seed the same compact alias. This costs no
+        # extra asymptotic work and keeps canonical evidence shared by callers.
+        first = movie.chunks[0]
+        if (first.track, first.index) in mapping:
+            sid, off = mapping[(first.track, first.index)]
+            translation = off-first.offset
+            if sid in pool.sources and all((c.track, c.index) in mapping and
+                    mapping[(c.track, c.index)] == (sid, translation+c.offset) for c in movie.chunks):
+                compact, _ = _translation_key(movie, sid, translation, pool)
+                case.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', ('translated:'+compact, md))
     try:
         if isinstance(mapping, _TranslatedMapping) and mapping.plan.movie is movie:
             mapping.check_source(pool)
@@ -432,7 +505,8 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
         temp.unlink()
     cacheable = True
     try:
-        quick_ok = check_samples(movie, mapping, pool, quick=True, unavailable_raises=True)
+        quick_ok = (prechecked_quick if prechecked_quick is not None else
+                    check_samples(movie, mapping, pool, quick=True, unavailable_raises=True))
         if not quick_ok:
             result.update(reason='NAL_sample_boundaries_do_not_match', negative_screen=True,
                           range_validation='not_evaluated', content_evaluated=True)
@@ -655,7 +729,7 @@ def finish(case: Case, movie: Movie, candidates: list[dict], limited: bool,
     if _search_scope(case) is not None:
         detail['search_tiers'] = dict(_search_scope(case))
     _scoped_result(case, movie.digest, status, detail)
-    _refresh_tiers(case)
+    _refresh_tiers(case, owner=('ordinary', movie.digest))
     LOG.info('%s %s: %d byte-distinct candidates (%s)', movie.digest[:12], status, len(good),
              'structural reconstruction; no decode check' if any(c.get('reconstruct_only') for c in good)
              else 'decode checked' if good else 'no accepted candidate; no decode claim')
@@ -689,7 +763,17 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
     tested = 0
     plan = _TranslationPlan(movie)
     metadata_pool = pool.tiers.pool if getattr(pool, 'tiers', None) else pool
-    with _search_store(case) as search:
+    with _search_store(case) as search, ExitStack() as origin_context:
+        from .origin_index import OriginIndex, first_anchor
+        mandatory = first_anchor(movie)
+        origins = getattr(metadata_pool, 'origin_index', None)
+        if mandatory is not None and all(value is None for value in
+                (opt.max_candidates, opt.max_anchor_checks, opt.max_hits, opt.max_assemblies)):
+            if origins is None:
+                origins = origin_context.enter_context(OriginIndex(case, metadata_pool))
+            origins.prepare([mandatory])
+        else:
+            origins = None
         search.execute('CREATE TABLE translations (sid INTEGER,base INTEGER,PRIMARY KEY(sid,base)) WITHOUT ROWID')
         search.execute('CREATE TABLE origins (sid INTEGER,base INTEGER,PRIMARY KEY(sid,base)) WITHOUT ROWID')
         locations = case.db.execute('''SELECT a.* FROM atoms a JOIN sources s ON s.id=a.source_id
@@ -732,8 +816,13 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
         # Finish the case read before attempts commit. A live case cursor pins
         # the WAL snapshot and prevents checkpoint recycling across the search.
         search.execute('CREATE TABLE candidates (position INTEGER PRIMARY KEY,sid INTEGER,offset INTEGER,header INTEGER)')
-        search.executemany('INSERT INTO candidates(sid,offset,header) VALUES(?,?,?)',
-                           case.db.execute(query, parameters))
+        if origins is None:
+            search.executemany('INSERT INTO candidates(sid,offset,header) VALUES(?,?,?)',
+                               case.db.execute(query, parameters))
+        else:
+            rows = ((sid, offset, header) for sid, offset, header, payload in origins.candidates(*mandatory)
+                    if payload >= movie.span and (opt.max_padding is None or payload <= movie.span+opt.max_padding))
+            search.executemany('INSERT INTO candidates(sid,offset,header) VALUES(?,?,?)', rows)
         examined = 0
         with phase('Whole mdat locations examined', unit='candidates') as task:
             for sid, offset, header in search.execute('SELECT sid,offset,header FROM candidates ORDER BY position'):
@@ -760,7 +849,9 @@ def whole_payload(case: Case, movie: Movie, pool: ReaderPool, tools: dict,
             if limited:
                 task.outcome('limited', detail='candidate search or validation limit reached')
     status = finish(case, movie, list(successes.values()), limited, 'whole_payload', run_key,
-                    {'tested_hypotheses': tested, 'max_trailing_padding': opt.max_padding})
+                    {'tested_hypotheses': tested, 'max_trailing_padding': opt.max_padding,
+                     'matching_work': dict(getattr(case, '_matching_work', {})),
+                     'origin_index': dict(origins.stats) if origins is not None else None})
     return status, list(successes.values()), limited
 
 
@@ -827,52 +918,52 @@ def _group_hash(group: Group, mapping: Mapping, pool: ReaderPool) -> str:
     return h.hexdigest()
 
 
-def _anchor_locations(pool, maximum_sample, wanted, opt, state, task):
+def _anchor_locations(pool, maximum_sample, wanted, opt, state, task, *, source_ids=None):
     """Canonical bounded NAL-chain discovery, independent of target batches."""
     high = ((maximum_sample - 4) >> 16) & 255
     # Zero-width matching preserves overlapping length prefixes at block edges.
     pattern = re.compile(fr'(?=\x00[\x00-\x{high:02x}][\s\S]{{2}})(?!\x00{{4}})'.encode('ascii'))
 
+    # Header facts are independent of the sample start and cumulative length.
+    # Bound cache memory; cache no source bytes and clear at each read block.
+    heads = {}
+
+    def header(sid, block_base, data, pos):
+        if pos in heads:
+            state['discovery_header_cache_hits'] = state.get('discovery_header_cache_hits', 0) + 1
+            return heads[pos]
+        state['discovery_header_reads'] = state.get('discovery_header_reads', 0) + 1
+        def read(offset, count):
+            local = offset-block_base
+            if 0 <= local and local+count <= len(data):
+                return data[local:local+count]
+            return pool.read(sid, offset, count)
+        value = nal_search.header(read, pos)
+        if len(heads) >= 8192:
+            heads.clear()
+        heads[pos] = value
+        return value
+
     def totals(sid, block_base, data, start):
-        pos = start
-        total = 0
-        source_size = pool.sources[sid]['size']
-        for _ in range(65536):
+        def visit():
             if opt.max_anchor_checks is not None and state['nal_checks'] >= opt.max_anchor_checks:
                 state.update(limited=True, stop_reason='nal_check_budget')
-                return
+                return False
             state['nal_checks'] += 1
             if state['nal_checks'] % 4096 == 0:
                 task.heartbeat(nal_checks=state['nal_checks'], anchor_checks=state['anchor_checks'])
-            if pos + 5 > source_size:
-                return
-            local = pos - block_base
-            head_size = min(6, source_size - pos)
-            try:
-                head = (data[local:local+head_size]
-                        if 0 <= local and local+head_size <= len(data)
-                        else pool.read(sid, pos, head_size))
-            except FormatError:
-                return
-            n = int.from_bytes(head[:4], 'big')
-            if n < 1 or total+4+n > maximum_sample or pos+4+n > source_size:
-                return
-            first = head[4]
-            avc = not (first & 128) and 1 <= (first & 31) <= 23
-            hevc = (n >= 2 and len(head) >= 6 and not (first & 128) and
-                    ((first >> 1) & 63) <= 40 and (head[5] & 7))
-            if not (avc or hevc):
-                return
-            total += n + 4
-            if wanted(total - 4):
-                yield total - 4
-            pos += n + 4
+            return True
+        for length in nal_search.cumulative_lengths(lambda pos: header(sid, block_base, data, pos),
+                                                   start, pool.sources[sid]['size'], maximum_sample, visit):
+            if wanted(length):
+                yield length
 
     scanned = 0
-    for sid in pool.sources:
+    for sid in (pool.sources if source_ids is None else source_ids):
         pool.check(sid)
         try:
             for base, data, owned in pool.iter_blocks(sid, overlap=16):
+                heads.clear()
                 at = 0
                 for match in pattern.finditer(data):
                     at = match.start()
@@ -929,58 +1020,53 @@ def _movie_batches(movies, max_groups):
 
 def deep_search(case: Case, movies: list[Movie] | _DeferredMovies, pool: ReaderPool, tools: dict,
                 opt: Options, run_key: str, *, incomplete: set[str] | None = None) -> None:
-    batches = _movie_batches(movies, opt.max_groups)
-    first = next(batches, None)
-    if first is None:
-        return
-    second = next(batches, None)
     capped = any(value is not None for value in (opt.max_anchor_checks, opt.max_hits, opt.max_assemblies))
-    if second is None or capped:
-        for batch in (first, second):
-            if batch:
-                _deep_batch(case, batch, pool, tools, opt, run_key, incomplete or set())
-        for batch in batches:
+    if capped:
+        # Budget semantics remain local and explicit; an incomplete posting set
+        # cannot support a necessary-anchor intersection or a negative receipt.
+        for batch in _movie_batches(movies, opt.max_groups):
             _deep_batch(case, batch, pool, tools, opt, run_key, incomplete or set())
         return
-    del first, second, batches
-    # Discovery is scoped to this reader and invocation. SQLite keeps all
-    # wanted sizes and physical locations on disk; no persistent stale cache.
-    with _search_store(case) as discovery:
-        discovery.execute('CREATE TABLE lengths(length INTEGER PRIMARY KEY) WITHOUT ROWID')
-        discovery.execute('CREATE TABLE locations(length INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(length,sid,start)) WITHOUT ROWID')
-        for movie in movies:
-            groups = groups_for(movie)
-            if any(not group.anchors() for group in groups):
+    from .structural_index import postings
+    lengths = set()
+    base_pool = getattr(pool, 'discovery_pool', pool)
+    catalogue = getattr(case, '_structural_catalogue_lengths', None)
+    if catalogue is None and isinstance(getattr(case, 'db', None), sqlite3.Connection):
+        catalogue = set()
+        # Read one metadata BLOB at a time; finish all catalogue queries before
+        # entering byte discovery or committing attempts.
+        for (digest,) in case.db.execute('''SELECT digest FROM movies WHERE error IS NULL AND EXISTS(
+                SELECT 1 FROM atoms JOIN sources ON atoms.source_id=sources.id
+                WHERE atoms.movie_digest=movies.digest AND sources.complete=1) ORDER BY digest'''):
+            if not any(row[0] in base_pool.sources and base_pool.permits(*row) for row in case.db.execute(
+                    'SELECT source_id,offset,size FROM atoms WHERE movie_digest=?', (digest,))):
                 continue
-            for group in groups:
-                discovery.executemany('INSERT OR IGNORE INTO lengths VALUES(?)', ((length,) for length, _ in group.anchors()))
-        maximum = discovery.execute('SELECT max(length) FROM lengths').fetchone()[0]
-        state = dict(nal_checks=0, anchor_checks=0, limited=False, stop_reason=None, locations=0)
-        if maximum is not None:
-            # Anchor sizes are below 16 MiB by contract: exact membership costs
-            # at most 2 MiB instead of a SQLite query for every NAL in a chain.
-            length_bits = bytearray((maximum >> 3) + 1)
-            for (length,) in discovery.execute('SELECT length FROM lengths'):
-                length_bits[length >> 3] |= 1 << (length & 7)
-            available = sum(length for sid in pool.sources for _, length in pool.available_ranges(sid))
-            with phase('Deep search available bytes', total=available, unit='bytes') as task:
-                wanted = lambda length: bool(length_bits[length >> 3] & (1 << (length & 7)))
-                for sid, start, length in _anchor_locations(pool, maximum+4, wanted, opt, state, task):
-                    state['locations'] += discovery.execute('INSERT OR IGNORE INTO locations VALUES(?,?,?)', (length, sid, start)).rowcount
-                    if state['locations'] % 4096 == 0:
-                        task.heartbeat(discovered_locations=state['locations'], store_pages=discovery.execute('PRAGMA page_count').fetchone()[0])
+            row = case.db.execute('SELECT data FROM movies WHERE digest=?', (digest,)).fetchone()
+            target = parse_movie(row[0])
+            catalogue.update(length for group in groups_for(target) for length, _ in group.anchors())
+        catalogue = case._structural_catalogue_lengths = frozenset(catalogue)
+    for movie in movies:
+        groups = groups_for(movie)
+        if any(not group.anchors() for group in groups):
+            continue
+        lengths.update(length for group in groups for length, _ in group.anchors())
+    if catalogue is not None and lengths.issubset(catalogue):
+        lengths = catalogue
+    elif catalogue:
+        lengths = frozenset(lengths | catalogue)
+        case._structural_catalogue_lengths = lengths
+    with phase('Deep structural index', unit='bytes') as task, \
+            postings(case, base_pool, lengths, _anchor_locations, opt, task) as (discovery, discovery_stats):
         for batch in _movie_batches(movies, opt.max_groups):
-            # Zero-hit sources also underpin negative discovery conclusions.
-            for sid in pool.sources:
-                pool.check(sid)
             _deep_batch(case, batch, pool, tools, opt, run_key, incomplete or set(), discovery=discovery,
-                        discovery_nal_checks=state['nal_checks'])
+                        discovery_nal_checks=discovery_stats['nal_checks'], discovery_stats=discovery_stats)
+        if not getattr(base_pool, '_recovery_active', False):
             for sid in pool.sources:
                 pool.check(sid)
 
 
 def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
-                opt: Options, run_key: str, incomplete: set[str], *, discovery=None, discovery_nal_checks=0) -> None:
+                opt: Options, run_key: str, incomplete: set[str], *, discovery=None, discovery_nal_checks=0, discovery_stats=None) -> None:
     groups = {}
     per_movie = {}
     excluded = set()
@@ -1005,36 +1091,63 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         search.execute('CREATE INDEX hits_order ON hits(movie,g,fingerprint,sid,start)')
         counts_by_group = {key: 0 for key in groups}
         capped = set()
-        state = dict(anchor_checks=0, nal_checks=discovery_nal_checks, limited=False, stop_reason=None, located_extents=0)
+        state = dict(anchor_checks=0, nal_checks=discovery_nal_checks, limited=False, stop_reason=None, located_extents=0,
+                     anchor_associations=0, posting_probes=0, posting_rejections=0, duplicate_bases=0)
         LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchors), len(pool.sources))
         available = (sum(length for sid in pool.sources for _, length in pool.available_ranges(sid))
                      if discovery is None else None)
         label = 'Deep search available bytes' if discovery is None else 'Deep anchor associations'
         with phase(label, total=available, unit='bytes' if discovery is None else 'locations') as scan_task:
             if discovery is None:
-                locations = _anchor_locations(pool, max(anchors)+4, anchors.__contains__, opt, state, scan_task)
+                locations = ((sid, at, length, anchors.get(length, ())) for sid, at, length in
+                             _anchor_locations(pool, max(anchors)+4, anchors.__contains__, opt, state, scan_task))
             else:
                 def replay():
-                    for length in sorted(anchors):
-                        for sid, start in discovery.execute('SELECT sid,start FROM locations WHERE length=? ORDER BY sid,start', (length,)):
-                            pool.check(sid)
-                            yield sid, start, length
+                    frequencies = {}
+                    for length in anchors:
+                        row = discovery.execute('SELECT total FROM frequencies WHERE length=?', (length,)).fetchone()
+                        frequencies[length] = row[0] if row else 0
+                    for key, group in groups.items():
+                        required = group.anchors()
+                        # Only real complete Group anchors have the necessary
+                        # sample predicate. Unsupported custom models retain OR.
+                        intersect = isinstance(group, Group)
+                        ordered = sorted(required, key=lambda item: (frequencies[item[0]], item))
+                        seeds = ordered[:1] if intersect else ordered
+                        for length, relative in seeds:
+                            for sid, at in discovery.execute('SELECT sid,start FROM locations WHERE length=? ORDER BY sid,start', (length,)):
+                                pool.check(sid)
+                                start = at-relative
+                                if intersect:
+                                    present = True
+                                    for other_length, other_relative in ordered[1:]:
+                                        state['posting_probes'] += 1
+                                        if discovery.execute('SELECT 1 FROM locations WHERE length=? AND sid=? AND start=?',
+                                                             (other_length, sid, start+other_relative)).fetchone() is None:
+                                            present = False
+                                            state['posting_rejections'] += 1
+                                            break
+                                    if not present:
+                                        continue
+                                yield sid, start, length, ((key, 0),)
                 locations = replay()
             visited_locations = 0
             try:
-                for sid, at, length in locations:
+                for sid, at, length, associations in locations:
                     visited_locations += 1
                     source = pool.sources[sid]
-                    for key, relative in anchors.get(length, ()):
+                    for key, relative in associations:
+                        state['anchor_associations'] += 1
                         if key in capped:
                             continue
                         group = groups[key]
                         start = at - relative
                         if start < 0 or start + group.span > source['size']:
                             continue
-                        if any(not pool.permits(sid, start+c.offset-group.start, c.size) for c in group.chunks):
-                            continue
                         if not search.execute('INSERT OR IGNORE INTO visited VALUES(?,?,?,?)', (*key, sid, start)).rowcount:
+                            state['duplicate_bases'] += 1
+                            continue
+                        if any(not pool.permits(sid, start+c.offset-group.start, c.size) for c in group.chunks):
                             continue
                         state['anchor_checks'] += 1
                         if opt.max_anchor_checks is not None and state['anchor_checks'] > opt.max_anchor_checks:
@@ -1073,6 +1186,9 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                        'hit_counts': counts, 'anchor_checks': state['anchor_checks'],
                        'nal_checks': state['nal_checks'], 'stop_reason': state['stop_reason'],
                        'shared_discovery': discovery is not None,
+                       'anchor_associations': state['anchor_associations'], 'posting_probes': state['posting_probes'],
+                       'posting_rejections': state['posting_rejections'], 'duplicate_bases': state['duplicate_bases'],
+                       'discovery': discovery_stats or {},
                        'model': 'Each video chunk plus adjacent audio remains contiguous; no within-extent sector permutation.'}
             if any(n == 0 for n in counts):
                 finish(case, movie, [], limited, 'scattered_extents', run_key, details)
@@ -1119,15 +1235,62 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
 
 
 
-def _group_physical_ranges(group, choice, pool):
+def _group_physical_ranges(group, choice, pool, cache=None):
     sid, start = choice
+    key = (group.key, choice)
+    if cache is not None and key in cache:
+        pool.check(sid)
+        yield from cache[key]
+        return
+    parts = []
     for chunk in group.chunks:
-        for part in pool.provenance(sid, start + chunk.offset - group.start, chunk.size):
-            key = pool.physical_key(part['source_id'])
-            yield (*key, part['source_offset'], part['source_offset'] + part['length'])
+        for part in pool.provenance(sid, start+chunk.offset-group.start, chunk.size):
+            physical = pool.physical_key(part['source_id'])
+            parts.append((*physical, part['source_offset'], part['source_offset']+part['length']))
+    if cache is not None and len(cache) < 4096:
+        cache[key] = tuple(parts)
+    yield from parts
+
+
+def _prune_physical_domains(search, groups, pool, stats, footprints):
+    # Dense or huge domains retain streaming DFS; no optimization may discard
+    # values merely because its own memory/edge budget is exhausted.
+    total = sum(search.execute('SELECT count(*) FROM hits WHERE movie=? AND g=?', group.key).fetchone()[0]
+                for group in groups)
+    if total > 4096 or len(groups) < 2:
+        stats['constraint_complete'] = False
+        stats['constraint_skipped_large_domains'] = total > 4096
+        return
+    from .constraints import prune_domains
+    domains = []
+    for group in groups:
+        domain = []
+        unavailable = []
+        for choice in search.execute('SELECT sid,start FROM hits WHERE movie=? AND g=? ORDER BY sid,start', group.key):
+            try:
+                parts = tuple(_group_physical_ranges(group, choice, pool, footprints))
+            except FormatError:
+                # An earlier movie may have demoted these hits after discovery.
+                # This scope exclusion is not a byte-validation negative.
+                unavailable.append(choice)
+                continue
+            domain.append((choice, parts))
+        search.executemany('DELETE FROM hits WHERE movie=? AND g=? AND sid=? AND start=?',
+                           ((*group.key, *choice) for choice in unavailable))
+        domains.append(domain)
+    pruned, counters = prune_domains(domains)
+    stats.update(counters)
+    if not counters['constraint_complete']:
+        return
+    for group, before, after in zip(groups, domains, pruned):
+        retained = {choice for choice, _ in after}
+        search.executemany('DELETE FROM hits WHERE movie=? AND g=? AND sid=? AND start=?',
+                           ((*group.key, *choice) for choice, _ in before if choice not in retained))
 
 
 def _content_assemblies(search, groups, pool, stats, task):
+    footprints = {}
+    _prune_physical_domains(search, groups, pool, stats, footprints)
     distinct = [search.execute('SELECT count(DISTINCT fingerprint) FROM hits WHERE movie=? AND g=?', group.key).fetchone()[0]
                 for group in groups]
     order = sorted(range(len(groups)), key=lambda i: distinct[i])
@@ -1159,21 +1322,21 @@ def _content_assemblies(search, groups, pool, stats, task):
         # Usually the existing witness can be extended without revisiting any
         # older provenance. Greedy failure is never proof of impossibility.
         extension = _assemblies(search, [groups[order[depth]]], pool, counts=[choice[1]],
-                                fingerprints=[choice[0]], stats=stats, task=task, initial_occupied=occupied)
+                                fingerprints=[choice[0]], stats=stats, task=task, initial_occupied=occupied, footprints=footprints)
         try:
             added = next(extension, None)
         finally:
             extension.close()
         if added is not None:
             witness_choices.append(added[0])
-            parts = list(_group_physical_ranges(groups[order[depth]], added[0], pool))
+            parts = list(_group_physical_ranges(groups[order[depth]], added[0], pool, footprints))
             witness_parts.append(parts)
             for extent in parts:
                 occupied.insert(bisect_left(occupied, extent), extent)
         else:
             physical = _assemblies(search, [groups[i] for i in indices], pool,
                                    counts=[item[1] for item in selected],
-                                   fingerprints=[item[0] for item in selected], stats=stats, task=task)
+                                   fingerprints=[item[0] for item in selected], stats=stats, task=task, footprints=footprints)
             try:
                 witness = next(physical, None)
             finally:
@@ -1185,7 +1348,7 @@ def _content_assemblies(search, groups, pool, stats, task):
             # A new location may require reassigning any earlier group. The new
             # jointly feasible witness also proves each shorter content prefix.
             witness_choices = list(witness)
-            witness_parts = [list(_group_physical_ranges(groups[i], item, pool)) for i, item in zip(indices, witness)]
+            witness_parts = [list(_group_physical_ranges(groups[i], item, pool, footprints)) for i, item in zip(indices, witness)]
             occupied = sorted(extent for parts in witness_parts for extent in parts)
         if depth+1 == len(groups):
             stats['content_tuples_considered'] += 1
@@ -1201,7 +1364,7 @@ def _content_assemblies(search, groups, pool, stats, task):
                 # its content could be evaluated; retain all alternative proofs.
                 physical = _assemblies(search, [groups[i] for i in indices], pool,
                                        counts=[item[1] for item in selected],
-                                       fingerprints=[item[0] for item in selected], stats=stats, task=task)
+                                       fingerprints=[item[0] for item in selected], stats=stats, task=task, footprints=footprints)
                 try:
                     for other in physical:
                         if other != first:
@@ -1213,7 +1376,7 @@ def _content_assemblies(search, groups, pool, stats, task):
             depth += 1
 
 
-def _assemblies(search, groups, pool=None, *, counts=None, stats=None, task=None, fingerprints=None, initial_occupied=()):
+def _assemblies(search, groups, pool=None, *, counts=None, stats=None, task=None, fingerprints=None, initial_occupied=(), footprints=None):
     """Enumerate all feasible physical assignments without expanding conflicts."""
     order = sorted(range(len(groups)), key=lambda i: counts[i]) if counts is not None else list(range(len(groups)))
     cursors = []
@@ -1250,7 +1413,7 @@ def _assemblies(search, groups, pool=None, *, counts=None, stats=None, task=None
         try:
             group = groups[order[depth]]
             if pool is not None:
-                for extent in _group_physical_ranges(group, choice, pool):
+                for extent in _group_physical_ranges(group, choice, pool, footprints):
                     at = bisect_left(occupied, extent)
                     if ((at and occupied[at-1][:2] == extent[:2] and occupied[at-1][3] > extent[2]) or
                             (at < len(occupied) and occupied[at][:2] == extent[:2] and extent[3] > occupied[at][2])):
@@ -1277,16 +1440,18 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
     sources = case.sources()
     if not sources:
         raise SafetyError('No completed source scans; run scan or run first')
+    # Discovery scheduling changes execution, not the searched evidence or model.
+    semantic_options = {key: value for key, value in asdict(opt).items() if key != 'search_workers'}
     run_key = hashlib.sha256(json_text({'version': __version__, 'matching_revision': MATCHING_REVISION, 'validation_revision': VALIDATION_REVISION,
                          'allocation_scope': allocation_scope.digest if allocation_scope is not None else None,
-                         'options': asdict(opt), 'tools': tools,
+                         'options': semantic_options, 'tools': tools,
                          'sources': [(sid,s['sha256'],s['path'],s.get('extents'),s.get('binding'))
                                      for sid,s in sorted(sources.items())]}).encode()).hexdigest()
     case.event('recovery_started', {'run_key': run_key, 'tools': tools, 'options': asdict(opt),
                  'validation_revision': VALIDATION_REVISION})
     incomplete = set()
     processed = 0
-    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store(case) as pending:
+    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store(case) as pending, ExitStack() as indexed:
         # Snapshot only selected identities on disk, then load one metadata
         # BLOB at a time with a completed point query. Streaming the case SELECT
         # through attempt writes pins its WAL for the entire recovery.
@@ -1308,6 +1473,23 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                              'second_tier_unsearched': tiers.has_recovered,
                              'uniqueness_scope': 'searched_tiers_only'}
         pool = tiers.view()
+        case._structural_catalogue_lengths = None
+        base_pool._recovery_active = True
+        if all(value is None for value in (opt.max_candidates, opt.max_anchor_checks, opt.max_hits, opt.max_assemblies)):
+            from .origin_index import OriginIndex, first_anchor
+            origins = base_pool.origin_index = indexed.enter_context(OriginIndex(case, base_pool))
+            profiles = set()
+            for (digest,) in pending.execute('SELECT digest FROM selected ORDER BY digest'):
+                row = case.db.execute('SELECT data,error FROM movies WHERE digest=?', (digest,)).fetchone()
+                if row['error']:
+                    continue
+                if not any(location[0] in base_pool.sources and base_pool.permits(*location) for location in case.db.execute(
+                        'SELECT source_id,offset,size FROM atoms WHERE movie_digest=?', (digest,))):
+                    continue
+                anchor = first_anchor(parse_movie(row['data']))
+                if anchor is not None:
+                    profiles.add(anchor)
+            origins.prepare(profiles)
         for (digest,) in pending.execute('SELECT digest FROM selected ORDER BY digest'):
             row = case.db.execute('''SELECT m.*,r.status AS old_status,r.detail AS old_detail FROM movies m
                   LEFT JOIN jobs r ON r.kind='ordinary' AND r.key=m.digest WHERE m.digest=?''', (digest,)).fetchone()
@@ -1390,5 +1572,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                     fallback.add(digest)
             if fallback:
                 deep_search(case, fallback, base_pool, tools, opt, run_key, incomplete=incomplete)
+        for sid in base_pool.sources:
+            base_pool.check(sid)
         jobs_task.heartbeat(processed_movies=processed)
     case.event('recovery_complete', {'run_key': run_key, 'processed_movies': processed})

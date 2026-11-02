@@ -57,8 +57,8 @@ class SharedDiscoveryTests(unittest.TestCase):
                         patch.object(engine, 'whole_payload', return_value=('unresolved', [], False)), \
                         patch.object(ReaderPool, 'iter_blocks', counted):
                     engine.recover(case, engine.Options(deep=True, reconstruct_only=True, include_recovered=True))
-                # One shared discovery per searched tier, never one per metadata batch.
-                self.assertEqual(len(visited), 2)
+                # Base-scoped discovery is reused across tiers and metadata batches.
+                self.assertEqual(len(visited), 1)
                 jobs = list(case.get_jobs('ordinary'))
                 self.assertEqual(len(jobs), len(targets))
                 self.assertTrue(all(job['status'] == 'reconstructed' for job in jobs))

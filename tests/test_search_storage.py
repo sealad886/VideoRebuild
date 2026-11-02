@@ -123,7 +123,12 @@ class SearchStorageTests(unittest.TestCase):
                     engine.recover(case, engine.Options(deep=True, reconstruct_only=True, max_groups=1))
                 self.assertGreaterEqual(len(paths), 5)
                 self.assertTrue(all(path.parent.parent == case.root / 'work' for path in paths))
-                self.assertTrue(all(not path.parent.exists() for path in paths))
+                ephemeral = [path for path in paths if path.parent.name.startswith('videorebuild-search-')]
+                durable = [path for path in paths if path.parent.name == 'structural-index']
+                self.assertTrue(ephemeral)
+                self.assertTrue(durable)
+                self.assertTrue(all(not path.parent.exists() for path in ephemeral))
+                self.assertTrue(all(path.is_file() for path in durable))
                 self.assertEqual(len(list(case.get_jobs('ordinary'))), len(targets))
 
 
