@@ -49,7 +49,7 @@ videorebuild recover --case /healthy/case --deep --reconstruct-only
 videorebuild report --case /healthy/case
 ```
 
-Re-run the recovery command after interruption. Completed source scans and reusable search coverage remain in the case. Add `--retry` to revisit nonmatched results under unchanged settings. Changes to the matching revision or search policy cause affected decisions to be re-evaluated while retaining indexed evidence and published media. Recovery appends to `CASE/run.log`.
+Re-run the recovery command after interruption. Completed source scans, preliminary matching, deferred deep-search work and reusable search coverage remain in the case. The durable queue resumes unfinished deep jobs without repeating completed preliminary matching, including when `--retry` is present. Completed deep jobs are retained across an interrupted pass; an unfinished deep job may be repeated. After a fully completed pass, `--retry` revisits nonmatched results, reusing completed preliminary work for deferred jobs. Changes to the matching revision or search policy cause affected decisions to be re-evaluated while retaining indexed evidence and published media. Recovery appends to `CASE/run.log`.
 
 ## Terminal interface
 
