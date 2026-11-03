@@ -250,6 +250,85 @@ class TerminalInterfaceTests(unittest.TestCase):
         self.assertNotIn('\x1b', app.screen.lines[4])
         self.assertNotIn('\n', app.screen.lines[4])
 
+    def progress_snapshot(self, **changes):
+        observed = {'case': '/case', 'error': None, 'busy': True,
+                    'jobs': {'ordinary/reconstructed': 12}, 'sources': 30,
+                    'free_bytes': 4096, 'log_lines': ['work continues'],
+                    'log_mtime': None, 'report_path': '/case/reports/index.html',
+                    'progress_note': 'Measured phase work; overall total unknown.',
+                    'progress': [{'label': 'Deep structural indexing', 'status': 'running',
+                                  'completed': 250, 'total': 1000, 'unit': 'bytes',
+                                  'elapsed_seconds': 5.0, 'fraction': 0.25,
+                                  'eta_seconds': 15.0, 'eta_basis': 'phase_average',
+                                  'historical': False, 'stale': False}]}
+        observed.update(changes)
+        return observed
+
+    def test_watch_shows_measured_phase_fraction_and_estimate_scope(self):
+        app = self.app()
+        app.draw_watch(self.progress_snapshot())
+        text = '\n'.join(app.screen.lines.values())
+        for expected in ('Deep structural indexing', '250/1,000 bytes', '25.0%', '#',
+                         'running', 'phase-average', 'overall total unknown'):
+            self.assertIn(expected, text)
+        self.assertNotIn('100.0%', text)
+        self.assertNotIn('Recovery complete', text)
+
+    def test_watch_unknown_total_does_not_invent_fraction(self):
+        observed = self.progress_snapshot()
+        observed['progress'][0].update(total=None, fraction=None, eta_seconds=None)
+        app = self.app()
+        app.draw_watch(observed)
+        text = '\n'.join(app.screen.lines.values())
+        self.assertIn('250/? bytes', text)
+        self.assertIn('total unknown', text)
+        self.assertIn('???', text)
+        self.assertNotIn('%', text)
+        self.assertNotIn('ETA', text)
+
+    def test_watch_interrupted_and_historical_progress_keeps_recorded_fraction(self):
+        observed = self.progress_snapshot(busy=False)
+        observed['progress'][0].update(status='interrupted', historical=True, stale=True)
+        app = self.app()
+        app.draw_watch(observed)
+        text = '\n'.join(app.screen.lines.values())
+        for expected in ('25.0%', 'interrupted', 'historical', 'STALE', 'completion unverified'):
+            self.assertIn(expected, text)
+        self.assertNotIn('Phase ETA', text)
+        self.assertNotIn('100.0%', text)
+
+    def test_incomplete_fraction_never_rounds_up_to_complete(self):
+        progress = self.progress_snapshot()['progress'][0]
+        progress.update(completed=99999, total=100000, fraction=0.99999)
+        text = '\n'.join(tui.phase_lines(progress, 77))
+        self.assertIn('99.9%', text)
+        self.assertNotIn('100.0%', text)
+        self.assertIn('-', text)
+
+    def test_watch_no_progress_preference_hides_bars(self):
+        app = self.app()
+        app.no_progress = True
+        app.draw_watch(self.progress_snapshot())
+        text = '\n'.join(app.screen.lines.values())
+        self.assertNotIn('Deep structural indexing', text)
+        self.assertNotIn('25.0%', text)
+        self.assertIn('Recorded jobs', text)
+
+    def test_watch_progress_fits_resize_without_overwriting_footer(self):
+        observed = self.progress_snapshot()
+        observed['progress'] *= 3
+        for size in ((24, 80), (18, 40), (8, 20)):
+            with self.subTest(size=size):
+                app = self.app(size=size)
+                app.draw_watch(observed)
+                height, width = size
+                self.assertTrue(all(len(text) <= width - 3 for text in app.screen.lines.values()))
+                self.assertIn('R:', app.screen.lines[height - 2])
+                self.assertTrue(all(row < height - 1 for row in app.screen.lines))
+                if height >= 18:
+                    self.assertIn('writer lock held', app.screen.lines[5])
+                    self.assertIn('25.0%', '\n'.join(app.screen.lines.values()))
+
     def test_small_terminal_can_exit(self):
         self.assertEqual(self.app(['q'], size=(8, 20)).loop(), 0)
 

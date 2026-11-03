@@ -24,11 +24,12 @@ scope, and supported Python/platform requirements. Assess the cumulative
 behavioral diff from the last published baseline; commit labels alone do not
 determine compatibility.
 
-The verified current baseline is GitHub release `v0.4.0`, published
-2 November 2026 at commit `ee46785efa8df7adab7fc19bc7e755e785f70ef1`.
-The next pending version is 0.5.0: the discovery-worker option and durable
-structural-index behavior add to the pre-1.0 consumer contract. See
-`RELEASE_NOTES_0.5.0.md`. Publication requires the checks and authorization below.
+The verified current baseline is GitHub release `v0.5.0`, published
+2 November 2026 at commit `e257562a0194cec863bb89eb74d76a2c0847f844`.
+The next pending version is 0.6.0: measured phase progress bars extend the TUI
+under the pre-1.0 feature policy. See `RELEASE_NOTES_0.6.0.md`. This preparation
+does not include the separately developed Rust migration. Publication requires
+the checks and authorization below.
 
 While below 1.0, features and intentional breaking changes increment the minor
 component; compatible fixes increment patch. Compute a pending version from

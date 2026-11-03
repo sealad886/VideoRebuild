@@ -16,6 +16,39 @@ def clean_text(value: object) -> str:
     return ''.join(c if c.isprintable() else ' ' for c in str(value))
 
 
+def phase_lines(progress: dict, width: int) -> list[str]:
+    """Render measured phase work without implying total recovery completion."""
+    completed, total = progress['completed'], progress['total']
+    fraction = progress.get('fraction')
+    counts = f'{completed:,}' + (f'/{total:,}' if total is not None else '/?')
+    counts += f' {clean_text(progress["unit"])}'
+    if fraction is None:
+        measure = 'total unknown' if total is None else 'percentage unavailable'
+    else:
+        # Rounding a still-incomplete fraction to 100% would misreport completion.
+        percentage = min(99.9, fraction * 100) if fraction < 1 else 100.0
+        measure = f'{percentage:.1f}%'
+    state = clean_text(progress['status'])
+    if progress.get('historical'):
+        state = 'historical; ' + state
+    if progress.get('stale'):
+        state = 'STALE; ' + state
+    cells = max(3, min(24, width - len(state) - 5))
+    if fraction is None:
+        bar = '[' + '?' * cells + ']'
+    else:
+        filled = min(cells, int(fraction * cells))
+        bar = '[' + '#' * filled + '-' * (cells - filled) + ']'
+    lines = [f'Phase: {clean_text(progress["label"])}']
+    lines.extend(textwrap.wrap(f'{counts} ({measure})', max(1, width)))
+    lines.append(f'{state} {bar}')
+    eta = progress.get('eta_seconds')
+    if (eta is not None and progress.get('eta_basis') == 'phase_average'
+            and not progress.get('historical') and not progress.get('stale')):
+        lines.append(f'Phase ETA ~{eta:.0f}s (estimate from phase-average byte rate)')
+    return lines
+
+
 class Application:
     def __init__(self, screen, terminal, settings: Settings, *, watch: bool = False,
                  no_progress: bool = False):
@@ -258,29 +291,55 @@ class Application:
             self.message = clean_text(error)
 
     def draw_watch(self, observed: dict) -> None:
-        height, _ = self.frame('Watch case - read-only; no process control',
-                               'R: refresh  Q/Esc: return to menu; recovery keeps running')
-        self.write(4, f'Case: {observed["case"]}')
+        height, width = self.frame('Watch case - read-only; no process control',
+                                   'R: refresh  Q/Esc: menu; recovery keeps running')
         busy = observed['busy']
         lock = ('writer lock held' if busy is True else
                 'no writer lock held; completion unverified' if busy is False else 'writer lock unknown')
-        self.write(5, f'Status: {lock}')
         free = observed['free_bytes']
         storage = f'{free / 1024**3:.1f} GiB free' if free is not None else 'free space unavailable'
         sources = observed['sources']
-        self.write(6, f'Sources: {sources if sources is not None else "unknown"} | Output storage: {storage}')
+        content = [f'Case: {observed["case"]}', f'Status: {lock}',
+                   f'Sources: {sources if sources is not None else "unknown"} | Output: {storage}']
+        if observed['error']:
+            content.append(f'Observation error: {observed["error"]}')
+        if not self.no_progress:
+            content.append(observed.get('progress_note') or
+                           'Phase work only; overall recovery progress is unknown.')
+            progress = observed.get('progress', [])
+            # Keep the footer, writer state and at least one log line visible.
+            capacity = max(0, height - 7)
+            reserved = 5 if capacity >= 15 else 4
+            available = max(0, capacity - len(content) - reserved)
+            shown = 0
+            for item in progress[:2]:
+                lines = phase_lines(item, max(1, width - 3))
+                if len(lines) > available and lines[-1].startswith('Phase ETA '):
+                    lines = lines[:-1]
+                if len(lines) > available:
+                    break
+                content.extend(lines)
+                available -= len(lines)
+                shown += 1
+            if not progress:
+                content.append('Phase progress unavailable; no measurable work reported.')
+            elif not shown:
+                content.append('Enlarge terminal to show measured phase progress.')
         counts = ', '.join(f'{clean_text(status)}={count:,}' for status, count in observed['jobs'].items())
-        self.write(7, f'Jobs: {counts or "no job counts available"}')
-        self.write(8, f'Report: {observed["report_path"]}')
+        content.append(f'Recorded jobs (all runs): {counts or "unavailable"}')
         modified = observed['log_mtime']
         age = f'{max(0, time.time() - modified):.0f}s ago' if modified is not None else 'unavailable'
-        self.write(9, f'Latest log update: {age}; observations do not establish completion.')
-        if observed['error']:
-            self.write(10, observed['error'])
-        self.write(11, 'Recent run.log:')
-        lines = observed['log_lines'][-max(0, height - 16):] if height > 16 else []
-        for row, line in enumerate(lines, 12):
+        content.append(f'Latest log update: {age}; completion unverified.')
+        capacity = max(0, height - 7)
+        if capacity - len(content) >= 3:
+            content.append(f'Report: {observed["report_path"]}')
+        content.append('Recent run.log:')
+        for row, line in enumerate(content[:capacity], 4):
             self.write(row, line)
+        remaining = max(0, capacity - len(content))
+        if remaining:
+            for row, line in enumerate(observed['log_lines'][-remaining:], 4 + len(content)):
+                self.write(row, line)
         self.screen.refresh()
 
     def loop(self) -> int:
