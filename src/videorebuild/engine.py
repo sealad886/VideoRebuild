@@ -609,6 +609,21 @@ def _backfill_candidate_manifest(case, candidate):
     return updated
 
 
+def _verify_job_artifacts(case, detail):
+    """A scheduling receipt never replaces saved candidate/publication integrity."""
+    candidates = detail.get('candidates', [])
+    for candidate in candidates:
+        path = case.root / candidate['path']
+        if not path.is_file() or path.is_symlink() or file_sha256(path) != candidate['sha256']:
+            raise SafetyError(f'Previously validated candidate changed or disappeared: {path}')
+        _backfill_candidate_manifest(case, candidate)
+    for output in detail.get('outputs', []):
+        path = case.root / output
+        if (not path.is_file() or path.is_symlink() or len(candidates) != 1 or
+                file_sha256(path) != candidates[0]['sha256']):
+            raise SafetyError(f'Published output changed or disappeared: {path}')
+
+
 def _backfill_ordinary_publications(case):
     for job in case.get_jobs('ordinary'):
         detail = job['detail']
@@ -1614,7 +1629,6 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
             if saved is None and opt.deep:
                 saved = resume.adopt(digest, row['old_status'], old_detail)
             if saved is not None:
-                pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
                 # Successful publications still pass the existing fresh hash
                 # gates below. A resume receipt never substitutes for integrity.
                 successful = row['old_status'] in {'matched', 'reconstructed'}
@@ -1625,6 +1639,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                             break
                         processed += 1
                         resumed_preliminary += 1
+                        pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
                         if saved['whole_limited']:
                             incomplete.add(digest)
                         if saved['owner']:
@@ -1635,25 +1650,14 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                             deferred.add(digest)
                         continue
                     if saved['state'] != 'preliminary_retry':
+                        _verify_job_artifacts(case, old_detail)
+                        pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
                         resumed_preliminary += 1
                         continue
             if old_detail.get('run_key') == run_key:
                 if (not (saved and saved['state'] == 'preliminary_retry') and
                         row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] in {'matched', 'reconstructed'})):
-                    candidates = old_detail.get('candidates', [])
-                    for c in candidates:
-                        p = case.root / c['path']
-                        if not p.is_file() or p.is_symlink() or file_sha256(p) != c['sha256']:
-                            raise SafetyError(f'Previously validated candidate changed or disappeared: {p}')
-                        _backfill_candidate_manifest(case, c)
-                    for output in old_detail.get('outputs', []):
-                        p = case.root / output
-                        if (not p.is_file() or p.is_symlink() or len(candidates) != 1 or
-                                file_sha256(p) != candidates[0]['sha256']):
-                            raise SafetyError(f'Published output changed or disappeared: {p}')
-                        # Accepted publication manifests were backfilled before
-                        # tier construction. Keep that verified evidence stable
-                        # while other jobs use its cached identity in this pass.
+                    _verify_job_artifacts(case, old_detail)
                     if row['old_status'] in {'matched', 'reconstructed'}:
                         resume.verified(digest)
                     continue
@@ -1695,6 +1699,10 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
             # Recovered references are eligible only after a completed first-tier miss.
             fallback = _DeferredMovies(case, pending, resume, tier=2)
             for (digest,) in pending.execute('SELECT digest FROM visited_movies ORDER BY digest'):
+                first_tier = resume.get(digest)
+                completed_stage = 'deep_complete' if opt.deep else 'preliminary_complete'
+                if first_tier is None or first_tier['state'] != completed_stage:
+                    continue
                 job = case.job('ordinary', digest)
                 if not job or job['detail'].get('run_key') != run_key or job['detail'].get('candidates'):
                     continue

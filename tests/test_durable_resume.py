@@ -1,13 +1,15 @@
 """Durable recovery resumes skip finished stages without losing pending work."""
 from collections import Counter
+import hashlib
 import json
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from videorebuild import engine
-from videorebuild.storage import Case, scan_logical
+from videorebuild.storage import Case, SafetyError, scan_logical
 from videorebuild.ranges import AllocationScope
 from test_deep_witnesses import structural_movie
 import test_ordinary_tiers as tier_cases
@@ -360,6 +362,87 @@ class DurableResumeTests(unittest.TestCase):
                 self.assertEqual(job['detail']['search_tiers']['searched'], [1, 2])
                 self.assertTrue(job['detail']['outputs'])
             self.assertEqual(scopes, [[1, 2]])
+
+    def test_completed_ambiguous_resume_rechecks_canonical_candidate_integrity(self):
+        for change in ('missing', 'changed_bytes', 'symlink'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                movie = structural_movie([1000], [8])
+                source = root / 'ambiguous.bin'
+                token = b'\0\0\0\x04\x65ABC'
+                other = b'\0\0\0\x04\x65BBB'
+                source.write_bytes(movie.data + bytes(992 - len(movie.data)) +
+                                   struct.pack('>I4s', 16, b'mdat') + token +
+                                   struct.pack('>I4s', 16, b'mdat') + other)
+                original = source.read_bytes()
+                path = root / 'case'
+                options = engine.Options(reconstruct_only=True)
+                with Case(path) as case:
+                    scan_logical(case, case.register_source(source))
+                    engine.recover(case, options)
+                    job = case.job('ordinary', movie.digest)
+                    self.assertEqual(job['status'], 'ambiguous')
+                    self.assertEqual(len(job['detail']['candidates']), 2)
+                    self.assertFalse(job['detail']['outputs'])
+                    candidate = case.root / job['detail']['candidates'][0]['path']
+                if change == 'missing':
+                    candidate.unlink()
+                elif change == 'changed_bytes':
+                    changed = bytearray(candidate.read_bytes())
+                    changed[-1] ^= 1
+                    candidate.write_bytes(changed)
+                else:
+                    substitute = root / 'substitute.mp4'
+                    substitute.write_bytes(candidate.read_bytes())
+                    candidate.unlink()
+                    candidate.symlink_to(substitute)
+                with Case(path) as resumed:
+                    with self.assertRaises(SafetyError):
+                        engine.recover(resumed, options)
+                self.assertEqual(source.read_bytes(), original)
+
+    def test_limit_excluded_pending_deep_job_cannot_enter_recovered_fallback(self):
+        alternative = b'\0\0\0\x04\x65BBB'
+        with tempfile.TemporaryDirectory() as directory:
+            case, movie, source = tier_cases.OrdinaryTierTests.fixture(
+                self, Path(directory), tail=b'Z' * 16 + alternative)
+            original_source = source.read_bytes()
+            options = engine.Options(deep=True, reconstruct_only=True, include_recovered=True)
+            with patch.object(engine, 'deep_search', side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    engine.recover(case, options)
+            self.assertEqual(case.job('ordinary', movie.digest)['status'], 'awaiting_deep')
+            path = case.root
+            case.__exit__(None, None, None)
+            scopes = []
+            original_whole = engine.whole_payload
+
+            def tracked_whole(case, movie, *args):
+                scopes.append(list(engine._search_scope(case)['searched']))
+                return original_whole(case, movie, *args)
+
+            with Case(path) as resumed, patch.object(engine, 'whole_payload', side_effect=tracked_whole), \
+                    patch.object(engine, 'deep_search', wraps=engine.deep_search) as deep:
+                engine.recover(resumed, options, limit=0)
+                self.assertEqual(deep.call_count, 0)
+                self.assertNotIn([1, 2], scopes)
+                pending = resumed.job('ordinary', movie.digest)
+                self.assertEqual(pending['status'], 'awaiting_deep')
+                self.assertFalse(pending['detail']['outputs'])
+                self.assertEqual(pending['detail']['search_tiers']['searched'], [1])
+                self.assertEqual(resumed.db.execute(
+                    'SELECT state FROM ordinary_resume WHERE run_key=? AND tier=1 AND digest=?',
+                    (pending['detail']['run_key'], movie.digest)).fetchone()[0], 'deep_pending')
+            with Case(path) as resumed, patch.object(engine, 'deep_search', wraps=engine.deep_search) as deep:
+                engine.recover(resumed, options)
+                self.assertGreater(deep.call_count, 0)
+                completed = resumed.job('ordinary', movie.digest)
+                self.assertEqual(completed['status'], 'reconstructed')
+                self.assertEqual(completed['detail']['search_tiers']['searched'], [1])
+                self.assertEqual(len(completed['detail']['outputs']), 1)
+                self.assertEqual(completed['detail']['candidates'][0]['media_sha256'],
+                                 hashlib.sha256(alternative).hexdigest())
+            self.assertEqual(source.read_bytes(), original_source)
 
 
 if __name__ == '__main__':
