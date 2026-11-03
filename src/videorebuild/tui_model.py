@@ -11,6 +11,7 @@ import sqlite3
 import time
 
 from .storage import SCHEMA
+from .tui_progress import progress_observations
 
 
 @dataclass
@@ -92,6 +93,8 @@ def _tail(path: Path, lines: int = 12) -> tuple[list[str], float | None]:
             stream.seek(start)
             data = stream.read(65536)
         values = data.decode('utf-8', errors='replace').splitlines()
+        if data and not data.endswith(b'\n') and values:
+            values.pop()  # A writer may be partway through its newest record.
         if start and values:
             values.pop(0)  # The first line may start inside a UTF-8 character.
         return [_display(value) for value in values[-lines:]], info.st_mtime
@@ -109,8 +112,12 @@ def snapshot(case: str | Path) -> dict:
     root = Path(case).expanduser().absolute()
     result = {'case': str(root), 'error': None, 'busy': None, 'jobs': {},
               'sources': None, 'free_bytes': None, 'log_lines': [],
-              'log_mtime': None, 'report_path': str(root / 'reports' / 'index.html')}
+              'log_mtime': None, 'progress': [],
+              'progress_note': 'Phase work only; overall recovery total and ETA are unknown.',
+              'report_path': str(root / 'reports' / 'index.html')}
     errors = []
+    progress_lines = []
+    run_started = None
     ancestor = root
     while not ancestor.exists() and ancestor != ancestor.parent:
         ancestor = ancestor.parent
@@ -125,7 +132,8 @@ def snapshot(case: str | Path) -> dict:
         result['error'] = 'Case folder is missing, is not a directory, or is a symlink'
         return result
     try:
-        result['log_lines'], result['log_mtime'] = _tail(root / 'run.log')
+        progress_lines, result['log_mtime'] = _tail(root / 'run.log', lines=4096)
+        result['log_lines'] = progress_lines[-12:]
     except (OSError, ValueError) as error:
         errors.append(str(error))
     lock = None
@@ -179,6 +187,11 @@ def snapshot(case: str | Path) -> dict:
             result['jobs'] = {f'{kind}/{status}': count for kind, status, count in
                               connection.execute('SELECT kind,status,COUNT(*) FROM jobs GROUP BY kind,status')}
             result['sources'] = connection.execute('SELECT COUNT(*) FROM sources WHERE complete=1').fetchone()[0]
+            # Bounded reverse-id walk; never scan the attempt history for progress.
+            for created, kind in connection.execute('SELECT created,kind FROM events ORDER BY id DESC LIMIT 128'):
+                if kind == 'recovery_started':
+                    run_started = created
+                    break
     except (OSError, ValueError, sqlite3.Error) as error:
         errors.append(str(error))
     finally:
@@ -186,5 +199,8 @@ def snapshot(case: str | Path) -> dict:
             if locked:
                 fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
+    result['progress'], result['progress_note'] = progress_observations(
+        progress_lines, busy=result['busy'], now=time.time(),
+        run_started=run_started)
     result['error'] = '; '.join(errors) if errors else None
     return result

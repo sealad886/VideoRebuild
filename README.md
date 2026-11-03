@@ -78,6 +78,10 @@ Directories appear before files. On macOS, mounted volumes are under `/Volumes`.
 
 A running operation uses the same CLI, case lock, progress reporting and interruption handling as a direct command. The **watch** screen reads logs, counts, lock state and available output space. It refreshes automatically, and closing it leaves the recovery process running. An allocation map applies to **recover existing index**; the menu rejects it for scan actions.
 
+Watch progress bars show **work reported for a named phase**, with its actual count and unit. A byte-scan percentage describes bytes examined in that scan; a per-file hashing percentage describes that file. Neither is an overall recovery percentage. Phases without a known positive total show an indeterminate indicator and the observed count. Historical job totals are displayed separately, since jobs can be retried or re-evaluated.
+
+Interrupted, failed and limited phases retain their observed progress. A finished phase does not establish that recovery has completed or that every recording was recovered. Old observations and observations without a confirmed writer are labelled accordingly. Any displayed ETA is an estimate for that byte phase based on its average rate; it is withheld for stale or historical observations. `--no-progress` hides the watch progress bars.
+
 ## Input evidence and permitted ranges
 
 You can combine recovered files with a regular raw image and optional PhotoRec/ddrescue evidence:

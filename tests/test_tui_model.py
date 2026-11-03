@@ -1,6 +1,7 @@
 """The TUI must preserve canonical argv and observe cases without creating state."""
 from pathlib import Path
 import sqlite3
+from datetime import datetime, timedelta
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -148,6 +149,40 @@ class TuiSnapshotTests(unittest.TestCase):
         alias = self.root / 'alias'
         alias.symlink_to(self.case)
         self.assertIsNotNone(snapshot(alias)['error'])
+
+    def test_progress_uses_bounded_history_beyond_visible_log_lines(self):
+        with Case(self.case) as case:
+            stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+            (self.case / 'run.log').write_text(
+                f'{stamp} INFO Progress: Deep structural index | running | '
+                '25/100 bytes (25.0%) | elapsed 10.0s\n' +
+                '\n'.join(f'{stamp} INFO other detail {n}' for n in range(20)) + '\n')
+            observed = snapshot(self.case)
+            self.assertEqual(len(observed['log_lines']), 12)
+            self.assertEqual(observed['progress'][0]['fraction'], .25)
+            self.assertEqual(observed['progress'][0]['eta_seconds'], 30)
+            self.assertIs(observed['progress'][0]['historical'], False)
+        idle = snapshot(self.case)
+        self.assertIs(idle['progress'][0]['historical'], True)
+        self.assertIsNone(idle['progress'][0]['eta_seconds'])
+
+    def test_new_recovery_event_discards_previous_run_progress(self):
+        with Case(self.case) as case:
+            old = (datetime.now() - timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+            (self.case / 'run.log').write_text(
+                f'{old} INFO Progress: Old scan | running | 90/100 bytes | elapsed 10s\n')
+            case.event('recovery_started', {'run_key': 'new'})
+            self.assertEqual(snapshot(self.case)['progress'], [])
+
+    def test_incomplete_final_log_record_cannot_change_progress(self):
+        with Case(self.case):
+            stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+            (self.case / 'run.log').write_text(
+                f'{stamp} INFO Progress: Scan | running | 25/100 bytes | elapsed 10s\n'
+                f'{stamp} INFO Progress: Scan | finished | 100/100 bytes | elapsed 11s')
+            observed = snapshot(self.case)
+            self.assertEqual(observed['progress'][0]['completed'], 25)
+            self.assertEqual(observed['progress'][0]['status'], 'running')
 
     def test_attempt_table_is_never_read(self):
         with Case(self.case) as case:
