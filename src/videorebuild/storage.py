@@ -129,6 +129,13 @@ def initialize_database(db: sqlite3.Connection) -> None:
                     kind TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL,
                     detail TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(kind,key));
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(kind,status);
+                CREATE TABLE IF NOT EXISTS ordinary_resume_runs (
+                    run_key TEXT PRIMARY KEY, complete INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS ordinary_resume (
+                    run_key TEXT NOT NULL, tier INTEGER NOT NULL, digest TEXT NOT NULL,
+                    state TEXT NOT NULL, whole_limited INTEGER NOT NULL,
+                    owner INTEGER NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(run_key,tier,digest)) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY,value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS attempts (
                     id INTEGER PRIMARY KEY, movie_digest TEXT NOT NULL,
@@ -232,11 +239,20 @@ class Case:
                         (time.time(), kind, json_text(detail)))
         self.db.commit()
 
-    def result(self, key: str, status: str, detail: dict, *, kind: str = 'ordinary') -> None:
-        self.db.execute('''INSERT INTO jobs VALUES(?,?,?,?,?) ON CONFLICT(kind,key)
-                           DO UPDATE SET status=excluded.status,detail=excluded.detail,updated=excluded.updated''',
-                        (kind, str(key), status, json_text(detail), time.time()))
-        self.db.commit()
+    def result(self, key: str, status: str, detail: dict, *, kind: str = 'ordinary',
+               checkpoint: dict | None = None) -> None:
+        # A finished result and its deferred/completed receipt are one durable
+        # transition. An interruption can repeat unfinished work, never lose it.
+        with self.db:
+            self.db.execute('''INSERT INTO jobs VALUES(?,?,?,?,?) ON CONFLICT(kind,key)
+                               DO UPDATE SET status=excluded.status,detail=excluded.detail,updated=excluded.updated''',
+                            (kind, str(key), status, json_text(detail), time.time()))
+            if checkpoint is not None:
+                self.db.execute('''INSERT INTO ordinary_resume VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(run_key,tier,digest) DO UPDATE SET state=excluded.state,
+                    whole_limited=excluded.whole_limited,owner=excluded.owner,updated=excluded.updated''',
+                    (checkpoint['run_key'], checkpoint['tier'], str(key), checkpoint['state'],
+                     int(checkpoint['whole_limited']), int(checkpoint['owner']), time.time()))
 
     def job(self, kind: str, key: str) -> dict | None:
         row = self.db.execute('SELECT * FROM jobs WHERE kind=? AND key=?', (kind,str(key))).fetchone()

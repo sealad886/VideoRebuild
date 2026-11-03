@@ -26,6 +26,7 @@ import shutil
 import struct
 import sqlite3
 import tempfile
+import time
 from typing import Iterable
 
 from . import __version__, nal_search
@@ -340,7 +341,13 @@ def _scoped_result(case, key, status, detail):
         detail['historical_outputs'] = [entry['path'] for entry in retained]
     if _search_scope(case) is not None:
         detail['search_tiers'] = dict(_search_scope(case))
-    case.result(key, status, detail)
+    resume = getattr(case, '_ordinary_resume', None)
+    checkpoint = resume.result_checkpoint(key, status, detail) if resume is not None else None
+    if checkpoint is None:
+        case.result(key, status, detail)
+    else:
+        case.result(key, status, detail, checkpoint=checkpoint)
+        resume.committed(checkpoint)
 
 
 def _refresh_tiers(case, owner=None):
@@ -600,6 +607,21 @@ def _backfill_candidate_manifest(case, candidate):
     if updated != evidence:
         write_json(sidecar, updated)
     return updated
+
+
+def _verify_job_artifacts(case, detail):
+    """A scheduling receipt never replaces saved candidate/publication integrity."""
+    candidates = detail.get('candidates', [])
+    for candidate in candidates:
+        path = case.root / candidate['path']
+        if not path.is_file() or path.is_symlink() or file_sha256(path) != candidate['sha256']:
+            raise SafetyError(f'Previously validated candidate changed or disappeared: {path}')
+        _backfill_candidate_manifest(case, candidate)
+    for output in detail.get('outputs', []):
+        path = case.root / output
+        if (not path.is_file() or path.is_symlink() or len(candidates) != 1 or
+                file_sha256(path) != candidates[0]['sha256']):
+            raise SafetyError(f'Published output changed or disappeared: {path}')
 
 
 def _backfill_ordinary_publications(case):
@@ -966,22 +988,138 @@ def _anchor_locations(pool, maximum_sample, wanted, opt, state, task, *, source_
             pool.check(sid)
 
 
+class _OrdinaryResume:
+    """Durable stage receipts; selected metadata and byte-search tables stay bounded."""
+    def __init__(self, case, run_key, deep, retry):
+        self.case, self.run_key, self.deep = case, run_key, deep
+        row = case.db.execute('SELECT complete FROM ordinary_resume_runs WHERE run_key=?', (run_key,)).fetchone()
+        self.retry_completed = bool(retry and row and row[0])
+        self.tier, self.stage, self.owner = 1, None, False
+        if self.retry_completed:
+            # Persist the entire explicit retry generation before any limit or
+            # interruption. A later invocation resumes its remaining members.
+            case.db.execute('''UPDATE ordinary_resume SET state=CASE state
+                WHEN 'deep_complete' THEN 'deep_pending'
+                WHEN 'preliminary_complete' THEN 'preliminary_retry' ELSE state END
+                WHERE run_key=? AND EXISTS(SELECT 1 FROM jobs j WHERE j.kind='ordinary'
+                    AND j.key=ordinary_resume.digest AND j.status NOT IN ('matched','reconstructed')
+                    AND json_extract(j.detail,'$.run_key')=?)''', (run_key, run_key))
+        self._counts = dict(case.db.execute('SELECT state,count(*) FROM ordinary_resume WHERE run_key=? AND tier=1 GROUP BY state', (run_key,)).fetchall())
+        case.db.execute('INSERT INTO ordinary_resume_runs VALUES(?,0) ON CONFLICT(run_key) DO UPDATE SET complete=0', (run_key,))
+        case.db.commit()
+
+    def __enter__(self):
+        self.case._ordinary_resume = self
+        return self
+
+    def __exit__(self, *_):
+        del self.case._ordinary_resume
+
+    def context(self, tier, stage, owner=False):
+        self.tier, self.stage, self.owner = tier, stage, owner
+
+    def get(self, digest, tier=1):
+        row = self.case.db.execute('SELECT * FROM ordinary_resume WHERE run_key=? AND tier=? AND digest=?',
+                                   (self.run_key, tier, digest)).fetchone()
+        return dict(row) if row else None
+
+    def result_checkpoint(self, digest, status, detail):
+        if self.stage is None or detail.get('run_key') != self.run_key:
+            return None
+        previous = self.get(digest, self.tier)
+        limited = bool(detail.get('search_limited'))
+        if self.stage == 'deep':
+            state = 'deep_complete'
+            limited = bool(previous and previous['whole_limited'])
+        else:
+            state = ('deep_pending' if self.deep and status in {'awaiting_deep', 'unresolved', 'search_limited'}
+                     and not detail.get('candidates') and detail.get('reason') != 'output_size_budget'
+                     else 'preliminary_complete')
+        return dict(run_key=self.run_key, tier=self.tier, state=state,
+                    whole_limited=limited, owner=self.owner,
+                    previous_state=previous['state'] if previous else None)
+
+    def committed(self, checkpoint):
+        if checkpoint['tier'] != 1:
+            return
+        before, after = checkpoint.get('previous_state'), checkpoint['state']
+        if before is not None:
+            self._counts[before] = self._counts.get(before, 0)-1
+        self._counts[after] = self._counts.get(after, 0)+1
+
+    def adopt(self, digest, status, detail):
+        # The old durable awaiting_deep result itself proves preliminary work
+        # returned. Import only that exact evidence, not arbitrary failed jobs.
+        if (status != 'awaiting_deep' or detail.get('run_key') != self.run_key or
+                detail.get('stage') != 'whole_payload' or detail.get('candidates') or
+                detail.get('reason') != 'whole-payload search finished; deep pass not yet completed'):
+            return None
+        tier = 2 if detail.get('search_tiers', {}).get('searched') == [1, 2] else 1
+        checkpoint = dict(run_key=self.run_key, tier=tier, state='deep_pending',
+                          whole_limited=bool(detail.get('search_limited')),
+                          owner=bool(detail.get('outputs') or detail.get('historical_publications')))
+        if tier == 2:
+            # Entering fallback proves the first tier finished without a
+            # candidate or an unsearched limit. Import both receipts in the
+            # same transaction as the retained waiting result.
+            self.case.db.execute('INSERT OR IGNORE INTO ordinary_resume VALUES(?,?,?,?,?,?,?)',
+                                 (self.run_key, 1, digest, 'deep_complete', 0,
+                                  int(checkpoint['owner']), time.time()))
+        self.case.result(digest, status, detail, checkpoint=checkpoint)
+        self.committed(checkpoint)
+        if tier == 2:
+            self.committed(dict(tier=1, state='deep_complete'))
+        return self.get(digest)
+
+    def discard(self, digest):
+        previous = self.get(digest)
+        self.case.db.execute('DELETE FROM ordinary_resume WHERE run_key=? AND digest=?', (self.run_key, digest))
+        self.case.db.commit()
+        if previous:
+            self._counts[previous['state']] -= 1
+
+    def verified(self, digest):
+        if self.get(digest) is not None:
+            return
+        self.case.db.execute('INSERT INTO ordinary_resume VALUES(?,?,?,?,?,?,?)',
+                             (self.run_key, 1, digest, 'preliminary_complete', 0, 1, time.time()))
+        self.case.db.commit()
+        self.committed(dict(tier=1, state='preliminary_complete'))
+
+    def counts(self):
+        values = self._counts
+        return dict(preliminary_completed=sum(values.values()), deferred_pending=values.get('deep_pending', 0),
+                    deep_completed=values.get('deep_complete', 0))
+
+    def complete(self):
+        if self.case.db.execute("SELECT 1 FROM ordinary_resume WHERE run_key=? AND state IN ('deep_pending','preliminary_retry') LIMIT 1",
+                                (self.run_key,)).fetchone() is not None:
+            return
+        self.case.db.execute('UPDATE ordinary_resume_runs SET complete=1 WHERE run_key=?', (self.run_key,))
+        self.case.db.commit()
+
+
 class _DeferredMovies:
     """Repeatable metadata stream backed by selected digests, not retained BLOBs."""
-    def __init__(self, case, store):
-        self.case, self.store = case, store
-        store.execute('CREATE TABLE deferred(digest TEXT PRIMARY KEY) WITHOUT ROWID')
+    def __init__(self, case, store, resume=None, tier=1):
+        self.case, self.store, self.resume, self.tier = case, store, resume, tier
+        self.table = 'deferred' if tier == 1 else 'deferred_fallback'
+        store.execute(f'CREATE TABLE {self.table}(digest TEXT PRIMARY KEY) WITHOUT ROWID')
 
     def add(self, digest):
-        self.store.execute('INSERT OR IGNORE INTO deferred VALUES(?)', (digest,))
+        self.store.execute(f'INSERT OR IGNORE INTO {self.table} VALUES(?)', (digest,))
 
     def __iter__(self):
-        for (digest,) in self.store.execute('SELECT digest FROM deferred ORDER BY digest'):
+        for (digest,) in self.store.execute(f'SELECT digest FROM {self.table} ORDER BY digest'):
+            # Each lookup finishes before callers commit a result. Completed
+            # members disappear from subsequent passes over this lazy stream.
+            if self.resume is not None and self.resume.get(digest, self.tier)['state'] != 'deep_pending':
+                continue
             row = self.case.db.execute('SELECT data FROM movies WHERE digest=?', (digest,)).fetchone()
             yield parse_movie(row[0])
 
     def __bool__(self):
-        return self.store.execute('SELECT 1 FROM deferred LIMIT 1').fetchone() is not None
+        return self.store.execute(f'SELECT 1 FROM {self.table} LIMIT 1').fetchone() is not None
 
 
 def _movie_batches(movies, max_groups):
@@ -1433,7 +1571,9 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                  'validation_revision': VALIDATION_REVISION})
     incomplete = set()
     processed = 0
-    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store(case) as pending, ExitStack() as indexed:
+    catalogue_complete = True
+    resumed_preliminary = 0
+    with phase('Ordinary catalogue jobs visited', unit='jobs') as jobs_task, ReaderPool(sources,physical_sources=case.physical_sources(), allocation_scope=allocation_scope) as pool, _search_store(case) as pending, ExitStack() as indexed, _OrdinaryResume(case, run_key, opt.deep, retry) as resume:
         # Snapshot only selected identities on disk, then load one metadata
         # BLOB at a time with a completed point query. Streaming the case SELECT
         # through attempt writes pins its WAL for the entire recovery.
@@ -1441,7 +1581,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
         pending.executemany('INSERT INTO selected VALUES(?)', case.db.execute('''SELECT m.digest FROM movies m
               WHERE EXISTS(SELECT 1 FROM atoms a JOIN sources s ON a.source_id=s.id
                            WHERE a.movie_digest=m.digest AND s.complete=1) ORDER BY m.digest'''))
-        deferred = _DeferredMovies(case, pending)
+        deferred = _DeferredMovies(case, pending, resume)
         for sid in sources:
             pool.check(sid)
         _backfill_ordinary_publications(case)
@@ -1478,29 +1618,55 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
             if not any(base_pool.permits(location['source_id'], location['offset'], location['size'])
                        for location in case.db.execute('SELECT source_id,offset,size FROM atoms WHERE movie_digest=?', (row['digest'],))):
                 continue
-            jobs_task.advance(processed_movies=processed)
+            jobs_task.advance(processed_movies=processed, resumed_preliminary=resumed_preliminary, **resume.counts())
             old_detail = json.loads(row['old_detail']) if row['old_detail'] else {}
+            saved = resume.get(digest)
+            if saved is not None and old_detail.get('run_key') != run_key:
+                # Jobs expose the latest result. Receipts from an older visit
+                # to this scope cannot certify a different scope's job row.
+                resume.discard(digest)
+                saved = None
+            if saved is None and opt.deep:
+                saved = resume.adopt(digest, row['old_status'], old_detail)
+            if saved is not None:
+                # Successful publications still pass the existing fresh hash
+                # gates below. A resume receipt never substitutes for integrity.
+                successful = row['old_status'] in {'matched', 'reconstructed'}
+                if not successful:
+                    if saved['state'] == 'deep_pending':
+                        if limit is not None and processed >= limit:
+                            catalogue_complete = False
+                            break
+                        processed += 1
+                        resumed_preliminary += 1
+                        pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
+                        if saved['whole_limited']:
+                            incomplete.add(digest)
+                        if saved['owner']:
+                            resume.context(1, 'deep', True)
+                            movie = parse_movie(row['data'])
+                            deep_search(case, [movie], tiers.view(('ordinary', digest)), tools, opt, run_key, incomplete=incomplete)
+                        else:
+                            deferred.add(digest)
+                        continue
+                    if saved['state'] != 'preliminary_retry':
+                        _verify_job_artifacts(case, old_detail)
+                        pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
+                        resumed_preliminary += 1
+                        continue
             if old_detail.get('run_key') == run_key:
-                if row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] in {'matched', 'reconstructed'}):
-                    candidates = old_detail.get('candidates', [])
-                    for c in candidates:
-                        p = case.root / c['path']
-                        if not p.is_file() or p.is_symlink() or file_sha256(p) != c['sha256']:
-                            raise SafetyError(f'Previously validated candidate changed or disappeared: {p}')
-                        _backfill_candidate_manifest(case, c)
-                    for output in old_detail.get('outputs', []):
-                        p = case.root / output
-                        if (not p.is_file() or p.is_symlink() or len(candidates) != 1 or
-                                file_sha256(p) != candidates[0]['sha256']):
-                            raise SafetyError(f'Published output changed or disappeared: {p}')
-                        # Accepted publication manifests were backfilled before
-                        # tier construction. Keep that verified evidence stable
-                        # while other jobs use its cached identity in this pass.
+                if (not (saved and saved['state'] == 'preliminary_retry') and
+                        row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] in {'matched', 'reconstructed'})):
+                    _verify_job_artifacts(case, old_detail)
+                    if row['old_status'] in {'matched', 'reconstructed'}:
+                        resume.verified(digest)
                     continue
             if limit is not None and processed >= limit:
+                catalogue_complete = False
                 break
             processed += 1
             pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
+            resume.context(1, 'preliminary', bool(old_detail.get('outputs') or old_detail.get('historical_publications')))
             if row['error']:
                 _scoped_result(case, row['digest'], 'unsupported', {'run_key': run_key, 'reason': row['error'], 'search_tiers': dict(_search_scope(case))})
                 continue
@@ -1522,35 +1688,63 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                 if old_detail.get('outputs') or old_detail.get('historical_publications'):
                     # A resumed target may revalidate its own accepted extents.
                     # Other targets' accepted bytes remain excluded by this view.
+                    resume.context(1, 'deep', True)
                     deep_search(case, [movie], owner_pool, tools, opt, run_key, incomplete=incomplete)
                 else:
                     deferred.add(movie.digest)
         if deferred:
+            resume.context(1, 'deep')
             deep_search(case, deferred, pool, tools, opt, run_key, incomplete=incomplete)
         if opt.include_recovered and tiers.has_recovered:
             # Recovered references are eligible only after a completed first-tier miss.
-            pending.execute('DELETE FROM deferred')
-            fallback = deferred
+            fallback = _DeferredMovies(case, pending, resume, tier=2)
             for (digest,) in pending.execute('SELECT digest FROM visited_movies ORDER BY digest'):
+                first_tier = resume.get(digest)
+                completed_stage = 'deep_complete' if opt.deep else 'preliminary_complete'
+                if first_tier is None or first_tier['state'] != completed_stage:
+                    continue
                 job = case.job('ordinary', digest)
                 if not job or job['detail'].get('run_key') != run_key or job['detail'].get('candidates'):
                     continue
-                if job['status'] == 'search_limited' or job['detail'].get('search_limited'):
+                saved = resume.get(digest, 2)
+                if saved is None and (job['status'] == 'search_limited' or job['detail'].get('search_limited')):
                     # A fallback success cannot settle unexamined first-tier alternatives.
+                    # An existing tier-two receipt already proves first-tier
+                    # eligibility; its own interrupted limits are separate.
                     continue
                 row = case.db.execute('SELECT data,error FROM movies WHERE digest=?', (digest,)).fetchone()
                 if row['error']:
                     continue
                 movie = parse_movie(row['data'])
                 case._search_tiers = dict(case._search_tiers, searched=[1, 2], second_tier_unsearched=False)
+                if saved is not None:
+                    if saved['state'] == 'deep_pending':
+                        if saved['whole_limited']:
+                            incomplete.add(digest)
+                        fallback.add(digest)
+                        continue
+                    if saved['state'] != 'preliminary_retry':
+                        continue
+                resume.context(2, 'preliminary')
                 status, candidates, whole_limited = whole_payload(case, movie, base_pool, tools, opt, run_key)
                 if opt.deep and not candidates and status in {'unresolved', 'search_limited'}:
                     if whole_limited:
                         incomplete.add(digest)
+                    current = case.job('ordinary', digest)
+                    waiting = dict(current['detail']) if current else {}
+                    waiting.update(run_key=run_key, stage='whole_payload',
+                                   reason='whole-payload search finished; deep pass not yet completed',
+                                   search_limited=whole_limited)
+                    _scoped_result(case, digest, 'awaiting_deep', waiting)
                     fallback.add(digest)
             if fallback:
+                resume.context(2, 'deep')
                 deep_search(case, fallback, base_pool, tools, opt, run_key, incomplete=incomplete)
         for sid in base_pool.sources:
             base_pool.check(sid)
-        jobs_task.heartbeat(processed_movies=processed)
+        counts = resume.counts()
+        jobs_task.heartbeat(processed_movies=processed, resumed_preliminary=resumed_preliminary, **counts)
+        case.event('ordinary_resume_progress', dict(run_key=run_key, resumed_preliminary=resumed_preliminary, **counts))
+        if catalogue_complete:
+            resume.complete()
     case.event('recovery_complete', {'run_key': run_key, 'processed_movies': processed})
