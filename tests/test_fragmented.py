@@ -335,15 +335,17 @@ class FragmentedTests(unittest.TestCase):
         args,_,image,_=self.arguments(); self.assertEqual(self.cli(args),0)
         b=bytearray(image.read_bytes()); b[-1]=42; image.write_bytes(b)
         self.assertEqual(self.cli(args),2)
-    def test_missing_published_prefix_refuses_resume(self):
+    def test_missing_published_prefix_is_recreated_before_pending_jobs(self):
         args,_,_,_=self.arguments([self.data,self.data])
         self.assertEqual(self.cli(args+['--limit','1']),0)
         output=next((self.root/'case/reconstructed').glob('*.mp4'))
         output.unlink()
-        self.assertEqual(self.cli(args),2)
-        self.assertFalse(list((self.root/'case/reconstructed').glob('*.mp4')))
+        self.assertEqual(self.cli(args),0)
+        outputs=list((self.root/'case/reconstructed').glob('*.mp4'))
+        self.assertEqual(len(outputs),2)
+        self.assertTrue(all(path.read_bytes()==self.data for path in outputs))
         with contextlib.closing(sqlite3.connect(self.root/'case/case.sqlite3')) as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE kind='fragmented'").fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE kind='fragmented'").fetchone()[0],2)
     def test_changed_published_prefix_refuses_resume(self):
         args,_,_,_=self.arguments(); self.assertEqual(self.cli(args),0)
         output=next((self.root/'case/reconstructed').glob('*.mp4'))
@@ -356,10 +358,12 @@ class FragmentedTests(unittest.TestCase):
         output.write_bytes(b'corrupt')
         self.assertEqual(self.cli(args),2)
         self.assertEqual(output.read_bytes(),b'corrupt')
-    def test_missing_published_evidence_refuses_resume(self):
+    def test_missing_published_evidence_is_recreated(self):
         args,_,_,_=self.arguments(); self.assertEqual(self.cli(args),0)
         next((self.root/'case/work').glob('*/result.json')).unlink()
-        self.assertEqual(self.cli(args),2)
+        self.assertEqual(self.cli(args),0)
+        output=next((self.root/'case/reconstructed').glob('*.mp4'))
+        self.assertEqual(output.read_bytes(),self.data)
     def test_wrong_image_header_refuses(self):
         args,_,image,locs=self.arguments(); b=bytearray(image.read_bytes()); b[locs[0][0]+16]=42; image.write_bytes(b)
         self.assertEqual(self.cli(args),2)

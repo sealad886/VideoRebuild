@@ -1,5 +1,41 @@
 # Executed validation — VideoRebuild
 
+## Missing generated-file restoration — November 4, 2026
+
+Pending source version **0.6.0**, local branch
+`codex/recreate-missing-outputs`, working changes based on `87c7014`.
+The complete local suite ran **529 tests in 59.185 seconds**: **527 passed**,
+with two optional real-fiwalk tests skipped because Sleuth Kit fiwalk was
+unavailable. Python 3.13.18 and FFmpeg/ffprobe 9.0.2 were used.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:tests \
+  .venv/bin/python -m unittest discover -s tests -v
+```
+
+FFmpeg/ffprobe were available on PATH. Regression tests cover missing ordinary
+candidate/publication pairs, fragmented MP4 plus manifest and validation document
+loss, restoration before cross-format tier loading, unchanged job/attempt/resume
+state, retained decode-validation scope, source identity/range/hash failures,
+changed surviving artifacts, unsafe paths, interrupted staging/copying, and
+case-log error retention. Repairs check referenced sources rather than walking
+the whole source catalogue per missing output. Historical device-number changes
+retain source ownership while inode mismatches still fail.
+
+An independent read-only review found no blocking issues and passed **54 focused
+tests**. A zipapp built in a disposable source copy contained the restoration
+module, passed version/recover-help checks, and passed **21 restoration/logging
+tests using the packaged modules**. The checkout's existing standalone archive
+was preserved. `git diff --check` passed, and the local code graph was refreshed.
+
+No live case recovery, hosted CI, wheel/sdist build, real remount, or power-loss
+qualification was performed. Read-only case metadata confirmed retained proof
+for the reported missing fragmented output. Ordinary reconstruction still needs
+mapping-bearing sidecar proof when both media copies are absent. On filesystems
+without hard links, forced termination during exclusive copy fallback can leave
+a partial generated destination; it remains an integrity error on resume.
+No commit, push, release, installation or external publication was performed.
+
 ## Indexed matching and incremental reconstruction — November 2, 2026
 
 Pending source version **0.5.0**, matching revision **5**, local branch

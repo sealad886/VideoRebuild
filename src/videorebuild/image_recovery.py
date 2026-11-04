@@ -26,6 +26,7 @@ from .storage import SafetyError, file_sha256, write_json
 from .validate import run_tool
 from .progress import phase
 from .candidate_tiers import CandidateTiers
+from .artifacts import ensure_generated_file, safe_case_path
 
 LOG = logging.getLogger(__name__)
 
@@ -188,6 +189,136 @@ def verify_completed(case) -> None:
                         raise SafetyError(f'Missing or changed fragmented manifest: {manifest}')
             if len(detail.get('output_evidence', [])) != len(detail['outputs']):
                 raise SafetyError('Incomplete fragmented publication evidence')
+
+
+def _fragment_jobs(case):
+    """Visit bounded pages without keeping a database cursor over repairs."""
+    previous = None
+    while True:
+        if previous is None:
+            keys = case.db.execute("SELECT key FROM jobs WHERE kind='fragmented' ORDER BY key LIMIT 256").fetchall()
+        else:
+            keys = case.db.execute("SELECT key FROM jobs WHERE kind='fragmented' AND key>? ORDER BY key LIMIT 256",
+                                   (previous,)).fetchall()
+        if not keys:
+            return
+        for row in keys:
+            yield case.job('fragmented', row[0])
+        previous = keys[-1][0]
+
+
+def _fragment_replay_ranges(pool, detail, segment, entry):
+    sid, init_at = detail.get('source_id'), detail.get('logical_offset')
+    start, end, size = segment.get('logical_start'), segment.get('logical_end'), entry.get('size')
+    if (sid not in pool.sources or any(type(v) is not int for v in (init_at, start, end, size)) or
+            min(init_at, start) < 0 or end <= start or not 0 < size-(end-start) <= MAX_INIT or
+            not segment.get('source_ranges')):
+        raise SafetyError('Insufficient committed source proof to recreate fragmented output')
+    ranges = [(init_at, size-(end-start)), (start, end-start)]
+    expected = [part for offset, length in ranges for part in pool.provenance(sid, offset, length)]
+    signature = lambda parts: [(v['source_id'], v['source_offset'], v['length']) for v in parts]
+    if signature(expected) != signature(segment['source_ranges']):
+        raise SafetyError('Committed fragmented source ranges do not match indexed evidence')
+    return sid, ranges
+
+
+def restore_fragmented_job(case, pool, job):
+    """Recreate absent generated artifacts from committed, exact-byte proof."""
+    detail = job['detail']
+    if not detail.get('outputs'):
+        return
+    entries = detail.get('output_evidence', [])
+    names = ([detail['detail_path']] if detail.get('detail_path') else []) + list(detail['outputs'])
+    names.extend(entry['manifest_path'] for entry in entries if entry.get('manifest_path'))
+    # Normal resumes keep their existing stat/hash work in the owning verifiers.
+    if all(safe_case_path(case, name).is_file() for name in names):
+        return
+    if (not detail.get('detail_path') or len(entries) != len(detail['outputs']) or
+            {entry['path'] for entry in entries} != set(detail['outputs'])):
+        raise SafetyError('Insufficient committed fragmented publication evidence')
+    evidence_root = case.root/('attempts' if detail.get('historical_validation') else 'work')
+    output_root = case.root/('recovered' if detail.get('historical_validation') else 'reconstructed')
+    evidence = safe_case_path(case, detail['detail_path'])
+    if not evidence.is_relative_to(evidence_root):
+        raise SafetyError('Unsafe committed fragmented validation evidence path')
+    for entry in entries:
+        for name in (entry['path'], entry.get('manifest_path')):
+            if name and not safe_case_path(case, name).is_relative_to(output_root):
+                raise SafetyError('Unsafe committed fragmented publication path')
+    sid = detail.get('source_id')
+    if sid not in pool.sources:
+        raise SafetyError('Insufficient committed source proof to recreate fragmented artifacts')
+    pool.check(sid)
+    if evidence.exists():
+        ensure_generated_file(case, detail['detail_path'], detail.get('evidence_sha256'))
+    for entry in entries:
+        for name, digest, size in ((entry['path'], entry['sha256'], entry['size']),
+                                   (entry.get('manifest_path'), entry.get('manifest_sha256'), None)):
+            if name and safe_case_path(case, name).exists():
+                ensure_generated_file(case, name, digest, expected_size=size)
+    updated = json.loads(json.dumps(detail))
+    segments = {segment.get('output'): segment for segment in updated.get('segments', [])}
+    metadata_changed = not evidence.exists()
+    for entry in updated['output_evidence']:
+        output = safe_case_path(case, entry['path'])
+        segment = segments.get(entry['path'], {})
+        if not output.exists():
+            sid, ranges = _fragment_replay_ranges(pool, updated, segment, entry)
+            def replay(path):
+                pool.check(sid)
+                with path.open('xb') as stream:
+                    for offset, length in ranges:
+                        while length:
+                            count = min(length, 1024*1024)
+                            stream.write(pool.read(sid, offset, count))
+                            offset += count
+                            length -= count
+                pool.check(sid)
+            ensure_generated_file(case, entry['path'], entry['sha256'],
+                                  expected_size=entry['size'], rebuild=replay)
+        manifest_name = entry.get('manifest_path')
+        if manifest_name and not safe_case_path(case, manifest_name).exists():
+            sid, ranges = _fragment_replay_ranges(pool, updated, segment, entry)
+            if entry['size'] > 256*1024*1024:
+                raise SafetyError('Fragmented output exceeds bounded manifest recreation limit')
+            raw = output.read_bytes()
+            prefix = walk_prefix(raw, ranges[0][1], allow_later_start=True)
+            if prefix.end != len(raw) or not prefix.fragments:
+                raise SafetyError('Committed fragmented output cannot recreate its ordered manifest')
+            manifest = _fragment_manifest(pool, sid, ranges[0][0], ranges[1][0], raw, prefix)
+            checked = segment.get('validation', {}).get('decode_checked')
+            decoded = checked if isinstance(checked, bool) else (
+                segment.get('reconstruct_only') is not True and
+                segment.get('status') in {'decoded_prefix', 'decoded_segment'})
+            manifest.update(decode_checked=decoded,
+                            validation_scope='strict_decode' if decoded else 'structural_reconstruction_only')
+            if entry.get('manifest_status') == 'backfilled_from_existing_publication':
+                manifest['status'] = entry['manifest_status']
+            else:
+                manifest['source_sha256'] = pool.sources[sid].get('sha256')
+            # New metadata pointers keep an interrupted repair retryable even
+            # when canonical serialization differs from the missing document.
+            sidecar = output.with_name(output.name+'.manifest-'+uuid.uuid4().hex+'.json')
+            payload = (json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True)+'\n').encode()
+            digest = hashlib.sha256(payload).hexdigest()
+            relative = str(sidecar.relative_to(case.root))
+            ensure_generated_file(case, relative, digest, expected_size=len(payload),
+                                  rebuild=lambda path: path.write_bytes(payload))
+            entry.update(manifest_path=relative, manifest_sha256=digest)
+            metadata_changed = True
+    if metadata_changed:
+        evidence_root = 'attempts' if updated.get('historical_validation') else 'work'
+        relative = evidence_root+'/fragment-restored-'+uuid.uuid4().hex+'.json'
+        updated['detail_path'] = relative
+        updated.pop('evidence_sha256', None)
+        payload = (json.dumps(updated, indent=2, sort_keys=True, ensure_ascii=True)+'\n').encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        ensure_generated_file(case, relative, digest, expected_size=len(payload),
+                              rebuild=lambda path: path.write_bytes(payload))
+        updated['evidence_sha256'] = digest
+        pool.check(sid)
+        case.result(job['key'], job['status'], updated, kind='fragmented')
+        job.update(case.job('fragmented', job['key']))
 
 
 def _initialization_locations(case, pool, discovery_task):
@@ -376,23 +507,7 @@ def _fragment_manifest_path(output: Path) -> Path:
 
 def _backfill_fragment_manifests(case, pool):
     """Add ordered evidence for existing outputs without recopying or decoding."""
-    def jobs():
-        # Keep only a bounded page of keys while backfill updates job details.
-        # No live SELECT cursor spans a commit or a mutation of the jobs table.
-        previous = None
-        while True:
-            if previous is None:
-                keys = case.db.execute("SELECT key FROM jobs WHERE kind='fragmented' ORDER BY key LIMIT 256").fetchall()
-            else:
-                keys = case.db.execute("SELECT key FROM jobs WHERE kind='fragmented' AND key>? ORDER BY key LIMIT 256",
-                                       (previous,)).fetchall()
-            if not keys:
-                return
-            for row in keys:
-                yield case.job('fragmented', row[0])
-            previous = keys[-1][0]
-
-    for job in jobs():
+    for job in _fragment_jobs(case):
         detail = job['detail']
         changed = False
         segments = {segment.get('output'): segment for segment in detail.get('segments', [])}
@@ -496,6 +611,8 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
     reconstruct_only = bool(getattr(options, 'reconstruct_only', False))
     include_recovered = bool(getattr(options, 'include_recovered', False))
     check_options(options)
+    for saved in _fragment_jobs(case):
+        restore_fragmented_job(case, pool, saved)
     verify_completed(case)
     _backfill_fragment_manifests(case, pool)
     allocation_scope = pool.allocation_scope.digest if pool.allocation_scope is not None else None

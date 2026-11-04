@@ -397,8 +397,16 @@ class DurableResumeTests(unittest.TestCase):
                     candidate.unlink()
                     candidate.symlink_to(substitute)
                 with Case(path) as resumed:
-                    with self.assertRaises(SafetyError):
-                        engine.recover(resumed, options)
+                    if change == 'missing':
+                        with patch.object(engine, 'whole_payload', side_effect=AssertionError('completed search replayed')):
+                            engine.recover(resumed, options)
+                        restored = resumed.job('ordinary', movie.digest)
+                        self.assertEqual(restored['status'], 'ambiguous')
+                        self.assertEqual(hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                                         job['detail']['candidates'][0]['sha256'])
+                    else:
+                        with self.assertRaises(SafetyError):
+                            engine.recover(resumed, options)
                 self.assertEqual(source.read_bytes(), original)
 
     def test_limit_excluded_pending_deep_job_cannot_enter_recovered_fallback(self):
