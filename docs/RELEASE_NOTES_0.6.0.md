@@ -21,3 +21,15 @@ Existing logs have no unique phase IDs; the viewer reports only phase evidence
 available in its bounded log tail and does not invent missing parent totals.
 
 The separate Rust migration is not included in this change.
+
+Recovery resume also gains targeted restoration of missing generated files:
+
+- Restore absent ordinary candidates/publications and fragmented outputs from
+  verified case copies or retained source provenance, requiring the accepted hash.
+- Recreate missing fragmented manifests and validation documents from committed
+  proof without changing their recorded decode-validation scope.
+- Preserve source checks, accepted job decisions and durable search progress;
+  changed surviving artifacts and insufficient reconstruction proof remain errors.
+- Retain recovery error messages in the case log after report refresh.
+
+These fixes remain part of pending 0.6.0; they do not publish a new release.

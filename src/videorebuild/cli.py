@@ -142,7 +142,13 @@ def _execute(args, feedback) -> int:
                 summary = report(case)
                 print(json.dumps(summary, indent=2))
                 print(f'Report: {case.root / "reports" / "index.html"}')
-            except BaseException:
+            except BaseException as error:
+                if isinstance(error, Exception):
+                    # The outer error handler runs after this file handler closes.
+                    # Save the reason here while keeping terminal reporting there.
+                    handler.handle(logging.makeLogRecord({
+                        'name': __name__, 'levelno': logging.ERROR, 'levelname': 'ERROR',
+                        'msg': str(error), 'args': ()}))
                 try:
                     report(case)
                 except Exception as error:

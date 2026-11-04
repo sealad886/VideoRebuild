@@ -30,6 +30,7 @@ import time
 from typing import Iterable
 
 from . import __version__, nal_search
+from .artifacts import ensure_generated_file, safe_case_path
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
 from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
 from .validate import VALIDATION_REVISION, doctor, validate
@@ -466,9 +467,7 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
             except FormatError as error:
                 return {'status': 'rejected', 'mapping_digest': md, 'stage': stage, 'reason': str(error)}
         if same_tools and old.get('status') == 'valid':
-            p = case.root / old['path']
-            if not p.is_file() or p.is_symlink() or file_sha256(p) != old['sha256']:
-                raise SafetyError(f'Previously validated candidate changed or disappeared: {p}')
+            _restore_ordinary_candidate(case, pool, movie.digest, old, movie=movie, mapping=mapping)
             return old
         if same_tools and old.get('status') == 'rejected':
             return dict(old, content_evaluated=True)
@@ -609,8 +608,152 @@ def _backfill_candidate_manifest(case, candidate):
     return updated
 
 
-def _verify_job_artifacts(case, detail):
+
+def _restore_ordinary_candidate(case, pool, digest, candidate, peers=(), *, movie=None, mapping=None):
+    """Restore accepted bytes from a retained peer or their exact source mapping."""
+    pool = getattr(pool, 'discovery_pool', pool)
+    if mapping is not None and safe_case_path(case, candidate['path']).is_file():
+        return ensure_generated_file(case, candidate['path'], candidate['sha256'])
+    rebuilt_manifest = None
+    retained = None
+
+    def rebuild(destination):
+        nonlocal rebuilt_manifest
+        target_movie, selected = movie, mapping
+        if target_movie is None:
+            row = case.db.execute('SELECT data FROM movies WHERE digest=?', (digest,)).fetchone()
+            if row is None:
+                raise SafetyError('Missing indexed metadata for generated ordinary artifact')
+            target_movie = parse_movie(row[0])
+        if target_movie.digest != digest:
+            raise SafetyError('Generated ordinary artifact metadata does not match its saved digest')
+        if retained is not None:
+            if retained.get('metadata_sha256', digest) != digest:
+                raise SafetyError('Generated ordinary artifact provenance names different metadata')
+            chunks = {(chunk.track, chunk.index): chunk for chunk in target_movie.chunks}
+            saved = {}
+            for entry in retained['chunks']:
+                key = (entry['track'], entry['chunk'])
+                sid, offset = entry['source_id'], entry['source_offset']
+                if (key in saved or key not in chunks or type(sid) is not int or
+                        type(offset) is not int or offset < 0 or entry['size'] != chunks[key].size or
+                        sid not in pool.sources):
+                    raise SafetyError('Incomplete or invalid generated ordinary artifact provenance')
+                saved[key] = entry
+            if set(saved) != set(chunks):
+                raise SafetyError('Incomplete generated ordinary artifact chunk provenance')
+            retained_mapping = {key: (entry['source_id'], entry['source_offset']) for key, entry in saved.items()}
+            if selected is not None and any(selected[key] != value for key, value in retained_mapping.items()):
+                raise SafetyError('Generated ordinary artifact mapping differs from retained provenance')
+            selected = retained_mapping
+        elif selected is None:
+            raise SafetyError('Missing source mapping provenance for generated ordinary artifact')
+        if candidate.get('mapping_digest') and mapping_digest(target_movie, selected) != candidate['mapping_digest']:
+            raise SafetyError('Generated ordinary artifact mapping does not match its saved digest')
+        source_ids = {sid for sid, _ in selected.values()}
+        for sid in source_ids:
+            pool.check(sid)
+        zero = {(chunk.track, chunk.index): 0 for chunk in target_movie.chunks}
+        size = len(FTYP) + len(rewrite_offsets(target_movie, zero)) + 16 + target_movie.media_size
+        proof = reconstruct(target_movie, selected, pool, destination, size)
+        if retained is not None:
+            for entry in proof['chunks']:
+                old = saved[(entry['track'], entry['chunk'])]
+                if entry['sha256'] != old['sha256']:
+                    raise SafetyError('Generated ordinary artifact source chunk hash changed')
+                if old.get('physical_extents'):
+                    fields = ('logical_offset', 'source_id', 'source_path', 'source_offset', 'length')
+                    current = [{name: part.get(name) for name in fields} for part in entry['physical_extents']]
+                    previous = [{name: part.get(name) for name in fields} for part in old['physical_extents']]
+                    if current != previous:
+                        raise SafetyError('Generated ordinary artifact source ranges changed')
+        for sid in source_ids:
+            pool.check(sid)
+        rebuilt_manifest = {'version': __version__, 'stage': candidate.get('stage'),
+                            'movie': target_movie.summary(), 'provenance': proof,
+                            'ordered_fragments': proof['ordered_fragments'],
+                            'validation': candidate.get('validation', {})}
+
+    try:
+        for name in (candidate['path'], *peers):
+            sidecar = safe_case_path(case, str(Path(name).with_suffix('.json')))
+            if not sidecar.is_file():
+                continue
+            evidence = json.loads(sidecar.read_text())
+            proof = evidence.get('provenance', {})
+            if proof.get('chunks'):
+                retained = proof
+                break
+        referenced = {sid for sid, _ in mapping.values()} if mapping is not None else set()
+        for entry in retained.get('chunks', []) if retained else ():
+            sid = entry['source_id']
+            source = pool.sources.get(sid)
+            if source is None:
+                raise SafetyError('Generated ordinary artifact source is unavailable')
+            if (entry.get('source_path', source['path']) != source['path'] or
+                    entry.get('source_sha256_at_scan', source['sha256']) != source['sha256']):
+                raise SafetyError('Generated ordinary artifact source evidence changed')
+            referenced.add(sid)
+            for part in entry.get('physical_extents', []):
+                physical = pool.physical.get(part['source_id'])
+                if physical is None or part.get('source_path', physical['path']) != physical['path']:
+                    raise SafetyError('Generated ordinary artifact physical source is unavailable')
+                identity = part.get('source_identity', {})
+                # Device IDs may change when the same source volume remounts.
+                if any(identity.get(name, physical.get(name)) != physical.get(name)
+                       for name in ('ino', 'size', 'mtime_ns', 'sha256')):
+                    raise SafetyError('Generated ordinary artifact physical source evidence changed')
+                referenced.add(part['source_id'])
+        for sid in referenced:
+            pool.check(sid)
+        path = ensure_generated_file(case, candidate['path'], candidate['sha256'], peers=peers, rebuild=rebuild)
+        for sid in referenced:
+            pool.check(sid)
+        sidecar = safe_case_path(case, str(Path(candidate['path']).with_suffix('.json')))
+        if not sidecar.exists():
+            evidence = None
+            for name in peers:
+                saved_sidecar = safe_case_path(case, str(Path(name).with_suffix('.json')))
+                if saved_sidecar.is_file():
+                    saved_evidence = json.loads(saved_sidecar.read_text())
+                    if saved_evidence.get('provenance', {}).get('chunks'):
+                        evidence = saved_evidence
+                        break
+            if evidence is None:
+                evidence = rebuilt_manifest
+            if evidence is not None:
+                write_json(sidecar, evidence)
+        return path
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise SafetyError('Incomplete or invalid source mapping provenance for generated ordinary artifact') from error
+
+
+def restore_ordinary_job(case, pool, job):
+    """Recreate absent generated media while retaining the saved recovery decision."""
+    detail = job['detail']
+    candidates = detail.get('candidates', [])
+    groups = [(candidate, tuple(detail.get('outputs', [])) if len(candidates) == 1 else ())
+              for candidate in candidates]
+    groups.extend(({'path': entry['candidate'], 'sha256': entry['sha256']}, (entry['path'],))
+                  for entry in detail.get('historical_publications', []))
+    missing = []
+    for candidate, outputs in groups:
+        paths = [safe_case_path(case, name) for name in (candidate['path'], *outputs)]
+        if any(not path.is_file() for path in paths):
+            missing.append((candidate, outputs))
+    if not missing:
+        return
+    pool = getattr(pool, 'discovery_pool', pool)
+    for candidate, outputs in missing:
+        _restore_ordinary_candidate(case, pool, job['key'], candidate, outputs)
+        for output in outputs:
+            if output != candidate['path']:
+                ensure_generated_file(case, output, candidate['sha256'], peers=(candidate['path'],))
+
+
+def _verify_job_artifacts(case, pool, digest, detail):
     """A scheduling receipt never replaces saved candidate/publication integrity."""
+    restore_ordinary_job(case, pool, {'key': digest, 'detail': detail})
     candidates = detail.get('candidates', [])
     for candidate in candidates:
         path = case.root / candidate['path']
@@ -624,8 +767,9 @@ def _verify_job_artifacts(case, detail):
             raise SafetyError(f'Published output changed or disappeared: {path}')
 
 
-def _backfill_ordinary_publications(case):
+def _backfill_ordinary_publications(case, pool):
     for job in case.get_jobs('ordinary'):
+        restore_ordinary_job(case, pool, job)
         detail = job['detail']
         publications = list(detail.get('historical_publications', []))
         candidates = detail.get('candidates', [])
@@ -1584,7 +1728,7 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
         deferred = _DeferredMovies(case, pending, resume)
         for sid in sources:
             pool.check(sid)
-        _backfill_ordinary_publications(case)
+        _backfill_ordinary_publications(case, pool)
         from .candidate_tiers import CandidateTiers
         pending.execute('CREATE TABLE visited_movies(digest TEXT PRIMARY KEY) WITHOUT ROWID')
         base_pool = pool
@@ -1650,14 +1794,14 @@ def recover(case: Case, opt: Options, limit: int | None = None, retry: bool = Fa
                             deferred.add(digest)
                         continue
                     if saved['state'] != 'preliminary_retry':
-                        _verify_job_artifacts(case, old_detail)
+                        _verify_job_artifacts(case, base_pool, digest, old_detail)
                         pending.execute('INSERT OR IGNORE INTO visited_movies VALUES(?)', (digest,))
                         resumed_preliminary += 1
                         continue
             if old_detail.get('run_key') == run_key:
                 if (not (saved and saved['state'] == 'preliminary_retry') and
                         row['old_status'] != 'awaiting_deep' and (not retry or row['old_status'] in {'matched', 'reconstructed'})):
-                    _verify_job_artifacts(case, old_detail)
+                    _verify_job_artifacts(case, base_pool, digest, old_detail)
                     if row['old_status'] in {'matched', 'reconstructed'}:
                         resume.verified(digest)
                     continue

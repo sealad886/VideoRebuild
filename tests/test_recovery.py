@@ -201,14 +201,17 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(c.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0],n)
         self.assertEqual(sha(out),before)
 
-    def test_missing_publication_aborts_resume(self):
+    def test_missing_publication_is_recreated_on_resume(self):
         split(self.h264,self.root/'input')
         out=self.assert_recovered(self.run_case([self.root/'input']),self.h264)
+        expected=sha(out)
         out.unlink()
         with Case(self.root/'case') as c:
-            with self.assertRaises(SafetyError):
+            before=c.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]
+            with patch('videorebuild.engine.validate',side_effect=AssertionError('restoration must not decode again')):
                 recover(c,Options())
-        self.assertFalse(out.exists())
+            self.assertEqual(c.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0],before)
+        self.assertEqual(sha(out),expected)
 
     def test_changed_independent_publication_aborts_resume(self):
         split(self.h264,self.root/'input')

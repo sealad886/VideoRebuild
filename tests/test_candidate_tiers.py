@@ -161,6 +161,25 @@ class CandidateTierTests(unittest.TestCase):
                 tiers.refresh()
                 self.assertTrue(tiers.view().permits(sid, 40, 10))
 
+    def test_historical_device_number_preserves_source_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case, sid, _ = self.setup_case(Path(directory))
+            with ReaderPool(case.sources()) as pool:
+                self.publish(case, pool, sid, 20, 10)
+                candidate = case.job('ordinary', 'accepted')['detail']['candidates'][0]
+                sidecar = (case.root / candidate['path']).with_suffix('.json')
+                manifest = json.loads(sidecar.read_text())
+                part = manifest['provenance']['chunks'][0]['physical_extents'][0]
+                identity = {key: pool.physical[sid][key] for key in ('size', 'mtime_ns', 'dev', 'ino')}
+                part['source_identity'] = dict(identity, dev=identity['dev']+1)
+                write_json(sidecar, manifest)
+                tiers = CandidateTiers(case, pool)
+                self.assertFalse(tiers.view().permits(sid, 20, 10))
+                part['source_identity']['ino'] += 1
+                write_json(sidecar, manifest)
+                with self.assertRaises(SafetyError):
+                    CandidateTiers(case, pool)
+
     def test_base_allocation_scope_still_limits_first_and_second_tier(self):
         with tempfile.TemporaryDirectory() as d:
             case, sid, _ = self.setup_case(Path(d))
