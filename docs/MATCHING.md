@@ -63,6 +63,19 @@ fresh source-catalogue fingerprint or coverage scan for every movie.
 
 ## Assembly and physical ownership
 
+For an extent containing exactly one supported video sample, uncapped deep
+search certifies the sample's exact framing once per indexed location, codec
+and length field width. The structural index still supplies the complete set
+of possible locations. Certificates only describe bytes in the base acquisition
+scope. Complete chunk geometry, current ownership and encoded-byte checks still
+apply when an extent uses a certified location.
+
+Within one association batch, extents with the same sample interpretation,
+relative offsets and ordered chunk spans share a physical hit domain. Assembly
+keeps exclusions local to the extent being pruned. Indexed groups that select
+one seed do not store rejected origins for deduplication because that seed's
+posting keys already translate to unique bases.
+
 Identical observed group content shares computation, while every physical witness
 remains available. Bounded sparse conflict/support propagation removes choices
 with no required pairwise support. If the derived graph or comparison budget is
@@ -87,6 +100,15 @@ the coordinator owns SQLite writes, coverage receipts and ordered publication.
 Parallelism does not make mutable tier decisions in workers. Parser facts may be
 reused only with their exact interpretation context and current read permissions.
 No GPU, native-extension or third-party runtime dependency is required.
+
+Framing certificates live beside the structural index in the case work
+directory. Each bounded page commits its accepted locations and cursor together,
+including pages with no hits. Resume reuses those receipts only with the same
+index coverage, source and map identity, and validator revision. The case volume
+keeps a 1 GiB reserve during association and certification. A low-space stop
+leaves affected jobs pending. Resume with the same command after restoring
+space. Unfinished extent assembly can repeat, while committed framing pages and
+completed job results remain reusable.
 
 Fragmented recovery reads adjacent box pairs incrementally under the same byte,
 sample, timing and source-range bounds as the in-memory parser. A short malformed

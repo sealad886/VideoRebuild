@@ -159,9 +159,9 @@ def _source_stamp(s: os.stat_result) -> tuple[int, int, int]:
     return s.st_size, s.st_mtime_ns, s.st_ino
 
 
-def _live_stamp(s: os.stat_result) -> tuple[int, int, int, int]:
-    """Same-run path/descriptor identity still includes the current device."""
-    return s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino
+def _live_stamp(s: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Same-run identity includes the current device and change time."""
+    return s.st_size, s.st_mtime_ns, s.st_dev, s.st_ino, s.st_ctime_ns
 
 
 def _binding_identity(binding: dict) -> dict:
@@ -493,6 +493,20 @@ class ReaderPool:
         for physical in ids:
             self._checked_stat(physical)
             self._check_map(physical)
+
+    def matching_source_stamps(self):
+        """Pin the current physical files and maps used by the discovery scope."""
+        for sid in self.sources:
+            self.check(sid)
+        used = {physical for sid in self.sources for physical in self.physical_ids.get(sid, (sid,))}
+
+        def durable(stamp):
+            size, modified, _, inode, changed = stamp
+            return size, modified, inode, changed
+
+        return tuple((sid, durable(self._identities[sid]),
+                      durable(self._map_identities[sid]) if sid in self._map_identities else None)
+                     for sid in sorted(used))
 
     def handle(self, sid: int):
         current = self._checked_stat(sid)

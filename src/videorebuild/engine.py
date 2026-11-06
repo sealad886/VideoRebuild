@@ -9,7 +9,7 @@ search limits are retained instead of being hidden behind a confidence score.
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping as MappingView
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
@@ -32,6 +32,7 @@ from typing import Iterable
 from . import __version__, nal_search
 from .artifacts import ensure_generated_file, safe_case_path
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
+from .sample_certificates import Profile, SUPPORTED_CODECS, require_search_space, sample_certificates, search_disk_full
 from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
 from .validate import VALIDATION_REVISION, doctor, validate
 from .progress import phase
@@ -900,6 +901,10 @@ def _search_store(case: Case):
             # state must not create anonymous files on the system temp volume.
             db.execute('PRAGMA temp_store=MEMORY')
             yield db
+        except sqlite3.Error as error:
+            if search_disk_full(error):
+                raise SafetyError('Case volume ran out of space while writing search scratch; free space and resume') from error
+            raise
         finally:
             db.close()
 
@@ -1033,6 +1038,19 @@ class Group:
                     result.append((size-4, pos))
                 pos += size
         return sorted(set(result))
+
+    def sample_profile(self) -> Profile | None:
+        """A certificate covers the group only when it covers all video samples."""
+        video = [c for c in self.chunks if self.movie.tracks[c.track].handler == b'vide']
+        if len(video) != 1 or len(video[0].sizes) != 1:
+            return None
+        chunk = video[0]
+        track = self.movie.tracks[chunk.track]
+        size = chunk.sizes[0]
+        if (track.codec in SUPPORTED_CODECS
+                and track.nal_length == 4 and 8 <= size < 16*1024*1024):
+            return size-4, track.codec, track.nal_length
+        return None
 
 
 def groups_for(movie: Movie) -> list[Group]:
@@ -1293,6 +1311,7 @@ def deep_search(case: Case, movies: list[Movie] | _DeferredMovies, pool: ReaderP
         return
     from .structural_index import postings
     lengths = set()
+    profiles = set()
     base_pool = getattr(pool, 'discovery_pool', pool)
     catalogue = getattr(case, '_structural_catalogue_lengths', None)
     if catalogue is None and isinstance(getattr(case, 'db', None), sqlite3.Connection):
@@ -1311,26 +1330,40 @@ def deep_search(case: Case, movies: list[Movie] | _DeferredMovies, pool: ReaderP
         catalogue = case._structural_catalogue_lengths = frozenset(catalogue)
     for movie in movies:
         groups = groups_for(movie)
-        if any(not group.anchors() for group in groups):
+        required = [group.anchors() for group in groups]
+        if any(not anchors for anchors in required):
             continue
-        lengths.update(length for group in groups for length, _ in group.anchors())
+        lengths.update(length for anchors in required for length, _ in anchors)
+        for group in groups:
+            if isinstance(group, Group) and (profile := group.sample_profile()) is not None:
+                profiles.add(profile)
     if catalogue is not None and lengths.issubset(catalogue):
         lengths = catalogue
     elif catalogue:
         lengths = frozenset(lengths | catalogue)
         case._structural_catalogue_lengths = lengths
-    with phase('Deep structural index', unit='bytes') as task, \
-            postings(case, base_pool, lengths, _anchor_locations, opt, task) as (discovery, discovery_stats):
+    with ExitStack() as stack:
+        with phase('Deep structural index', unit='bytes') as task:
+            discovery, discovery_stats = stack.enter_context(
+                postings(case, base_pool, lengths, _anchor_locations, opt, task))
+        certificates = None
+        if profiles:
+            certificates = stack.enter_context(sample_certificates(
+                case, base_pool, discovery, discovery_stats['discovery_index']))
+            with phase('Deep sample framing', unit='locations') as task:
+                certificates.prepare(profiles, task)
         for batch in _movie_batches(movies, opt.max_groups):
             _deep_batch(case, batch, pool, tools, opt, run_key, incomplete or set(), discovery=discovery,
-                        discovery_nal_checks=discovery_stats['nal_checks'], discovery_stats=discovery_stats)
+                        discovery_nal_checks=discovery_stats['nal_checks'], discovery_stats=discovery_stats,
+                        certificates=certificates)
         if not getattr(base_pool, '_recovery_active', False):
             for sid in pool.sources:
                 pool.check(sid)
 
 
 def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
-                opt: Options, run_key: str, incomplete: set[str], *, discovery=None, discovery_nal_checks=0, discovery_stats=None) -> None:
+                opt: Options, run_key: str, incomplete: set[str], *, discovery=None, discovery_nal_checks=0,
+                discovery_stats=None, certificates=None) -> None:
     groups = {}
     per_movie = {}
     excluded = set()
@@ -1349,13 +1382,50 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                 anchors[length].append((g.key, relative))
     if not groups:
         return
+    certified = {}
+    if certificates is not None:
+        certified = {key: profile for key, group in groups.items()
+                     if isinstance(group, Group) and (profile := group.sample_profile()) is not None}
+    representatives = {}
+    aliases = {}
+    for key, profile in certified.items():
+        group = groups[key]
+        # This batch has one eligibility view until its association pass ends.
+        # Framing, span, ordered reads and their physical origins must agree.
+        shape = (profile, group.anchors()[0][1], group.span,
+                 tuple((chunk.offset-group.start, chunk.size) for chunk in group.chunks))
+        representative = representatives.setdefault(shape, key)
+        if representative != key:
+            aliases[key] = representative
+    fanout = Counter(aliases.values())
+    require_search_space(case.root)
     with _search_store(case) as search:
         # An indexed Group picks one seed. Its unique posting keys translate
         # to unique bases, so only the paths with multiple seeds need dedup.
         if discovery is None or any(not isinstance(group, Group) for group in groups.values()):
             search.execute('CREATE TABLE visited (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
-        search.execute('CREATE TABLE hits (movie TEXT,g INTEGER,fingerprint TEXT,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
-        search.execute('CREATE INDEX hits_order ON hits(movie,g,fingerprint,sid,start)')
+        hit_table = 'hit_locations' if aliases else 'hits'
+        search.execute(f'CREATE TABLE {hit_table} (movie TEXT,g INTEGER,fingerprint TEXT,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
+        search.execute(f'CREATE INDEX hits_order ON {hit_table}(movie,g,fingerprint,sid,start)')
+        if aliases:
+            # The assembly solver prunes one group's choices. Apply those
+            # deletions as an overlay so another group keeps its own choices.
+            search.executescript("""
+                CREATE TABLE extent_domains (movie TEXT,g INTEGER,domain_movie TEXT,domain_g INTEGER,
+                    PRIMARY KEY(movie,g)) WITHOUT ROWID;
+                CREATE TABLE pruned_hits (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,
+                    PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID;
+                CREATE VIEW hits AS
+                    SELECT e.movie,e.g,h.fingerprint,h.sid,h.start FROM extent_domains e
+                    JOIN hit_locations h ON h.movie=e.domain_movie AND h.g=e.domain_g
+                    WHERE NOT EXISTS (SELECT 1 FROM pruned_hits p
+                        WHERE p.movie=e.movie AND p.g=e.g AND p.sid=h.sid AND p.start=h.start);
+                CREATE TRIGGER prune_hit INSTEAD OF DELETE ON hits BEGIN
+                    INSERT INTO pruned_hits VALUES (OLD.movie,OLD.g,OLD.sid,OLD.start);
+                END;
+            """)
+            search.executemany('INSERT INTO extent_domains VALUES(?,?,?,?)',
+                               ((*key, *aliases.get(key, key)) for key in groups))
         counts_by_group = {key: 0 for key in groups}
         capped = set()
         state = dict(anchor_checks=0, nal_checks=discovery_nal_checks, limited=False, stop_reason=None, located_extents=0,
@@ -1366,7 +1436,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         label = 'Deep search available bytes' if discovery is None else 'Deep anchor associations'
         with phase(label, total=available, unit='bytes' if discovery is None else 'locations') as scan_task:
             if discovery is None:
-                locations = ((sid, at, length, anchors.get(length, ())) for sid, at, length in
+                locations = ((sid, at, anchors.get(length, ())) for sid, at, length in
                              _anchor_locations(pool, max(anchors)+4, anchors.__contains__, opt, state, scan_task))
             else:
                 def replay():
@@ -1375,7 +1445,15 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                         row = discovery.execute('SELECT total FROM frequencies WHERE length=?', (length,)).fetchone()
                         frequencies[length] = row[0] if row else 0
                     for key, group in groups.items():
+                        if key in aliases:
+                            continue
                         required = group.anchors()
+                        if key in certified:
+                            _, relative = required[0]
+                            for sid, at in certificates.locations(certified[key]):
+                                pool.check(sid)
+                                yield sid, at-relative, ((key, 0),)
+                            continue
                         # Only real complete Group anchors have the necessary
                         # sample predicate. Unsupported custom models retain OR.
                         intersect = isinstance(group, Group)
@@ -1396,15 +1474,17 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                                             break
                                     if not present:
                                         continue
-                                yield sid, start, length, ((key, 0),)
+                                yield sid, start, ((key, 0),)
                 locations = replay()
             visited_locations = 0
             try:
-                for sid, at, length, associations in locations:
+                for sid, at, associations in locations:
                     visited_locations += 1
                     source = pool.sources[sid]
                     for key, relative in associations:
                         state['anchor_associations'] += 1
+                        if state['anchor_associations'] % 4096 == 0:
+                            require_search_space(case.root)
                         if key in capped:
                             continue
                         group = groups[key]
@@ -1423,18 +1503,19 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                             state.update(limited=True, stop_reason='anchor_check_budget')
                             break
                         mapping = group.mapping(sid, start)
-                        if not check_samples(group.movie, mapping, pool, quick=True, chunks=group.chunks):
-                            continue
-                        if not check_samples(group.movie, mapping, pool, chunks=group.chunks):
-                            continue
+                        if key not in certified:
+                            if not check_samples(group.movie, mapping, pool, quick=True, chunks=group.chunks):
+                                continue
+                            if not check_samples(group.movie, mapping, pool, chunks=group.chunks):
+                                continue
                         fingerprint = _group_hash(group, mapping, pool)
                         if opt.max_hits is not None and counts_by_group[key] >= opt.max_hits:
                             capped.add(key)
                             continue
                         if not counts_by_group[key]:
-                            state['located_extents'] += 1
+                            state['located_extents'] += 1 + fanout[key]
                         counts_by_group[key] += 1
-                        search.execute('INSERT INTO hits VALUES(?,?,?,?,?)', (*key, fingerprint, sid, start))
+                        search.execute(f'INSERT INTO {hit_table} VALUES(?,?,?,?,?)', (*key, fingerprint, sid, start))
                     if discovery is not None and visited_locations % 4096 == 0:
                         scan_task.update(visited_locations, anchor_checks=state['anchor_checks'], located_extents=state['located_extents'])
                     if state['limited']:
@@ -1445,11 +1526,17 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                 scan_task.update(visited_locations, anchor_checks=state['anchor_checks'], located_extents=state['located_extents'])
             if state['limited'] or capped:
                 scan_task.outcome('limited', detail=state['stop_reason'] or 'hit capacity reached')
+        if certified:
+            # A source without a certified hit still contributes to the
+            # coverage proof. Check the full scope before reporting results.
+            base_pool = getattr(pool, 'discovery_pool', pool)
+            for sid in base_pool.sources:
+                base_pool.check(sid)
         for movie in movies:
             if movie.digest in excluded:
                 continue
             gs = per_movie[movie.digest]
-            counts = [counts_by_group[g.key] for g in gs]
+            counts = [counts_by_group[aliases.get(g.key, g.key)] for g in gs]
             limited = state['limited'] or movie.digest in incomplete or any(g.key in capped for g in gs)
             details = {'extents': len(gs), 'located_extents': sum(n > 0 for n in counts),
                        'hit_counts': counts, 'anchor_checks': state['anchor_checks'],
@@ -1457,6 +1544,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                        'shared_discovery': discovery is not None,
                        'anchor_associations': state['anchor_associations'], 'posting_probes': state['posting_probes'],
                        'posting_rejections': state['posting_rejections'], 'duplicate_bases': state['duplicate_bases'],
+                       'shared_extent_domains': len(aliases),
                        'discovery': discovery_stats or {},
                        'model': 'Each video chunk plus adjacent audio remains contiguous; no within-extent sector permutation.'}
             if any(n == 0 for n in counts):
@@ -1501,6 +1589,8 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
             details.update(pruning)
             details['tested_assemblies'] = tried
             finish(case, movie, list(successes.values()), limited, 'scattered_extents', run_key, details)
+            if aliases:
+                search.execute('DELETE FROM pruned_hits WHERE movie=?', (movie.digest,))
 
 
 
