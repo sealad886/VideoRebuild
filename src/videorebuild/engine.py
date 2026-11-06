@@ -903,7 +903,7 @@ def _search_store(case: Case):
             yield db
         except sqlite3.Error as error:
             if search_disk_full(error):
-                raise SafetyError('Case volume ran out of space while writing search scratch; free space and resume') from error
+                raise SafetyError('Case volume is full; free space and resume recovery') from error
             raise
         finally:
             db.close()
@@ -1367,19 +1367,27 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     groups = {}
     per_movie = {}
     excluded = set()
-    anchors = defaultdict(list)
+    requirements = {}
+    anchor_lengths = set()
+    nominations = defaultdict(list)
     for movie in movies:
         gs = groups_for(movie)
-        if any(not g.anchors() for g in gs):
+        required = [group.anchors() for group in gs]
+        if any(not anchors for anchors in required):
             _scoped_result(case, movie.digest, 'search_limited' if movie.digest in incomplete else 'unsupported', {'run_key': run_key,
                         'reason': 'deep search requires eligible 4-byte NAL-length samples in every extent', 'search_tiers': _search_scope(case)})
             excluded.add(movie.digest)
             continue
         per_movie[movie.digest] = gs
-        for g in gs:
-            groups[g.key] = g
-            for length, relative in g.anchors():
-                anchors[length].append((g.key, relative))
+        for group, anchors in zip(gs, required):
+            key = group.key
+            groups[key] = group
+            anchor_lengths.update(length for length, _ in anchors)
+            if discovery is None:
+                for length, relative in anchors:
+                    nominations[length].append((key, relative))
+            else:
+                requirements[key] = anchors
     if not groups:
         return
     certified = {}
@@ -1392,7 +1400,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         group = groups[key]
         # This batch has one eligibility view until its association pass ends.
         # Framing, span, ordered reads and their physical origins must agree.
-        shape = (profile, group.anchors()[0][1], group.span,
+        shape = (profile, requirements[key][0][1], group.span,
                  tuple((chunk.offset-group.start, chunk.size) for chunk in group.chunks))
         representative = representatives.setdefault(shape, key)
         if representative != key:
@@ -1407,6 +1415,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         hit_table = 'hit_locations' if aliases else 'hits'
         search.execute(f'CREATE TABLE {hit_table} (movie TEXT,g INTEGER,fingerprint TEXT,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
         search.execute(f'CREATE INDEX hits_order ON {hit_table}(movie,g,fingerprint,sid,start)')
+        insert_hit = f'INSERT INTO {hit_table} VALUES(?,?,?,?,?)'
         if aliases:
             # The assembly solver prunes one group's choices. Apply those
             # deletions as an overlay so another group keeps its own choices.
@@ -1426,31 +1435,34 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
             """)
             search.executemany('INSERT INTO extent_domains VALUES(?,?,?,?)',
                                ((*key, *aliases.get(key, key)) for key in groups))
-        counts_by_group = {key: 0 for key in groups}
+        counts_by_group = {key: 0 for key in groups if key not in aliases}
         capped = set()
         state = dict(anchor_checks=0, nal_checks=discovery_nal_checks, limited=False, stop_reason=None, located_extents=0,
                      anchor_associations=0, posting_probes=0, posting_rejections=0, duplicate_bases=0)
-        LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchors), len(pool.sources))
+        LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchor_lengths), len(pool.sources))
         available = (sum(length for sid in pool.sources for _, length in pool.available_ranges(sid))
                      if discovery is None else None)
         label = 'Deep search available bytes' if discovery is None else 'Deep anchor associations'
         with phase(label, total=available, unit='bytes' if discovery is None else 'locations') as scan_task:
             if discovery is None:
-                locations = ((sid, at, anchors.get(length, ())) for sid, at, length in
-                             _anchor_locations(pool, max(anchors)+4, anchors.__contains__, opt, state, scan_task))
+                locations = ((sid, at, nominations.get(length, ())) for sid, at, length in
+                             _anchor_locations(pool, max(anchor_lengths)+4, nominations.__contains__, opt, state, scan_task))
             else:
                 def replay():
                     frequencies = {}
-                    for length in anchors:
+                    raw_lengths = {length for key, anchors in requirements.items() if key not in certified
+                                   for length, _ in anchors}
+                    for length in raw_lengths:
                         row = discovery.execute('SELECT total FROM frequencies WHERE length=?', (length,)).fetchone()
                         frequencies[length] = row[0] if row else 0
                     for key, group in groups.items():
                         if key in aliases:
                             continue
-                        required = group.anchors()
-                        if key in certified:
+                        required = requirements[key]
+                        profile = certified.get(key)
+                        if profile is not None:
                             _, relative = required[0]
-                            for sid, at in certificates.locations(certified[key]):
+                            for sid, at in certificates.locations(profile):
                                 pool.check(sid)
                                 yield sid, at-relative, ((key, 0),)
                             continue
@@ -1515,7 +1527,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                         if not counts_by_group[key]:
                             state['located_extents'] += 1 + fanout[key]
                         counts_by_group[key] += 1
-                        search.execute(f'INSERT INTO {hit_table} VALUES(?,?,?,?,?)', (*key, fingerprint, sid, start))
+                        search.execute(insert_hit, (*key, fingerprint, sid, start))
                     if discovery is not None and visited_locations % 4096 == 0:
                         scan_task.update(visited_locations, anchor_checks=state['anchor_checks'], located_extents=state['located_extents'])
                     if state['limited']:
