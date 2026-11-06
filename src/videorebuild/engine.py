@@ -1350,7 +1350,10 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     if not groups:
         return
     with _search_store(case) as search:
-        search.execute('CREATE TABLE visited (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
+        # An indexed Group picks one seed. Its unique posting keys translate
+        # to unique bases, so only the paths with multiple seeds need dedup.
+        if discovery is None or any(not isinstance(group, Group) for group in groups.values()):
+            search.execute('CREATE TABLE visited (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
         search.execute('CREATE TABLE hits (movie TEXT,g INTEGER,fingerprint TEXT,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
         search.execute('CREATE INDEX hits_order ON hits(movie,g,fingerprint,sid,start)')
         counts_by_group = {key: 0 for key in groups}
@@ -1408,7 +1411,9 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                         start = at - relative
                         if start < 0 or start + group.span > source['size']:
                             continue
-                        if not search.execute('INSERT OR IGNORE INTO visited VALUES(?,?,?,?)', (*key, sid, start)).rowcount:
+                        if (discovery is None or not isinstance(group, Group)) and not search.execute(
+                            'INSERT OR IGNORE INTO visited VALUES(?,?,?,?)', (*key, sid, start)
+                        ).rowcount:
                             state['duplicate_bases'] += 1
                             continue
                         if any(not pool.permits(sid, start+c.offset-group.start, c.size) for c in group.chunks):
