@@ -34,7 +34,7 @@ class SourceIdentityTests(unittest.TestCase):
         return self.case.sources()
 
     def fake_stat(self, state, **changes):
-        values = {key: getattr(state, key) for key in ('st_size', 'st_mtime_ns', 'st_dev', 'st_ino')}
+        values = {key: getattr(state, key) for key in ('st_size', 'st_mtime_ns', 'st_dev', 'st_ino', 'st_ctime_ns')}
         return SimpleNamespace(**(values | changes))
 
     def test_remount_resumes_without_rewriting_index_or_invalidating_job(self):
