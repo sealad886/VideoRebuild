@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -81,15 +82,16 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser().parse_args(effective_argv)
     if args.command == 'tui':
         from .tui import run
         return run(args.case, watch=args.watch, no_progress=args.no_progress)
     with reporting(enabled=not args.no_progress) as feedback:
-        return _execute(args, feedback)
+        return _execute(args, feedback, effective_argv)
 
 
-def _execute(args, feedback) -> int:
+def _execute(args, feedback, argv: list[str]) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
     if os.name != 'posix':
         print('ERROR: This release supports macOS and Linux; use WSL on Windows.', file=sys.stderr)
@@ -133,6 +135,14 @@ def _execute(args, feedback) -> int:
                 'name': 'videorebuild.progress', 'levelno': logging.INFO, 'levelname': 'INFO',
                 'msg': message, 'args': ()}))
             try:
+                handler.handle(logging.makeLogRecord({
+                    'name': 'videorebuild.startup', 'levelno': logging.INFO, 'levelname': 'INFO',
+                    'msg': json.dumps({'event': 'startup', 'tool': 'VideoRebuild', 'version': __version__,
+                        'utc': datetime.now(timezone.utc).isoformat(), 'pid': os.getpid(),
+                        'command': args.command, 'argv': argv,
+                        'python_executable': sys.executable, 'python_version': sys.version,
+                        'cwd': str(Path.cwd()), 'case': str(root),
+                        'cli_origin': __file__, 'entrypoint': sys.argv[0]}), 'args': ()}))
                 if args.command in ('scan', 'run'):
                     from .workflow import intake
                     intake(case, args)

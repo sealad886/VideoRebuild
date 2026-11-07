@@ -164,7 +164,7 @@ class TerminalInterfaceTests(unittest.TestCase):
         self.assertEqual(calls, ['save', 'leave', 'restore'])
 
     def test_foreground_handoff_preserves_progress_preference(self):
-        def recover(args, feedback):
+        def recover(args, feedback, argv):
             self.assertEqual(args.command, 'recover')
             with phase('Synthetic recovery', total=1) as work:
                 work.advance()
