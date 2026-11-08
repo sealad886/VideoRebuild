@@ -1071,13 +1071,29 @@ def groups_for(movie: Movie) -> list[Group]:
             for i, cs in enumerate(groups)]
 
 
-def _group_hash(group: Group, mapping: Mapping, pool: ReaderPool) -> str:
+def _group_hash(group: Group, mapping: Mapping, pool: ReaderPool, *, read_cache=None) -> str:
     h = hashlib.sha256()
     for c in group.chunks:
         sid, off = mapping[(c.track, c.index)]
         remaining = c.size
         while remaining:
-            raw = pool.read(sid, off, min(remaining, 4*1024*1024))
+            size = min(remaining, 4*1024*1024)
+            if read_cache is None:
+                raw = pool.read(sid, off, size)
+            else:
+                # Bytes belong to this batch's reader; eligibility is never cached.
+                key = sid, off, size
+                if key in read_cache:
+                    if not pool.permits(sid, off, size):
+                        raise FormatError('cached source range is unavailable')
+                    raw = read_cache[key]
+                    read_cache.move_to_end(key)
+                else:
+                    raw = pool.read(sid, off, size)
+                    if len(raw) == size:
+                        if len(read_cache) >= 4:
+                            read_cache.popitem(last=False)
+                        read_cache[key] = raw
             h.update(raw)
             off += len(raw)
             remaining -= len(raw)
@@ -1406,6 +1422,19 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         if representative != key:
             aliases[key] = representative
     fanout = Counter(aliases.values())
+    # Interleave same-profile audio geometries while source handles/pages are
+    # hot, retaining each group's posting order. Explicit cutoffs retain the
+    # original group-major replay and disable read reuse.
+    by_profile = defaultdict(list)
+    uncapped = all(value is None for value in
+                   (opt.max_anchor_checks, opt.max_hits, opt.max_assemblies))
+    if uncapped:
+        for key, profile in certified.items():
+            if key not in aliases:
+                by_profile[profile].append((key, requirements[key][0][1]))
+    shared_profiles = {profile for profile, members in by_profile.items() if len(members) > 1}
+    # Four exact reads at the existing 4 MiB bound retain at most 16 MiB.
+    read_cache = OrderedDict() if shared_profiles else None
     require_search_space(case.root)
     with _search_store(case) as search:
         # An indexed Group picks one seed. Its unique posting keys translate
@@ -1449,6 +1478,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                              _anchor_locations(pool, max(anchor_lengths)+4, nominations.__contains__, opt, state, scan_task))
             else:
                 def replay():
+                    seen_profiles = set()
                     frequencies = {}
                     raw_lengths = {length for key, anchors in requirements.items() if key not in certified
                                    for length, _ in anchors}
@@ -1461,10 +1491,16 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                         required = requirements[key]
                         profile = certified.get(key)
                         if profile is not None:
-                            _, relative = required[0]
+                            members = ((key, required[0][1]),)
+                            if uncapped:
+                                if profile in seen_profiles:
+                                    continue
+                                seen_profiles.add(profile)
+                                members = by_profile[profile]
                             for sid, at in certificates.locations(profile):
-                                pool.check(sid)
-                                yield sid, at-relative, ((key, 0),)
+                                for member, relative in members:
+                                    pool.check(sid)
+                                    yield sid, at-relative, ((member, 0),)
                             continue
                         # Only real complete Group anchors have the necessary
                         # sample predicate. Unsupported custom models retain OR.
@@ -1520,7 +1556,10 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                                 continue
                             if not check_samples(group.movie, mapping, pool, chunks=group.chunks):
                                 continue
-                        fingerprint = _group_hash(group, mapping, pool)
+                        if read_cache is not None and certified.get(key) in shared_profiles:
+                            fingerprint = _group_hash(group, mapping, pool, read_cache=read_cache)
+                        else:
+                            fingerprint = _group_hash(group, mapping, pool)
                         if opt.max_hits is not None and counts_by_group[key] >= opt.max_hits:
                             capped.add(key)
                             continue
