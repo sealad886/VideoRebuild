@@ -9,7 +9,7 @@ search limits are retained instead of being hidden behind a confidence score.
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Mapping as MappingView
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
@@ -1611,6 +1611,7 @@ def _group_physical_ranges(group, choice, pool, cache=None):
     key = (group.key, choice)
     if cache is not None and key in cache:
         pool.check(sid)
+        cache.move_to_end(key)
         yield from cache[key]
         return
     parts = []
@@ -1618,7 +1619,9 @@ def _group_physical_ranges(group, choice, pool, cache=None):
         for part in pool.provenance(sid, start+chunk.offset-group.start, chunk.size):
             physical = pool.physical_key(part['source_id'])
             parts.append((*physical, part['source_offset'], part['source_offset']+part['length']))
-    if cache is not None and len(cache) < 4096:
+    if cache is not None:
+        if len(cache) >= 4096:
+            cache.popitem(last=False)
         cache[key] = tuple(parts)
     yield from parts
 
@@ -1660,7 +1663,7 @@ def _prune_physical_domains(search, groups, pool, stats, footprints):
 
 
 def _content_assemblies(search, groups, pool, stats, task):
-    footprints = {}
+    footprints = OrderedDict()
     _prune_physical_domains(search, groups, pool, stats, footprints)
     distinct = [search.execute('SELECT count(DISTINCT fingerprint) FROM hits WHERE movie=? AND g=?', group.key).fetchone()[0]
                 for group in groups]
