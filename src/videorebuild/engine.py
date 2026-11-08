@@ -1480,7 +1480,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
             # deletions as an overlay so another group keeps its own choices.
             search.executescript("""
                 CREATE TABLE extent_domains (movie TEXT,g INTEGER,domain_movie TEXT,domain_g INTEGER,
-                    PRIMARY KEY(movie,g)) WITHOUT ROWID;
+                    domain TEXT,PRIMARY KEY(movie,g)) WITHOUT ROWID;
                 CREATE TABLE pruned_hits (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,
                     PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID;
                 CREATE VIEW hits AS
@@ -1492,7 +1492,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                     INSERT INTO pruned_hits VALUES (OLD.movie,OLD.g,OLD.sid,OLD.start);
                 END;
             """)
-            search.executemany('INSERT INTO extent_domains VALUES(?,?,?,?)',
+            search.executemany('INSERT INTO extent_domains VALUES(?,?,?,?,NULL)',
                                ((*key, *aliases.get(key, key)) for key in groups))
         counts_by_group = {key: restored[key][4] if key in restored else 0
                            for key in groups if key not in aliases}
@@ -1731,10 +1731,49 @@ def _group_physical_ranges(group, choice, pool, cache=None):
     yield from parts
 
 
-def _prune_physical_domains(search, groups, pool, stats, footprints):
+class _HitQueries:
+    """Query one indexed domain without sorting the compound diagnostic view."""
+    def __init__(self, search):
+        self.search = search
+        self.has_domains = search.execute('PRAGMA table_info(extent_domains)').fetchone() is not None
+        self.routes = {}
+
+    def _query(self, key, projection, *, suffix='', fingerprint=None):
+        if key not in self.routes:
+            table, where, params = 'hits', 'h.movie=? AND h.g=?', key
+            if self.has_domains:
+                row = self.search.execute('SELECT domain_movie,domain_g,domain FROM extent_domains WHERE movie=? AND g=?', key).fetchone()
+                if row is None:
+                    raise SafetyError('Deep association group has no hit domain')
+                if row[2] is not None:
+                    table, where, params = 'saved_associations.hit_locations', 'h.domain=?', (row[2],)
+                else:
+                    table, params = 'main.hit_locations', tuple(row[:2])
+                where += (' AND NOT EXISTS (SELECT 1 FROM pruned_hits p WHERE p.movie=? AND p.g=?'
+                          ' AND p.sid=h.sid AND p.start=h.start)')
+                params += key
+            self.routes[key] = table, where, params
+        table, where, params = self.routes[key]
+        if fingerprint is not None:
+            where += ' AND h.fingerprint=?'
+            params += (fingerprint,)
+        return f'SELECT {projection} FROM {table} h WHERE {where} {suffix}', params
+
+    def select(self, key, projection, **options):
+        return self.search.execute(*self._query(key, projection, **options))
+
+    def fingerprint_count(self, key):
+        # Older SQLite versions sort COUNT(DISTINCT) despite this ordered index.
+        # Counting a grouped index stream keeps those runtimes bounded too.
+        query, params = self._query(key, 'fingerprint', suffix='GROUP BY fingerprint')
+        return self.search.execute(f'SELECT count(*) FROM ({query})', params).fetchone()[0]
+
+
+def _prune_physical_domains(search, groups, pool, stats, footprints, *, hits=None):
     # Dense or huge domains retain streaming DFS; no optimization may discard
     # values merely because its own memory/edge budget is exhausted.
-    total = sum(search.execute('SELECT count(*) FROM hits WHERE movie=? AND g=?', group.key).fetchone()[0]
+    hits = hits if hits is not None else _HitQueries(search)
+    total = sum(hits.select(group.key, 'count(*)').fetchone()[0]
                 for group in groups)
     if total > 4096 or len(groups) < 2:
         stats['constraint_complete'] = False
@@ -1745,7 +1784,7 @@ def _prune_physical_domains(search, groups, pool, stats, footprints):
     for group in groups:
         domain = []
         unavailable = []
-        for choice in search.execute('SELECT sid,start FROM hits WHERE movie=? AND g=? ORDER BY sid,start', group.key):
+        for choice in hits.select(group.key, 'sid,start', suffix='ORDER BY sid,start'):
             try:
                 parts = tuple(_group_physical_ranges(group, choice, pool, footprints))
             except FormatError:
@@ -1769,9 +1808,9 @@ def _prune_physical_domains(search, groups, pool, stats, footprints):
 
 def _content_assemblies(search, groups, pool, stats, task):
     footprints = OrderedDict()
-    _prune_physical_domains(search, groups, pool, stats, footprints)
-    distinct = [search.execute('SELECT count(DISTINCT fingerprint) FROM hits WHERE movie=? AND g=?', group.key).fetchone()[0]
-                for group in groups]
+    hits = _HitQueries(search)
+    _prune_physical_domains(search, groups, pool, stats, footprints, hits=hits)
+    distinct = [hits.fingerprint_count(group.key) for group in groups]
     order = sorted(range(len(groups)), key=lambda i: distinct[i])
     cursors = []
     selected = []
@@ -1784,7 +1823,8 @@ def _content_assemblies(search, groups, pool, stats, task):
             for extent in witness_parts.pop():
                 occupied.pop(bisect_left(occupied, extent))
         if len(cursors) <= depth:
-            cursors.append(search.execute('SELECT fingerprint,count(*) FROM hits WHERE movie=? AND g=? GROUP BY fingerprint ORDER BY fingerprint', groups[order[depth]].key))
+            cursors.append(hits.select(groups[order[depth]].key, 'fingerprint,count(*)',
+                                       suffix='GROUP BY fingerprint ORDER BY fingerprint'))
         choice = next(cursors[depth], None)
         if choice is None:
             cursors.pop().close()
@@ -1801,7 +1841,7 @@ def _content_assemblies(search, groups, pool, stats, task):
         # Usually the existing witness can be extended without revisiting any
         # older provenance. Greedy failure is never proof of impossibility.
         extension = _assemblies(search, [groups[order[depth]]], pool, counts=[choice[1]],
-                                fingerprints=[choice[0]], stats=stats, task=task, initial_occupied=occupied, footprints=footprints)
+                                fingerprints=[choice[0]], stats=stats, task=task, initial_occupied=occupied, footprints=footprints, hits=hits)
         try:
             added = next(extension, None)
         finally:
@@ -1815,7 +1855,7 @@ def _content_assemblies(search, groups, pool, stats, task):
         else:
             physical = _assemblies(search, [groups[i] for i in indices], pool,
                                    counts=[item[1] for item in selected],
-                                   fingerprints=[item[0] for item in selected], stats=stats, task=task, footprints=footprints)
+                                   fingerprints=[item[0] for item in selected], stats=stats, task=task, footprints=footprints, hits=hits)
             try:
                 witness = next(physical, None)
             finally:
@@ -1843,7 +1883,7 @@ def _content_assemblies(search, groups, pool, stats, task):
                 # its content could be evaluated; retain all alternative proofs.
                 physical = _assemblies(search, [groups[i] for i in indices], pool,
                                        counts=[item[1] for item in selected],
-                                       fingerprints=[item[0] for item in selected], stats=stats, task=task, footprints=footprints)
+                                       fingerprints=[item[0] for item in selected], stats=stats, task=task, footprints=footprints, hits=hits)
                 try:
                     for other in physical:
                         if other != first:
@@ -1855,8 +1895,9 @@ def _content_assemblies(search, groups, pool, stats, task):
             depth += 1
 
 
-def _assemblies(search, groups, pool=None, *, counts=None, stats=None, task=None, fingerprints=None, initial_occupied=(), footprints=None):
+def _assemblies(search, groups, pool=None, *, counts=None, stats=None, task=None, fingerprints=None, initial_occupied=(), footprints=None, hits=None):
     """Enumerate all feasible physical assignments without expanding conflicts."""
+    hits = hits if hits is not None else _HitQueries(search)
     order = sorted(range(len(groups)), key=lambda i: counts[i]) if counts is not None else list(range(len(groups)))
     cursors = []
     choices = [None] * len(groups)
@@ -1875,12 +1916,9 @@ def _assemblies(search, groups, pool=None, *, counts=None, stats=None, task=None
                 occupied.pop(bisect_left(occupied, extent))
         if len(cursors) <= depth:
             index = order[depth]
-            query = 'SELECT sid,start FROM hits WHERE movie=? AND g=?'
-            params = groups[index].key
-            if fingerprints is not None:
-                query += ' AND fingerprint=?'
-                params += (fingerprints[index],)
-            cursors.append(search.execute(query + ' ORDER BY fingerprint,sid,start', params))
+            cursors.append(hits.select(groups[index].key, 'sid,start',
+                                       fingerprint=fingerprints[index] if fingerprints is not None else None,
+                                       suffix='ORDER BY fingerprint,sid,start'))
         choice = next(cursors[depth], None)
         if choice is None:
             cursors.pop().close()

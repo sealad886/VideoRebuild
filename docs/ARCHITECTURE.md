@@ -60,6 +60,8 @@ geometry receipts bind matching policy, source and map identities, allocation,
 ownership and tier scope; incomplete coverage cannot establish absence or
 uniqueness. Assembly can reuse complete association coverage after interruption,
 while final reader, physical-witness and validation checks remain authoritative.
+Per-group fingerprint aggregation and physical choices stream through their
+backing database indexes; group-specific pruning remains an ephemeral overlay.
 Completed batches retire their checkpoint data. Explicit finite budgets and raw
 nomination paths retain their existing semantics. See [RESUMABILITY.md](RESUMABILITY.md)
 for operator guidance and invalidation boundaries.
