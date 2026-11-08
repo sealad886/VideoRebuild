@@ -30,6 +30,7 @@ import time
 from typing import Iterable
 
 from . import __version__, nal_search
+from .association_resume import association_checkpoint, association_geometry, domain_key
 from .artifacts import ensure_generated_file, safe_case_path
 from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
 from .sample_certificates import Profile, SUPPORTED_CODECS, require_search_space, sample_certificates, search_disk_full
@@ -1416,8 +1417,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         group = groups[key]
         # This batch has one eligibility view until its association pass ends.
         # Framing, span, ordered reads and their physical origins must agree.
-        shape = (profile, requirements[key][0][1], group.span,
-                 tuple((chunk.offset-group.start, chunk.size) for chunk in group.chunks))
+        shape = association_geometry(group, profile, requirements[key][0][1])
         representative = representatives.setdefault(shape, key)
         if representative != key:
             aliases[key] = representative
@@ -1436,16 +1436,46 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
     # Four exact reads at the existing 4 MiB bound retain at most 16 MiB.
     read_cache = OrderedDict() if shared_profiles else None
     require_search_space(case.root)
-    with _search_store(case) as search:
+    with ExitStack() as checkpoint_context, _search_store(case) as search:
+        checkpoint = checkpoint_context.enter_context(
+            association_checkpoint(case, pool, run_key, certificates)
+            if uncapped and discovery is not None and certified else nullcontext(None))
+        domains = {key: domain_key(groups[key], profile, requirements[key][0][1])
+                   for key, profile in certified.items()} if checkpoint is not None else {}
+        restored = {key: checkpoint.register(domain) for key, domain in domains.items()
+                    if key not in aliases}
         # An indexed Group picks one seed. Its unique posting keys translate
         # to unique bases, so only the paths with multiple seeds need dedup.
         if discovery is None or any(not isinstance(group, Group) for group in groups.values()):
             search.execute('CREATE TABLE visited (movie TEXT,g INTEGER,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
-        hit_table = 'hit_locations' if aliases else 'hits'
+        hit_table = 'hit_locations' if aliases or checkpoint is not None else 'hits'
         search.execute(f'CREATE TABLE {hit_table} (movie TEXT,g INTEGER,fingerprint TEXT,sid INTEGER,start INTEGER,PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID')
         search.execute(f'CREATE INDEX hits_order ON {hit_table}(movie,g,fingerprint,sid,start)')
         insert_hit = f'INSERT INTO {hit_table} VALUES(?,?,?,?,?)'
-        if aliases:
+        if checkpoint is not None:
+            search.execute('ATTACH DATABASE ? AS saved_associations', (str(checkpoint.path),))
+            search.executescript("""
+                CREATE TEMP TABLE extent_domains(movie TEXT,g INTEGER,domain_movie TEXT,domain_g INTEGER,
+                    domain TEXT,PRIMARY KEY(movie,g)) WITHOUT ROWID;
+                CREATE TEMP TABLE pruned_hits(movie TEXT,g INTEGER,sid INTEGER,start INTEGER,
+                    PRIMARY KEY(movie,g,sid,start)) WITHOUT ROWID;
+                CREATE TEMP VIEW hits AS
+                    SELECT e.movie,e.g,h.fingerprint,h.sid,h.start FROM extent_domains e
+                    JOIN main.hit_locations h ON h.movie=e.domain_movie AND h.g=e.domain_g
+                    WHERE e.domain IS NULL AND NOT EXISTS (SELECT 1 FROM pruned_hits p
+                        WHERE p.movie=e.movie AND p.g=e.g AND p.sid=h.sid AND p.start=h.start)
+                    UNION ALL
+                    SELECT e.movie,e.g,h.fingerprint,h.sid,h.start FROM extent_domains e
+                    JOIN saved_associations.hit_locations h ON h.domain=e.domain
+                    WHERE NOT EXISTS (SELECT 1 FROM pruned_hits p
+                        WHERE p.movie=e.movie AND p.g=e.g AND p.sid=h.sid AND p.start=h.start);
+                CREATE TEMP TRIGGER prune_hit INSTEAD OF DELETE ON hits BEGIN
+                    INSERT OR IGNORE INTO pruned_hits VALUES(OLD.movie,OLD.g,OLD.sid,OLD.start);
+                END;
+            """)
+            search.executemany('INSERT INTO extent_domains VALUES(?,?,?,?,?)',
+                               ((*key, *aliases.get(key, key), domains.get(key)) for key in groups))
+        elif aliases:
             # The assembly solver prunes one group's choices. Apply those
             # deletions as an overlay so another group keeps its own choices.
             search.executescript("""
@@ -1464,10 +1494,17 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
             """)
             search.executemany('INSERT INTO extent_domains VALUES(?,?,?,?)',
                                ((*key, *aliases.get(key, key)) for key in groups))
-        counts_by_group = {key: 0 for key in groups if key not in aliases}
+        counts_by_group = {key: restored[key][4] if key in restored else 0
+                           for key in groups if key not in aliases}
         capped = set()
         state = dict(anchor_checks=0, nal_checks=discovery_nal_checks, limited=False, stop_reason=None, located_extents=0,
                      anchor_associations=0, posting_probes=0, posting_rejections=0, duplicate_bases=0)
+        if restored:
+            state['anchor_associations'] = sum(value[2] for value in restored.values())
+            state['anchor_checks'] = sum(value[3] for value in restored.values())
+            state['located_extents'] = sum(1+fanout[key] for key, value in restored.items() if value[4])
+            LOG.info('Deep association checkpoint restored: %d associations, %d hits across %d geometries',
+                     state['anchor_associations'], sum(value[4] for value in restored.values()), len(restored))
         LOG.info('Deep search: %d extents, %d anchor sizes across %d sources', len(groups), len(anchor_lengths), len(pool.sources))
         available = (sum(length for sid in pool.sources for _, length in pool.available_ranges(sid))
                      if discovery is None else None)
@@ -1497,10 +1534,33 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                                     continue
                                 seen_profiles.add(profile)
                                 members = by_profile[profile]
-                            for sid, at in certificates.locations(profile):
-                                for member, relative in members:
-                                    pool.check(sid)
-                                    yield sid, at-relative, ((member, 0),)
+                            active = [(member, relative) for member, relative in members
+                                      if member not in restored or not restored[member][5]]
+                            if not active:
+                                continue
+                            after = None
+                            if checkpoint is not None and all(restored[member][2] for member, _ in active):
+                                after = min(tuple(restored[member][:2]) for member, _ in active)
+                            posting_rows = (certificates.locations(profile, after=after) if after is not None
+                                            else certificates.locations(profile))
+                            try:
+                                for sid, at in posting_rows:
+                                    for member, relative in active:
+                                        saved = restored.get(member)
+                                        if saved is not None and saved[2] and (sid, at) <= tuple(saved[:2]):
+                                            continue
+                                        pool.check(sid)
+                                        checks_before, hits_before = state['anchor_checks'], counts_by_group[member]
+                                        yield sid, at-relative, ((member, 0),)
+                                        if checkpoint is not None:
+                                            checked = state['anchor_checks']-checks_before
+                                            checkpoint.advance(domains[member], sid, at, checked,
+                                                               counts_by_group[member]-hits_before,
+                                                               sum(chunk.size for chunk in groups[member].chunks) if checked else 0)
+                            finally:
+                                close = getattr(posting_rows, 'close', None)
+                                if close is not None:
+                                    close()
                             continue
                         # Only real complete Group anchors have the necessary
                         # sample predicate. Unsupported custom models retain OR.
@@ -1524,7 +1584,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                                         continue
                                 yield sid, start, ((key, 0),)
                 locations = replay()
-            visited_locations = 0
+            visited_locations = state['anchor_associations'] if checkpoint is not None else 0
             try:
                 for sid, at, associations in locations:
                     visited_locations += 1
@@ -1566,7 +1626,10 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                         if not counts_by_group[key]:
                             state['located_extents'] += 1 + fanout[key]
                         counts_by_group[key] += 1
-                        search.execute(insert_hit, (*key, fingerprint, sid, start))
+                        if key in domains:
+                            checkpoint.add_hit(domains[key], fingerprint, sid, start)
+                        else:
+                            search.execute(insert_hit, (*key, fingerprint, sid, start))
                     if discovery is not None and visited_locations % 4096 == 0:
                         scan_task.update(visited_locations, anchor_checks=state['anchor_checks'], located_extents=state['located_extents'])
                     if state['limited']:
@@ -1580,9 +1643,12 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
         if certified:
             # A source without a certified hit still contributes to the
             # coverage proof. Check the full scope before reporting results.
-            base_pool = getattr(pool, 'discovery_pool', pool)
-            for sid in base_pool.sources:
-                base_pool.check(sid)
+            if checkpoint is not None:
+                checkpoint.complete(set(domains.values()))
+            else:
+                base_pool = getattr(pool, 'discovery_pool', pool)
+                for sid in base_pool.sources:
+                    base_pool.check(sid)
         for movie in movies:
             if movie.digest in excluded:
                 continue
@@ -1640,7 +1706,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
             details.update(pruning)
             details['tested_assemblies'] = tried
             finish(case, movie, list(successes.values()), limited, 'scattered_extents', run_key, details)
-            if aliases:
+            if aliases or checkpoint is not None:
                 search.execute('DELETE FROM pruned_hits WHERE movie=?', (movie.digest,))
 
 

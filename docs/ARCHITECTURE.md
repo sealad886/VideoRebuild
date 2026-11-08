@@ -52,6 +52,18 @@ Extent-group capacity and a 32 MiB metadata budget schedule bounded batches inst
 
 Accepted reference bookkeeping uses a shared owner-labelled physical interval index. Overlapping claims remain distinct, so exempting an output's own owner cannot expose another owner's claim. Changed owners update only their intervals and normalized `candidate_references` rows. The former derived `candidate_tiers` JSON is backed up locally in `settings` before conversion. Startup rebuilds derived references from verified publications rather than trusting cached rows. The exclusive case writer names the changed job during publication refresh, avoiding repeated scans of empty catalogue jobs; accepted publications and sources still receive fresh integrity checks. A full refresh discovers every job change.
 
+Certified groups in uncapped indexed deep association also checkpoint exact
+checked locations and all matching physical hits in
+`work/association-checkpoint.sqlite3`. Bounded
+transactions commit hits and their source/location cursor together. Independent
+geometry receipts bind matching policy, source and map identities, allocation,
+ownership and tier scope; incomplete coverage cannot establish absence or
+uniqueness. Assembly can reuse complete association coverage after interruption,
+while final reader, physical-witness and validation checks remain authoritative.
+Completed batches retire their checkpoint data. Explicit finite budgets and raw
+nomination paths retain their existing semantics. See [RESUMABILITY.md](RESUMABILITY.md)
+for operator guidance and invalidation boundaries.
+
 Each newly accepted output has an atomic JSON sidecar containing `ordered_fragments`: ordered output ranges, hashes, source logical ranges, bound physical extents and identities, plus track/chunk or fragment sequence information where available. Generated ordinary container bytes are distinguished from copied media. Existing publications are backfilled from verified retained chunk/fragment proof and bounded reads of their existing outputs; unavailable historical proof is explicitly flagged, never fabricated. A later narrower search preserves prior publication files and exposes them separately as historical outputs.
 
 ## Safety, state and migration
