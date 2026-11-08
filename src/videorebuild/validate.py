@@ -89,6 +89,21 @@ def doctor() -> dict:
 def validate(path: Path, movie: Movie, tools: dict, timeout: float) -> dict:
     base = ['-v', 'error', '-threads', '1', '-f', 'mov', '-protocol_whitelist', 'file',
             '-enable_drefs', '0', '-ignore_editlist', '1']
+    # Fail at the first decoder error before spending time counting every
+    # packet and frame. Successful candidates still pass both independent tools.
+    # Validation ignores edit lists; the output retains the movie's lists.
+    with phase('Strict decode ordinary candidate', total=1, unit='jobs') as validation_task:
+        decode = run_tool([tools['ffmpeg']['path'], '-hide_banner', '-nostdin', '-xerror',
+                           *base, '-err_detect', 'explode', '-i', str(path),
+                           '-map', '0:v', '-map', '0:a?', '-threads', '1',
+                           '-filter_threads', '1', '-f', 'null', '-'], timeout)
+        validation_task.advance()
+        if decode['returncode'] or decode['timeout'] or decode['stderr'].strip():
+            validation_task.outcome('failed', detail='strict decode failed')
+    result = {'ok': False, 'decode': decode}
+    if decode['returncode'] or decode['timeout'] or decode['stderr'].strip():
+        result['reason'] = 'strict_decode_failed'
+        return result
     with phase('Probe ordinary packet and frame counts', total=1, unit='jobs') as validation_task:
         probe = run_tool([tools['ffprobe']['path'], *base, '-count_packets', '-count_frames',
                           '-show_entries', 'stream=index,codec_type,codec_name,nb_read_frames,nb_read_packets,width,height',
@@ -96,7 +111,7 @@ def validate(path: Path, movie: Movie, tools: dict, timeout: float) -> dict:
         validation_task.advance()
         if probe['returncode'] or probe['timeout'] or probe['stderr'].strip() or probe['stdout_truncated']:
             validation_task.outcome('failed', detail='probe failed or incomplete')
-    result = {'ok': False, 'probe': probe}
+    result['probe'] = probe
     if (probe['returncode'] or probe['timeout'] or probe['stderr'].strip() or
             probe['stdout_truncated']):
         result['reason'] = 'probe_or_decode_error'
@@ -131,18 +146,7 @@ def validate(path: Path, movie: Movie, tools: dict, timeout: float) -> dict:
             return result
         expected.append({'track': t.track_id, 'expected_packets': t.sample_count,
                          'packets': packets, 'frames': frames, 'codec': codec})
-    # Independent strict decode after the probe/count pass. Edit lists are ignored
-    # only while validating; the output retains the original movie's edit lists.
-    with phase('Strict decode ordinary candidate', total=1, unit='jobs') as validation_task:
-        decode = run_tool([tools['ffmpeg']['path'], '-hide_banner', '-nostdin', '-xerror',
-                           *base, '-err_detect', 'explode', '-i', str(path),
-                           '-map', '0:v', '-map', '0:a?', '-threads', '1',
-                           '-filter_threads', '1', '-f', 'null', '-'], timeout)
-        validation_task.advance()
-        if decode['returncode'] or decode['timeout'] or decode['stderr'].strip():
-            validation_task.outcome('failed', detail='strict decode failed')
-    result['decode'] = decode
     result['counts'] = expected
-    result['ok'] = not (decode['returncode'] or decode['timeout'] or decode['stderr'].strip())
-    result['reason'] = 'decode_checked' if result['ok'] else 'strict_decode_failed'
+    result['ok'] = True
+    result['reason'] = 'decode_checked'
     return result
