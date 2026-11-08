@@ -129,9 +129,13 @@ class SampleCertificates:
                 return
             processed = count
 
-    def locations(self, profile: Profile) -> sqlite3.Cursor:
+    def locations(self, profile: Profile, *, after: tuple[int, int] | None = None) -> sqlite3.Cursor:
         if profile not in self.ready:
             raise SafetyError('Deep sample framing has no complete coverage receipt')
+        if after is not None:
+            return self.db.execute('''SELECT sid,start FROM accepted
+                WHERE length=? AND codec=? AND width=? AND (sid,start)>(?,?) ORDER BY sid,start''',
+                (*profile, *after))
         return self.db.execute('''SELECT sid,start FROM accepted
             WHERE length=? AND codec=? AND width=? ORDER BY sid,start''', profile)
 

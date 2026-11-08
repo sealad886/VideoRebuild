@@ -122,7 +122,7 @@ class SearchStorageTests(unittest.TestCase):
                 with patch.object(engine.sqlite3, 'connect', side_effect=observed_connect):
                     engine.recover(case, engine.Options(deep=True, reconstruct_only=True, max_groups=1))
                 self.assertGreaterEqual(len(paths), 5)
-                self.assertTrue(all(path.parent.parent == case.root / 'work' for path in paths))
+                self.assertTrue(all(path.is_relative_to(case.root / 'work') for path in paths))
                 ephemeral = [path for path in paths if path.parent.name.startswith('videorebuild-search-')]
                 durable = [path for path in paths if path.parent.name == 'structural-index']
                 self.assertTrue(ephemeral)
