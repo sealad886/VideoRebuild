@@ -42,6 +42,24 @@ window; an abrupt process exit or failed write can repeat an uncommitted window.
 Completed association coverage remains available if interruption occurs before
 the batch's remaining reconstruction work completes.
 
+Association transactions normally commit at the next completed association
+after 60 seconds. Set `VIDEOREBUILD_ASSOCIATION_CHECKPOINT_SECONDS` to a positive,
+finite number of seconds to change that interval, for example:
+
+```bash
+VIDEOREBUILD_ASSOCIATION_CHECKPOINT_SECONDS=120 videorebuild run \
+  --case /healthy/recovery-case --input /recovered/files --deep
+```
+
+Changing this interval does not invalidate existing association progress.
+Transactions also commit after 250,000 newly stored matching hit rows to
+bound pending database work, and at association completion. Source bytes read
+and rejected locations do not trigger extra commits. Free-space checks run
+independently of commits, and SQLite retains full synchronous durability.
+Interruption can repeat work since the last committed transaction; one slow
+association can extend the normal interval. In-progress hits are rolled back
+with their cursor rather than being saved as complete work.
+
 Association checkpoints apply to certified groups in exhaustive indexed deep
 search. Groups without a structural certificate, explicit finite search limits
 and raw nomination paths retain their existing retry behavior; an unfinished
@@ -75,8 +93,11 @@ successfully reconstructed recordings. Reported counters are not a whole-case
 completion percentage when the total amount of search work is unknown.
 
 Keep the case directory, including its `work` directory, when preserving
-progress. The tool retains a single association checkpoint generation for its
-current scope rather than accumulating copies for every restart. Checkpointing
+progress. Each save updates the same association checkpoint database in place;
+there are no historical association checkpoint copies to retain or prune. A
+transient SQLite rollback journal protects the current transaction and is
+removed on commit. Genuine matching locations remain in the current database
+because later ambiguity and reconstruction checks need them. Checkpointing
 does not impose a total case quota: source indexes, genuine matching
 alternatives and reconstructed media can still require substantial space.
 

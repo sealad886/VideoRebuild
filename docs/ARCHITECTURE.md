@@ -74,8 +74,11 @@ Accepted reference bookkeeping uses a shared owner-labelled physical interval in
 
 Certified groups in uncapped indexed deep association also checkpoint exact
 checked locations and all matching physical hits in
-`work/association-checkpoint.sqlite3`. Bounded
-transactions commit hits and their source/location cursor together. Independent
+`work/association-checkpoint.sqlite3`. Transactions commit hits and their
+source/location cursor together after 60 seconds, 250,000 new matching hit rows,
+or association completion. The interval is configurable without changing
+checkpoint identity; free-space checks run independently. Each save updates
+the same database, with no historical checkpoint copies. Independent
 geometry receipts bind matching policy, source and map identities, allocation,
 ownership and tier scope; incomplete coverage cannot establish absence or
 uniqueness. Assembly can reuse complete association coverage after interruption,

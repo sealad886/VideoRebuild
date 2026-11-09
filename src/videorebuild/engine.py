@@ -1555,8 +1555,7 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
                                         if checkpoint is not None:
                                             checked = state['anchor_checks']-checks_before
                                             checkpoint.advance(domains[member], sid, at, checked,
-                                                               counts_by_group[member]-hits_before,
-                                                               sum(chunk.size for chunk in groups[member].chunks) if checked else 0)
+                                                               counts_by_group[member]-hits_before)
                             finally:
                                 close = getattr(posting_rows, 'close', None)
                                 if close is not None:
