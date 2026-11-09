@@ -6,6 +6,8 @@ overlay; it never removes a physical witness from this checkpoint.
 from contextlib import contextmanager
 import hashlib
 import logging
+import math
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -18,9 +20,21 @@ from .validate import VALIDATION_REVISION
 
 LOG = logging.getLogger(__name__)
 CHECKPOINT_REVISION = 1
-PAGE_ROWS = 4096
-PAGE_READ_BYTES = 64 * 1024**2
-PAGE_SECONDS = 5
+DEFAULT_CHECKPOINT_SECONDS = 60.0
+CHECKPOINT_SECONDS_ENV = 'VIDEOREBUILD_ASSOCIATION_CHECKPOINT_SECONDS'
+MAX_PENDING_HITS = 250_000
+SPACE_CHECK_ROWS = 4096
+SPACE_CHECK_SECONDS = 1.0
+
+
+def _checkpoint_seconds():
+    try:
+        value = float(os.environ.get(CHECKPOINT_SECONDS_ENV, str(DEFAULT_CHECKPOINT_SECONDS)))
+    except ValueError as error:
+        raise SafetyError(f'{CHECKPOINT_SECONDS_ENV} must be a finite positive number of seconds') from error
+    if not math.isfinite(value) or value <= 0:
+        raise SafetyError(f'{CHECKPOINT_SECONDS_ENV} must be a finite positive number of seconds')
+    return value
 
 
 def _private(path):
@@ -52,6 +66,7 @@ def domain_key(group, profile, relative):
 
 class AssociationCheckpoint:
     def __init__(self, case, pool, run_key):
+        self.interval = _checkpoint_seconds()
         self.pool = pool
         work = Path(case.root) / 'work'
         if work.is_symlink() or (work.exists() and not work.is_dir()):
@@ -65,13 +80,15 @@ class AssociationCheckpoint:
         self._connect()
         self.states = {}
         self.changed = set()
-        self.pending_rows = self.pending_bytes = 0
-        self.last_commit = time.monotonic()
+        self.pending_hits = self.space_check_rows = 0
+        self.last_commit = self.last_space_check = time.monotonic()
         try:
             self._initialize(identity)
         except BaseException:
             self.db.close()
             raise
+        LOG.info('Deep association checkpoint policy: interval=%.3gs, pending_hit_limit=%d; '
+                 'single in-place database, no historical snapshots', self.interval, MAX_PENDING_HITS)
 
     def _connect(self):
         self.db = sqlite3.connect(self.path)
@@ -144,8 +161,9 @@ class AssociationCheckpoint:
 
     def add_hit(self, domain, fingerprint, sid, start):
         self.db.execute('INSERT INTO hit_locations VALUES(?,?,?,?)', (domain, fingerprint, sid, start))
+        self.pending_hits += 1
 
-    def advance(self, domain, sid, start, checks, hits, read_bytes):
+    def advance(self, domain, sid, start, checks, hits):
         # Called only after the yielded association body returned normally.
         # A signal anywhere in this page rolls the transaction back.
         state = self.states[domain]
@@ -153,10 +171,16 @@ class AssociationCheckpoint:
             raise SafetyError('Deep association checkpoint cursor did not advance')
         state[:] = [sid, start, state[2]+1, state[3]+checks, state[4]+hits, 0]
         self.changed.add(domain)
-        self.pending_rows += 1
-        self.pending_bytes += read_bytes
-        if (self.pending_rows >= PAGE_ROWS or self.pending_bytes >= PAGE_READ_BYTES or
-                time.monotonic()-self.last_commit >= PAGE_SECONDS):
+        self.space_check_rows += 1
+        now = time.monotonic()
+        if (self.space_check_rows >= SPACE_CHECK_ROWS or
+                now-self.last_space_check >= SPACE_CHECK_SECONDS):
+            require_search_space(self.path.parent)
+            self.space_check_rows = 0
+            self.last_space_check = now
+        # Bound actual transaction metadata, not source bytes hashed or rejected
+        # locations. Large reads and zero-hit scans must not force rapid saves.
+        if self.pending_hits >= MAX_PENDING_HITS or now-self.last_commit >= self.interval:
             self.save()
 
     def complete(self, domains):
@@ -182,7 +206,7 @@ class AssociationCheckpoint:
                  sum(state[2] for state in self.states.values()), sum(state[4] for state in self.states.values()),
                  len(self.states))
         self.changed.clear()
-        self.pending_rows = self.pending_bytes = 0
+        self.pending_hits = 0
         self.last_commit = time.monotonic()
 
     def close(self, successful=False):

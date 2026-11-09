@@ -75,7 +75,7 @@ class AssociationResumeTests(unittest.TestCase):
             return value
 
         with self.opened() as (case, pool), patch.object(engine, '_group_hash', interrupt), \
-                patch.object(association_resume, 'PAGE_ROWS', 4):
+                patch.object(association_resume, 'MAX_PENDING_HITS', 4):
             with self.assertRaises(KeyboardInterrupt):
                 self.associate(case, pool)
             self.assertTrue(all(case.job('ordinary', movie.digest) is None for movie in self.movies))
@@ -222,7 +222,7 @@ class AssociationResumeTests(unittest.TestCase):
                 pages = checkpoint.db.execute('PRAGMA page_count').fetchone()[0]
                 checkpoint.db.execute(f'PRAGMA max_page_count={pages}')
 
-        with self.opened() as (case, pool), patch.object(association_resume, 'PAGE_ROWS', 16), \
+        with self.opened() as (case, pool), patch.object(association_resume, 'MAX_PENDING_HITS', 16), \
                 patch.object(association_resume.AssociationCheckpoint, 'save', limit_after_save):
             with self.assertRaises(SafetyError) as full:
                 self.associate(case, pool)
@@ -245,7 +245,7 @@ from unittest.mock import patch
 from test_association_io_parity import movie_with_audio
 from videorebuild import association_resume, engine
 from videorebuild.storage import Case, ReaderPool
-association_resume.PAGE_ROWS = 4
+association_resume.MAX_PENDING_HITS = 4
 original = engine._group_hash
 calls = 0
 def fingerprint(group, mapping, pool, **kwargs):
@@ -315,6 +315,13 @@ with Case(Path(sys.argv[1])) as case, ReaderPool(case.sources()) as pool, \\
 
     def test_zero_hit_page_is_durable_without_claiming_incomplete_coverage(self):
         original = association_resume.AssociationCheckpoint.save
+        original_advance = association_resume.AssociationCheckpoint.advance
+        clock = [0.0]
+
+        def advance(checkpoint, *args):
+            if sum(state[2] for state in checkpoint.states.values()) == 3:
+                clock[0] = 60.0
+            return original_advance(checkpoint, *args)
 
         def interrupt_after_commit(checkpoint):
             original(checkpoint)
@@ -323,8 +330,9 @@ with Case(Path(sys.argv[1])) as case, ReaderPool(case.sources()) as pool, \\
         with self.opened() as (case, pool):
             self.claim_range(case, pool, 0, len(self.data))
             view = CandidateTiers(case, pool).view()
-            with patch.object(association_resume, 'PAGE_ROWS', 4), patch.object(
-                    association_resume.AssociationCheckpoint, 'save', interrupt_after_commit):
+            with patch.object(association_resume.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(association_resume.AssociationCheckpoint, 'advance', advance), \
+                    patch.object(association_resume.AssociationCheckpoint, 'save', interrupt_after_commit):
                 with self.assertRaises(KeyboardInterrupt):
                     self.associate(case, view)
             self.assertTrue(all(case.job('ordinary', movie.digest) is None for movie in self.movies))
