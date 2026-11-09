@@ -2,9 +2,9 @@ import contextlib
 import hashlib
 import io
 from pathlib import Path
-import subprocess
 import tempfile
 from types import SimpleNamespace
+from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
@@ -25,6 +25,7 @@ class WaitingProcess:
         self.killed = False
         self.reaped = False
         self.waits = []
+        self.finished = Event()
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
@@ -32,18 +33,40 @@ class WaitingProcess:
             self.reaped = True
             return self.returncode
         if self.interrupt:
+            self.interrupt = False
             raise KeyboardInterrupt
-        elapsed = min(timeout, self.remaining)
-        self.clock.now += elapsed
-        self.remaining -= elapsed
-        if self.remaining:
-            raise subprocess.TimeoutExpired('synthetic tool', timeout)
-        self.returncode = 0
-        return 0
+        self.finished.wait()
+        self.reaped = True
+        return self.returncode
 
     def kill(self):
         self.killed = True
         self.returncode = -9
+        self.finished.set()
+
+
+class CompletionEvent:
+    """Advance logical time while the actual reaper waits for completion."""
+    def __init__(self, process, clock):
+        self.process, self.clock = process, clock
+        self.finished = Event()
+
+    def set(self):
+        self.finished.set()
+
+    def wait(self, timeout=None):
+        if self.finished.is_set():
+            return True
+        elapsed = min(timeout, self.process.remaining)
+        self.clock.now += elapsed
+        self.process.remaining -= elapsed
+        if not self.process.remaining:
+            self.process.returncode = 0
+            self.process.finished.set()
+            if not self.finished.wait(2):
+                raise AssertionError('completed synthetic process was not reaped')
+            return True
+        return False
 
 
 class RecoveryProgressTests(unittest.TestCase):
@@ -54,17 +77,17 @@ class RecoveryProgressTests(unittest.TestCase):
                 process = WaitingProcess(clock, duration)
                 stream = io.StringIO()
                 with patch('videorebuild.validate.subprocess.Popen', return_value=process), \
+                        patch('videorebuild.validate.Event', side_effect=lambda: CompletionEvent(process, clock)), \
                         patch('videorebuild.validate.time.monotonic', side_effect=lambda: clock.now), \
                         reporting(stream=stream, clock=lambda: clock.now):
                     result = run_tool(['/tools/ffmpeg', 'private-input.mp4'], timeout)
                 self.assertEqual(result['timeout'], expected_timeout)
                 self.assertEqual(clock.now, min(duration, timeout))
-                self.assertTrue(all(wait <= 5 for wait in process.waits if wait is not None))
                 self.assertIn('running', stream.getvalue())
                 self.assertNotIn('%', stream.getvalue())
                 self.assertNotIn('private-input.mp4', stream.getvalue())
                 self.assertEqual(process.killed, expected_timeout)
-                self.assertEqual(process.reaped, expected_timeout)
+                self.assertTrue(process.reaped)
                 self.assertIn('failed' if expected_timeout else 'finished', stream.getvalue())
 
     def test_nonzero_tool_exit_is_reported_as_failure(self):

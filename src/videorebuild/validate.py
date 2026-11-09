@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from threading import Event, Thread
 import time
 
 from .bmff import Movie
@@ -30,28 +31,47 @@ def run_tool(args: list[str], timeout: float, output_limit: int = 2*1024*1024) -
         except OSError as e:
             raise SafetyError(f'Cannot launch {args[0]}: {e}') from e
         timed_out = False
-        with phase(f'{Path(args[0]).name} subprocess', unit='jobs') as task:
-            deadline = time.monotonic() + timeout
+        completed = Event()
+        failures = []
+
+        def reap():
             try:
-                while True:
-                    try:
-                        process.wait(timeout=min(5.0, max(0.0, deadline-time.monotonic())))
+                # Timed Popen.wait polls with exponential sleeps on POSIX.
+                # A blocking wait wakes immediately when this child exits.
+                process.wait()
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        waiter = Thread(target=reap, name='videorebuild-tool-wait')
+        try:
+            with phase(f'{Path(args[0]).name} subprocess', unit='jobs') as task:
+                deadline = time.monotonic() + timeout
+                waiter.start()
+                while not completed.wait(min(5.0, max(0.0, deadline-time.monotonic()))):
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        process.kill()
                         break
-                    except subprocess.TimeoutExpired:
-                        if time.monotonic() >= deadline:
-                            timed_out = True
-                            process.kill()
-                            process.wait()
-                            task.outcome('failed', detail='timeout; process stopped')
-                            break
-                        task.heartbeat(detail='waiting for process', timeout_seconds=timeout)
+                    task.heartbeat(detail='waiting for process', timeout_seconds=timeout)
+                waiter.join()
+                if failures:
+                    raise failures[0]
+                if timed_out:
+                    task.outcome('failed', detail='timeout; process stopped')
                 task.advance()
                 if process.returncode and not timed_out:
                     task.outcome('failed', detail=f'exit status {process.returncode}')
-            except BaseException:
-                process.kill()
-                process.wait()
-                raise
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            # Join before closing the spool files, including cancellation and
+            # waiter/startup errors. The caller retains ownership of the child.
+            if waiter.ident is not None:
+                waiter.join()
         out.seek(0)
         err.seek(0)
         stdout = out.read(output_limit+1)
