@@ -12,6 +12,8 @@ Recovered files and optional image/map/DFXML → physical source catalogue → l
 registration, logical mapping intake, recovery reads and browser selection.
 Historical catalogue rows are retained rather than deleting evidence or touching
 the metadata file on disk.
+Only the pure path-name predicate has a bounded memoization cache. Mutable source
+records, filesystem identity checks, mappings and read eligibility remain current.
 
 Persisted source validation checks size, modification time and inode. A stored
 operating-system device number is historical metadata, since a reboot/remount
@@ -45,6 +47,24 @@ The index can contain allocated evidence from an earlier unrestricted scan witho
 `fragmented.py` retains narrow initialization, moof/traf/tfhd/trun and NAL validation. `image_recovery.py` discovers initialization locations in the shared catalogue and creates location-specific jobs. Equal headers remain separate locations. Unchanged completed coverage is checked from indexed locations before initialization media reads, while published hashes and current source identities are still verified. Later restarts with a present track missing its timing origin are rejected before reading the remaining section; a track absent from the first fragment can still appear later with explicit timing. It validates prefixes and separately assesses later independent starts up to the next initialization or source boundary, using bounded per-section reads. See FRAGMENTED.md.
 
 FFmpeg remains the codec implementation. Independent packet hashes, exact timing and strict decoding validate candidates; they do not prove recording association. Acquisition status, association evidence and validation are separate manifest fields. Ordinary `matched`, fragmented `decoded_prefix`/segment outcomes, blocked/unsupported states and search limits retain their scope.
+
+Codec subprocess completion uses a blocking child reaper and event-based
+deadlines and heartbeats. The caller kills and reaps timed-out or interrupted
+children and joins the waiter before closing bounded output spools. This changes
+waiting overhead while retaining strict arguments, output limits and validation
+evidence.
+
+Whole-payload origin matches store header and payload-size integers in an index
+ordered by anchor profile, payload size and physical candidate location. Candidate
+enumeration streams this index without a domain-sized ordering buffer and retains
+every eligible location. Origin cache revision 2 binds completed coverage to
+current source stamps, including ctime, while preserving historical device-number
+portability. A verified, closed revision-1 cache is renamed to a local `.v1.bak`
+before rebuilding at the canonical path. Its old positive and negative coverage
+is not adopted as new proof. Existing backups are preserved; a backup collision
+stops the transition. Interrupted initialization can resume without replacing the
+backup. This derived-cache transition leaves canonical case tables and inputs
+intact. See [PERFORMANCE.md](PERFORMANCE.md) for measured scope and tradeoffs.
 
 Default search policy enumerates eligible candidates in the first tier, excluding physical intervals already represented by accepted publications. Exclusions follow physical identity across aliases and mapped streams, while metadata remains readable and a resumed target can revalidate its own accepted intervals. Canonical jobs and publication provenance define the derived secondary membership; source files, atom indexes and prior accepted media remain intact. With `--include-recovered`, a target searches recovered references only after its first-tier whole/deep search yields no candidate. Job and sidecar scopes state searched tiers and whether second-tier evidence remains unsearched; first-tier uniqueness or absence is not a global claim. Optional finite search cutoffs preserve `search_limited` evidence. Ordinary catalogue identities and ordered whole-payload candidate locations are first snapshotted into private temporary SQLite storage. Case metadata is then loaded one movie at a time with completed point queries, so durable attempt commits do not retain a long-lived case read snapshot that prevents WAL recycling. Metadata BLOBs and candidate sets are not accumulated in Python memory. Uniform-offset hypotheses share a prepared read-only mapping plan; sparse rejection avoids rebuilding chunk assignments and sorting ranges for every candidate. Accepted mapping digests retain the canonical encoded representation. Translated sparse-negative keys are explicitly typed, source/scope-bound descriptors that avoid expanding all chunk rows; surviving candidates still receive the full allocation, source-range, overlap and encoded-byte proofs. Deep hits retain every physical location, including equal encoded content at different offsets, until physical compatibility is established. Cursor-based backtracking rejects overlapping partial assignments before expanding their remaining choices. Content prefixes expand only when a joint physical witness exists; a compatible witness is extended incrementally, with complete reassignment when a greedy extension fails. Each feasible content tuple is reconstructed once, while alternative locations remain available if a witness is unavailable. Final byte-identical outputs are deduplicated by their encoded bytes. Aliased logical sources cannot supply a second copy of the same physical bytes.
 

@@ -1,4 +1,7 @@
-# Performance optimization — 2026-11-01
+# Recovery performance audits
+
+The first assessment below ran on 1 November 2026. Later assessments appear in
+dated sections; each retains its own baseline and evidence limits.
 
 ## Scope and acceptance
 
@@ -168,3 +171,99 @@ The implementation follows the project's Python 3.13 floor:
 [cached properties for immutable data](https://docs.python.org/3.13/library/functools.html#functools.cached_property),
 [buffer views](https://docs.python.org/3.13/library/stdtypes.html#memoryview), and
 [JSON serialization](https://docs.python.org/3.13/library/json.html).
+
+## Adversarial throughput audit - 2026-11-09
+
+Recovery performance changes must preserve eligible candidates, physical
+alternatives, ownership and allocation rules, encoded bytes, requested validation,
+publication evidence and interruption/resume behavior. A faster search with less
+coverage is a different operation and cannot establish a speedup.
+
+### Optimizations assessed on 9 November 2026
+
+The comparison baseline was commit
+`1bd3e60a09c5aa1e906fc9744dd2639228cd5d74`. Measurements used Python 3.13.18,
+SQLite 3.54.1 and FFmpeg/FFprobe 9.0.2 on an arm64 Mac with 12 CPUs and 36 GiB RAM.
+A separate recovery remained active on the host, so results include shared-host
+noise. The actual implementations were compared with the baseline after warmup,
+using five matched pairs and alternating execution order.
+
+| Measured operation | Fixture | Median baseline | Median changed | Supported conclusion |
+| --- | --- | --- | --- | --- |
+| Tool completion and validation | Eight six-frame H.264 validations, four valid and four invalid | 0.977 s | 0.879 s | About 10% less validation time in this fixture |
+| Ordered whole-payload origin query | 60,000 matches across 64 sources | 0.0622 s | 0.0295 s | About 2.1 times the query throughput, with identical ordered rows |
+| Rejected-candidate pipeline | Three 10 MiB, 1,816-chunk attempts from one source | 0.8205 s | 0.5773 s | About 1.42 times the throughput, with identical attempt evidence |
+| Rejected-candidate pipeline | The same shape across eight round-robin sources | 0.8300 s | 0.5943 s | About 1.40 times the throughput, with identical attempt evidence |
+
+These operations are measured separately. Their ratios must not be multiplied
+to predict a complete recovery's throughput or completion time. Initial prototype
+results are superseded by measurements of the actual implementation.
+
+#### Subprocess completion
+
+Timed `Popen.wait` uses polling sleeps on supported POSIX runtimes. A blocking
+waiter now reports completion through an event while the caller retains the
+deadline and five-second progress heartbeat. Cancellation, launch errors, waiter
+errors and timeouts still clean up the owned child and waiter before output
+spools close. Strict FFmpeg arguments and validation receipts remain unchanged.
+
+#### Whole-payload origin lookup
+
+The origin index stores the header and payload-size integers needed to return
+candidates in their canonical order. Its covering primary key removes the join
+and temporary sort previously required before returning ordered candidates.
+The measured ordered row count and SHA-256 agree exactly with the baseline.
+
+The fixture's metadata database grew from 2,088,960 to 2,293,760 bytes, about
+9.8%. This stores metadata integers, not another copy of source media. The query
+benchmark measures warm lookup; it does not include initial source indexing,
+cache rebuilding or media reconstruction.
+
+On the first use of the revised layout, a verified old origin cache is closed
+and renamed with a `.v1.bak` suffix, then rebuilt at its usual path with current
+source coverage. The backup is never overwritten. A conflicting backup or unsafe
+file path stops the transition for operator review. Other case indexes and
+completed recovery records remain available. The extra one-time rebuild and
+retained backup need disk space; this is not a canonical case-schema migration.
+The backup retains the old layout for diagnosis or a separately planned rollback;
+older runtimes cannot reuse revision-2 origin caches.
+
+#### Path-name filtering
+
+The `.DS_Store` path-name predicate is pure and has a 4,096-entry LRU cache.
+Only that string/path classification is cached. Source dictionaries are mutable
+and remain uncached; current source, descriptor, map, ctime and eligibility checks
+still run. The metadata files themselves remain untouched.
+
+The combined candidate-pipeline comparison uses the actual subprocess and path
+filter implementations together, against both baseline implementations. All ten
+matched pairs improved. The source-stat counts stayed exactly 14,550 per attempt
+for one source and 14,557 for eight sources. Candidate hashes, reconstruction and
+attempt evidence, strict tool arguments, sync barriers and source bytes agreed;
+only volatile FFmpeg diagnostic allocator addresses were normalized. Cache usage
+was one or eight entries in these fixtures, and no waiter threads remained.
+
+#### Rejected optimization
+
+A bounded experiment deferred the speculative candidate's `fsync` in four
+10 MiB rejected-candidate pipelines. The median changed by only about 1%, with
+one pair regressing; the four sync calls together took roughly 2 ms per batch.
+That did not justify a durability change. The implementation retains existing
+sync barriers. This result does not establish sync cost on other storage.
+
+### Verification and reproducibility
+
+Focused lifecycle, source/filter and ordered-query checks can be run from the
+project environment:
+
+```bash
+PYTHONPATH=src:tests .venv/bin/python -B -m unittest -v \
+  test_subprocess_wait test_origin_index_streaming test_path_filter_cache
+PYTHONPATH=src .venv/bin/python -B -m unittest discover -s tests -v
+```
+
+The qualification workspace retains paired benchmark scripts, numeric results,
+source hashes and the audit ledger under
+`test-results/adversarial-performance-20261109/`. Synthetic timing evidence and
+passing tests do not establish real-media yield, whole-case speedup or quality.
+Updating source or preparing a zipapp does not update an already running recovery.
