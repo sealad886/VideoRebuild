@@ -104,7 +104,7 @@ class AssociationQueryPlanTests(unittest.TestCase):
                 with ReaderPool(case.sources()) as pool:
                     expected = [row[:5] for row in exhaustive_hits(movies, pool, {sid: data})]
 
-                    def inspect(search, groups, reader, stats, task):
+                    def inspect(search, groups, reader, stats, task, **options):
                         keys = {group.key for group in groups}
                         rows = [tuple(row) for row in search.execute(
                             'SELECT movie,g,fingerprint,sid,start FROM hits ORDER BY movie,g,fingerprint,sid,start')
@@ -126,7 +126,7 @@ class AssociationQueryPlanTests(unittest.TestCase):
                             for movie, index, fingerprint, source, at in rows}
                         audited = AuditedQueries(search, self)
                         observed_content = set()
-                        for alternatives in original(audited, groups, reader, stats, task):
+                        for alternatives in original(audited, groups, reader, stats, task, **options):
                             for choices in alternatives:
                                 observed_content.add(tuple(fingerprints_by_location[(*group.key, *choice)]
                                                            for group, choice in zip(groups, choices)))

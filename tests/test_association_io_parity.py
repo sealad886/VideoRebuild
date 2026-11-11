@@ -67,7 +67,7 @@ def capture_association(case, movies, pool, options=None):
                     for part in pool.provenance(sid, start+chunk.offset-group.start, chunk.size))
                 rows.append((movie, index, fingerprint, sid, start, physical))
 
-    def no_assemblies(*args):
+    def no_assemblies(*args, **kwargs):
         yield from ()
 
     with patch.object(engine, '_search_store', capture), \
