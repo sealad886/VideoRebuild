@@ -88,3 +88,11 @@ before assessing release readiness. Synthetic speed measurements do not establis
 private-image recovery throughput or real-camera acceptance. Local process and
 environment boundaries, including the shared-environment isolation violation,
 are recorded in the validation report.
+
+After a filesystem-mapped image scan, `videorebuild salvage` can produce
+strictly decoded video-only excerpts of damaged ordinary AVC1 and HVC1 MP4s
+with surviving sample tables. It restarts at independently decodable IDRs,
+preserves source packet bytes and media timing, and emits sample ranges and
+physical witnesses in JSON manifests. Acquisition holes and rejected groups
+remain gaps between clips. The ordinary whole-file recovery decision is
+unchanged. See the [image recovery release plan](IMAGE_RECOVERY_RELEASE_PLAN.md).
