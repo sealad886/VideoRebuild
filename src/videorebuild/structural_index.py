@@ -191,6 +191,7 @@ def postings(case, pool, lengths, scan, opt, task):
                     predicates[id(missing)] = (missing, bits)
                 bits = predicates[id(missing)][1]
                 wanted = lambda length: bool(bits[length >> 3] & (1 << (length & 7)))
+                wanted.native_bits = bytes(bits)
                 local = dict(nal_checks=0, anchor_checks=0, limited=False, stop_reason=None)
                 batch = []
                 for location in scan(pool, missing[-1]+4, wanted, opt, local, SourceTask(), source_ids=(sid,)):

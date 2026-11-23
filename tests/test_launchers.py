@@ -1,5 +1,6 @@
 """Run the macOS launcher against isolated Homebrew installation trees."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import shlex
@@ -31,16 +32,20 @@ class HomebrewLauncherTests(unittest.TestCase):
             script = script.replace(location, str(fixture))
         self.launcher = self.root/'run-macos.command'
         self.launcher.write_text(script)
-        with zipfile.ZipFile(self.root/'videorebuild.pyz', 'w') as archive:
-            source = self.repo/'src'
-            for module in source.rglob('*.py'):
-                archive.write(module, str(module.relative_to(source)))
-            # Probe the canonical doctor for candidate selection and observe
-            # the selected runtime at the final application boundary.
-            archive.writestr('__main__.py',
-                'import json, sys\n'
-                'from videorebuild.validate import doctor\n'
-                'print(json.dumps({"tools": doctor(), "argv": sys.argv[1:]}))\n')
+        spec = importlib.util.spec_from_file_location('build_zipapp', self.repo/'tools/build_zipapp.py')
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        target = builder.build_archive(self.root/'videorebuild.pyz')
+        with zipfile.ZipFile(target) as archive:
+            content = {name: archive.read(name) for name in archive.namelist()}
+        # Keep the canonical native bootstrap. Observe doctor/tool selection
+        # only after reaching the final CLI boundary.
+        content['videorebuild/cli.py'] = (
+            b'import json, sys\nfrom videorebuild.validate import doctor\n'
+            b'def main():\n    print(json.dumps({"tools": doctor(), "argv": sys.argv[1:]}))\n')
+        with zipfile.ZipFile(target, 'w') as archive:
+            for name, data in content.items():
+                archive.writestr(name, data)
 
     def executable(self, path, body):
         path.parent.mkdir(parents=True, exist_ok=True)

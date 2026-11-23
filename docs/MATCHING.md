@@ -99,7 +99,11 @@ Each worker owns its reader handles. Bounded queues constrain unpublished work;
 the coordinator owns SQLite writes, coverage receipts and ordered publication.
 Parallelism does not make mutable tier decisions in workers. Parser facts may be
 reused only with their exact interpretation context and current read permissions.
-No GPU, native-extension or third-party runtime dependency is required.
+Rust performs bounded NAL scan batches, complete-sample byte checks and physical
+support propagation through the bundled native extension. It releases the GIL
+for suitable batch work. Python retains reader authorization, indexes, coverage
+receipts and coordinator writes. No GPU or third-party Python runtime package
+is required. See [native ownership and verification](RUST_CORE.md).
 
 Framing certificates live beside the structural index in the case work
 directory. Each bounded page commits its accepted locations and cursor together,

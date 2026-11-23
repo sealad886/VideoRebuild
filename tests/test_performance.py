@@ -67,29 +67,18 @@ class DeepSearchPerformanceTests(unittest.TestCase):
     def test_zero_filled_gap_does_not_generate_nal_candidates(self):
         movie = SimpleNamespace(digest='synthetic')
         group = SimpleNamespace(key=('synthetic', 0), anchors=lambda: [(1024, 0)])
-        candidates = []
-        compile_pattern = re.compile
-
-        def instrument(pattern):
-            compiled = compile_pattern(pattern)
-            def finditer(data):
-                for match in compiled.finditer(data):
-                    candidates.append(match.start())
-                    yield match
-            return SimpleNamespace(finditer=finditer)
-
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'image.bin'
             source.write_bytes(bytes(65536))
             stat = source.stat()
             sources = {1: dict(path=str(source), size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                                dev=stat.st_dev, ino=stat.st_ino)}
-            with ReaderPool(sources) as pool, \
-                    patch.object(engine, 'groups_for', return_value=[group]), \
-                    patch.object(engine.re, 'compile', side_effect=instrument), \
-                    patch.object(engine, 'finish'):
-                engine.deep_search(SimpleNamespace(root=Path(directory)), [movie], pool, {}, engine.Options(), 'synthetic')
-        self.assertEqual(candidates, [])
+            state = dict(nal_checks=0, anchor_checks=0, limited=False)
+            from unittest.mock import Mock
+            with ReaderPool(sources) as pool:
+                self.assertEqual(list(engine._anchor_locations(pool, 16, lambda _: True,
+                                 engine.Options(), state, Mock())), [])
+        self.assertEqual(state['nal_checks'], 0)
 
     def test_overlapping_nonzero_length_anchors_remain_visible(self):
         # At offsets 0 and 1: valid first NAL lengths 1 and 257 respectively.
@@ -169,18 +158,18 @@ class SampleValidationPerformanceTests(unittest.TestCase):
         from videorebuild.storage import SafetyError
         with tempfile.TemporaryDirectory() as directory:
             source, movie, pool = self.fixture(directory, [1024]*20)
-            validate_sample = engine.valid_sample
+            read_bytes = pool.read
             changed = False
-            def mutate_after_read(raw, codec, length):
+            def mutate_after_read(sid, offset, size):
                 nonlocal changed
-                result = validate_sample(raw, codec, length)
+                result = read_bytes(sid, offset, size)
                 if not changed:
                     changed = True
                     # Deterministic identity change, independent of timestamp resolution.
                     with source.open('ab') as handle:
                         handle.write(b'X')
                 return result
-            with pool, patch.object(engine, 'valid_sample', side_effect=mutate_after_read):
+            with pool, patch.object(pool, 'read', side_effect=mutate_after_read):
                 with self.assertRaises(SafetyError):
                     engine.check_samples(movie, {(0, 0): (1, 0)}, pool)
 

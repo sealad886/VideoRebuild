@@ -14,14 +14,13 @@ from collections.abc import Mapping as MappingView
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
-from itertools import accumulate, islice
+from itertools import islice
 import errno
 import json
 import logging
 import math
 import os
 from pathlib import Path
-import re
 import shutil
 import struct
 import sqlite3
@@ -29,7 +28,7 @@ import tempfile
 import time
 from typing import Iterable
 
-from . import __version__, nal_search
+from . import __version__, _native, nal_search
 from .association_resume import association_checkpoint, association_geometry, domain_key
 from .artifacts import ensure_generated_file, safe_case_path
 from .bmff import Chunk, FormatError, Movie, iter_sample_nals, make_box, parse_movie, rewrite_offsets, valid_sample
@@ -190,36 +189,45 @@ def check_samples(movie: Movie, mapping: Mapping, pool: ReaderPool, quick: bool 
             if quick:
                 relative_ranges = (plan.quick_samples[(chunk.track, chunk.index)]
                                    if plan is not None else _quick_sample_ranges(chunk))
-                sample_ranges = ((base + offset, size) for offset, size in relative_ranges)
+                for offset, size in relative_ranges:
+                    try:
+                        raw = pool.read(sid, base+offset, size)
+                    except FormatError:
+                        if unavailable_raises:
+                            raise
+                        if task is not None:
+                            task.outcome('failed', detail='sample bytes unavailable')
+                        return False
+                    checked += 1
+                    if not valid_sample(raw, t.codec, t.nal_length):
+                        if task is not None:
+                            task.update(checked)
+                            task.outcome('failed', detail='sample boundaries do not match')
+                        return False
             else:
-                sample_ranges = zip(accumulate(chunk.sizes, initial=base), chunk.sizes)
-            chunk_end = base + chunk.size if not quick else 0
-            window = memoryview(b'')
-            window_start = base
-            for off, n in sample_ranges:
-                try:
-                    if quick:
-                        raw = pool.read(sid, off, n)
-                    else:
-                        if off + n > window_start + len(window):
-                            window = memoryview(pool.read(sid, off, min(
-                                max(n, 4*1024*1024), chunk_end-off)))
-                            window_start = off
-                        raw = window[off-window_start:off-window_start+n]
-                except FormatError:
-                    if unavailable_raises:
-                        raise
-                    if task is not None:
-                        task.outcome('failed', detail='sample bytes unavailable')
-                    return False
-                checked += 1
-                if task is not None and checked % 4096 == 0:
-                    task.update(checked)
-                if not valid_sample(raw, t.codec, t.nal_length):
+                validator = _native.SampleValidator(chunk.sizes, t.codec, t.nal_length)
+                index, off = 0, base
+                chunk_end = base+chunk.size
+                while index < len(chunk.sizes):
+                    size = min(max(chunk.sizes[index], 4*1024*1024), chunk_end-off)
+                    try:
+                        raw = pool.read(sid, off, size)
+                    except FormatError:
+                        if unavailable_raises:
+                            raise
+                        if task is not None:
+                            task.outcome('failed', detail='sample bytes unavailable')
+                        return False
+                    count, consumed, valid = validator.validate_window(raw)
+                    checked += count
                     if task is not None:
                         task.update(checked)
-                        task.outcome('failed', detail='sample boundaries do not match')
-                    return False
+                    if not valid or not count:
+                        if task is not None:
+                            task.outcome('failed', detail='sample boundaries do not match')
+                        return False
+                    index += count
+                    off += consumed
             # Cached bytes still require the source-identity gate after validation.
             pool.check(sid)
         if task is not None:
@@ -1101,63 +1109,36 @@ def _group_hash(group: Group, mapping: Mapping, pool: ReaderPool, *, read_cache=
     return h.hexdigest()
 
 
-def _anchor_locations(pool, maximum_sample, wanted, opt, state, task, *, source_ids=None):
-    """Canonical bounded NAL-chain discovery, independent of target batches."""
-    high = ((maximum_sample - 4) >> 16) & 255
-    # Zero-width matching preserves overlapping length prefixes at block edges.
-    pattern = re.compile(fr'(?=\x00[\x00-\x{high:02x}][\s\S]{{2}})(?!\x00{{4}})'.encode('ascii'))
-
-    # Header facts are independent of the sample start and cumulative length.
-    # Bound cache memory; cache no source bytes and clear at each read block.
-    heads = {}
-
-    def header(sid, block_base, data, pos):
-        if pos in heads:
-            state['discovery_header_cache_hits'] = state.get('discovery_header_cache_hits', 0) + 1
-            return heads[pos]
-        state['discovery_header_reads'] = state.get('discovery_header_reads', 0) + 1
-        def read(offset, count):
-            local = offset-block_base
-            if 0 <= local and local+count <= len(data):
-                return data[local:local+count]
-            return pool.read(sid, offset, count)
-        value = nal_search.header(read, pos)
-        if len(heads) >= 8192:
-            heads.clear()
-        heads[pos] = value
-        return value
-
-    def totals(sid, block_base, data, start):
-        def visit():
-            if opt.max_anchor_checks is not None and state['nal_checks'] >= opt.max_anchor_checks:
-                state.update(limited=True, stop_reason='nal_check_budget')
-                return False
-            state['nal_checks'] += 1
-            if state['nal_checks'] % 4096 == 0:
-                task.heartbeat(nal_checks=state['nal_checks'], anchor_checks=state['anchor_checks'])
-            return True
-        for length in nal_search.cumulative_lengths(lambda pos: header(sid, block_base, data, pos),
-                                                   start, pool.sources[sid]['size'], maximum_sample, visit):
-            if wanted(length):
-                yield length
-
+def _anchor_locations(pool, maximum_sample, wanted, opt, state, task, *, source_ids=None, wanted_bits=None):
+    """Bounded native NAL discovery; ReaderPool owns every evidence read."""
+    wanted_bits = getattr(wanted, 'native_bits', wanted_bits)
     scanned = 0
     for sid in (pool.sources if source_ids is None else source_ids):
         pool.check(sid)
         try:
             for base, data, owned in pool.iter_blocks(sid, overlap=16):
-                heads.clear()
-                at = 0
-                for match in pattern.finditer(data):
-                    at = match.start()
-                    if at >= owned or at+4 > len(data):
-                        continue
-                    for length in totals(sid, base, data, base+at):
-                        yield sid, base+at, length
-                        if state['limited']:
-                            break
-                    if state['limited']:
+                scanner = _native.NalScanner(base, owned, pool.sources[sid]['size'], maximum_sample, wanted_bits)
+                while True:
+                    budget = None if opt.max_anchor_checks is None else max(0, opt.max_anchor_checks-state['nal_checks'])
+                    rows, visits, reads, hits, request, done, limited, at = scanner.scan(data, budget, 1 if any(value is not None for value in (opt.max_anchor_checks, opt.max_hits)) else 4096)
+                    state['nal_checks'] += visits
+                    state['discovery_header_reads'] = state.get('discovery_header_reads', 0) + reads
+                    state['discovery_header_cache_hits'] = state.get('discovery_header_cache_hits', 0) + hits
+                    # Native batches are bounded even when no postings match, so
+                    # workers observe cancellation and the UI remains responsive.
+                    task.heartbeat(nal_checks=state['nal_checks'], anchor_checks=state['anchor_checks'])
+                    for start, length in rows:
+                        if wanted_bits is not None or wanted(length):
+                            yield sid, start, length
+                            if state['limited']:
+                                break
+                    if limited:
+                        state.update(limited=True, stop_reason='nal_check_budget')
+                    if state['limited'] or done:
                         break
+                    if request is not None:
+                        header = nal_search.header(lambda off, count: pool.read(sid, off, count), request)
+                        scanner.supply_header(*header)
                 scanned += min(owned, at+1) if state['limited'] else owned
                 task.update(scanned, anchor_checks=state['anchor_checks'], nal_checks=state['nal_checks'],
                             located_extents=state.get('located_extents', 0), discovered_locations=state.get('locations', 0))
