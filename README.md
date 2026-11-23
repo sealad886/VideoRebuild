@@ -53,6 +53,23 @@ Re-run the recovery command after interruption. Completed source scans, prelimin
 
 Resume automatically restores missing generated candidate and reconstructed MP4 files before reusing accepted results. It first uses a surviving verified case copy, then rebuilds from retained source provenance when needed. Restored media must match the previously accepted SHA-256; matching, validation labels and saved search progress remain intact. Fragmented manifests and validation documents can also be recreated from committed job evidence. Missing or changed original sources, changed existing outputs, unsafe paths and insufficient reconstruction proof still stop recovery. Ordinary source mappings must remain available in a candidate or publication sidecar when both media copies are missing.
 
+## Compare recovered videos with an archive
+
+Compare any recovered-video directory **A** with a transferred-video directory **B**, including their subdirectories:
+
+```bash
+videorebuild compare \
+  --recovered /recovery/videos \
+  --archive /transferred/videos \
+  --output /healthy/video-comparison
+```
+
+Open `OUTPUT/missing.csv` for recovered videos without a confirmed match. The command compares encoded video samples, so container metadata and file names may differ, and a recovered clip can match a segment inside a longer archived video. It checks the whole recovered video before excluding it from the list. Both inputs stay read-only.
+
+Add `--visual` to look for visually similar re-encoded copies using FFmpeg. Visual suggestions remain in `missing.csv` for review; fixed-camera scenes can look alike across different recordings. No match found is a candidate for further investigation, rather than proof that footage is absent. Unreadable or unsupported inputs are reported explicitly. Matching concerns video content; it does not establish audio equivalence, original chronology or recovery completeness.
+
+Reports include JSON, CSV and a Markdown summary, with a reusable cache for repeated comparisons. See [comparison usage and result meanings](docs/COMPARISON.md).
+
 ## Terminal interface
 
 ```bash
