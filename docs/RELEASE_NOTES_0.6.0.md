@@ -33,3 +33,19 @@ Recovery resume also gains targeted restoration of missing generated files:
 - Retain recovery error messages in the case log after report refresh.
 
 These fixes remain part of pending 0.6.0; they do not publish a new release.
+
+Recovered-video comparison also becomes available through `videorebuild compare`:
+
+- Recursively compare a recovered folder against a transferred-video archive,
+  keeping both input trees read-only and reports in a separate output folder.
+- Recognize identical encoded video in different MP4 containers, including a
+  complete recovered clip contained in a longer archived recording.
+- Keep unmatched, unreadable and uncertain visual candidates in `missing.csv`.
+  Optional decoded-image suggestions require review and never establish absence.
+- Reuse a local metadata cache on subsequent runs and report comparison errors
+  separately from missing candidates. Video matching does not establish audio
+  equivalence, original recording completeness or recovery provenance.
+
+See [comparison usage and evidence limits](COMPARISON.md). This additive command
+remains part of the pending 0.6.0 minor release; publication requires separate
+authorization and release verification.
