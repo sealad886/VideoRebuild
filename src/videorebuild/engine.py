@@ -32,7 +32,7 @@ from typing import Iterable
 from . import __version__, nal_search
 from .association_resume import association_checkpoint, association_geometry, domain_key
 from .artifacts import ensure_generated_file, safe_case_path
-from .bmff import Chunk, FormatError, Movie, make_box, parse_movie, rewrite_offsets, valid_sample
+from .bmff import Chunk, FormatError, Movie, iter_sample_nals, make_box, parse_movie, rewrite_offsets, valid_sample
 from .sample_certificates import Profile, SUPPORTED_CODECS, require_search_space, sample_certificates, search_disk_full
 from .storage import Case, ReaderPool, SafetyError, file_sha256, json_text, write_json
 from .validate import VALIDATION_REVISION, doctor, validate
@@ -1670,10 +1670,13 @@ def _deep_batch(case: Case, movies: list[Movie], pool: ReaderPool, tools: dict,
             tried = 0
             pruning = {'partial_assignments_checked': 0, 'partial_assignments_rejected': 0,
                        'content_prefixes_checked': 0, 'content_prefixes_rejected': 0,
-                       'content_tuples_considered': 0, 'physical_witness_attempts': 0}
+                       'content_tuples_considered': 0, 'physical_witness_attempts': 0,
+                       'initial_avc_fingerprints_checked': 0, 'initial_avc_fingerprints_rejected': 0,
+                       'initial_avc_locations_rejected': 0}
             budget_reached = False
             with phase('Deep assemblies attempted', unit='candidates') as assembly_task:
-                content_choices = _content_assemblies(search, gs, pool, pruning, assembly_task)
+                content_choices = _content_assemblies(search, gs, pool, pruning, assembly_task,
+                                                     strict=not opt.reconstruct_only)
                 try:
                     for witnesses in content_choices:
                         for choices in witnesses:
@@ -1737,7 +1740,7 @@ class _HitQueries:
         self.has_domains = search.execute('PRAGMA table_info(extent_domains)').fetchone() is not None
         self.routes = {}
 
-    def _query(self, key, projection, *, suffix='', fingerprint=None):
+    def _query(self, key, projection, *, suffix='', fingerprint=None, after_fingerprint=None):
         if key not in self.routes:
             table, where, params = 'hits', 'h.movie=? AND h.g=?', key
             if self.has_domains:
@@ -1756,6 +1759,9 @@ class _HitQueries:
         if fingerprint is not None:
             where += ' AND h.fingerprint=?'
             params += (fingerprint,)
+        if after_fingerprint is not None:
+            where += ' AND h.fingerprint>?'
+            params += (after_fingerprint,)
         return f'SELECT {projection} FROM {table} h WHERE {where} {suffix}', params
 
     def select(self, key, projection, **options):
@@ -1805,11 +1811,64 @@ def _prune_physical_domains(search, groups, pool, stats, footprints, *, hits=Non
                            ((*group.key, *choice) for choice, _ in before if choice not in retained))
 
 
-def _content_assemblies(search, groups, pool, stats, task):
+def _prune_initial_avc(search, groups, pool, stats, task, hits, footprints):
+    """Discard exact content branches whose first AVC packet cannot start a picture."""
+    for group in groups:
+        initial = [c for c in group.chunks if c.sample_start == 0 and c.sizes[0] <= 16*1024*1024 and
+                   group.movie.tracks[c.track].codec in {b'avc1', b'avc3'}]
+        if not initial:
+            continue
+        after = None
+        while rows := hits.select(group.key, 'fingerprint,count(*)', after_fingerprint=after,
+                                 suffix='GROUP BY fingerprint ORDER BY fingerprint LIMIT 256').fetchall():
+            rejected = []
+            for fingerprint, count in rows:
+                witnesses = _assemblies(search, [group], pool, counts=[count], fingerprints=[fingerprint],
+                                        stats=stats, task=task, footprints=footprints, hits=hits)
+                try:
+                    for (choice,) in witnesses:
+                        sid, start = choice
+                        try:
+                            impossible = False
+                            for chunk in initial:
+                                track = group.movie.tracks[chunk.track]
+                                raw = pool.read(sid, start + chunk.offset-group.start, chunk.sizes[0])
+                                # FFmpeg may reinterpret these nonstandard packet wrappers.
+                                if raw.startswith(b'Q264') or raw[:1] == b'\1':
+                                    continue
+                                types = {nal[0] & 31 for nal in iter_sample_nals(raw, track.codec, track.nal_length)}
+                                # Partition B/C and ancillary NALs cannot supply the initial
+                                # picture header. Keep primary, extension and unknown types.
+                                impossible |= bool(types) and types <= {3, 4, 6, 7, 8, 9, 10, 11, 12}
+                            pool.check(sid)
+                        except FormatError:
+                            # An unavailable witness is not a negative about its content.
+                            continue
+                        stats['initial_avc_fingerprints_checked'] += 1
+                        if impossible:
+                            rejected.append(fingerprint)
+                            stats['initial_avc_fingerprints_rejected'] += 1
+                            stats['initial_avc_locations_rejected'] += count
+                        break
+                finally:
+                    witnesses.close()
+            if rejected:
+                placeholders = ','.join('?' for _ in rejected)
+                search.execute(f'DELETE FROM hits WHERE movie=? AND g=? AND fingerprint IN ({placeholders})',
+                               (*group.key, *rejected))
+            after = rows[-1][0]
+            task.heartbeat(**stats)
+
+
+def _content_assemblies(search, groups, pool, stats, task, *, strict=False):
     footprints = OrderedDict()
     hits = _HitQueries(search)
+    if strict:
+        _prune_initial_avc(search, groups, pool, stats, task, hits, footprints)
     _prune_physical_domains(search, groups, pool, stats, footprints, hits=hits)
     distinct = [hits.fingerprint_count(group.key) for group in groups]
+    if any(count == 0 for count in distinct):
+        return
     order = sorted(range(len(groups)), key=lambda i: distinct[i])
     cursors = []
     selected = []

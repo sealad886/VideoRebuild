@@ -43,7 +43,7 @@ class AssociationResumeTests(unittest.TestCase):
     def associate(self, case, pool, movies=None, *, run_key='resume-test', options=None, retain=False):
         rows = []
 
-        def capture(search, groups, *args):
+        def capture(search, groups, *args, **kwargs):
             keys = {group.key for group in groups}
             rows.extend(tuple(row) for row in search.execute(
                 'SELECT movie,g,fingerprint,sid,start FROM hits ORDER BY movie,g,fingerprint,sid,start')
@@ -97,7 +97,7 @@ class AssociationResumeTests(unittest.TestCase):
     def test_completed_associations_survive_finished_movie_leaving_batch(self):
         calls = []
 
-        def stop_before_second_movie(search, groups, *args):
+        def stop_before_second_movie(search, groups, *args, **kwargs):
             calls.append(groups[0].movie.digest)
             if len(calls) == 2:
                 raise KeyboardInterrupt
@@ -118,7 +118,7 @@ class AssociationResumeTests(unittest.TestCase):
         self.movies[0] = movie_with_audio('different-geometry', 100, gap=2)
         calls = []
 
-        def stop_before_second_movie(search, groups, *args):
+        def stop_before_second_movie(search, groups, *args, **kwargs):
             calls.append(groups[0].movie.digest)
             if len(calls) == 2:
                 raise KeyboardInterrupt
@@ -256,7 +256,7 @@ def fingerprint(group, mapping, pool, **kwargs):
         sys.stdin.readline()
         raise AssertionError('parent should terminate this process')
     return original(group, mapping, pool, **kwargs)
-def no_assemblies(*args):
+def no_assemblies(*args, **kwargs):
     yield from ()
 with Case(Path(sys.argv[1])) as case, ReaderPool(case.sources()) as pool, \\
         patch.object(engine, '_group_hash', fingerprint), \\
