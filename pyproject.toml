@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==84.1.0"]
+requires = ["setuptools==84.1.0", "setuptools-rust==1.13.0", "semantic-version==2.10.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ description = "MP4 reconstruction from recovered files and mapped image byte ran
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
+license-files = ["LICENSE", "native/THIRD_PARTY_NOTICES.md"]
 authors = [{name = "VideoRebuild contributors"}]
 dependencies = []
 classifiers = [
@@ -28,3 +29,12 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = {attr = "videorebuild.__version__"}
+
+[[tool.setuptools-rust.ext-modules]]
+target = "videorebuild._native"
+path = "native/Cargo.toml"
+binding = "PyO3"
+cargo-manifest-args = ["--locked"]
+debug = false
+features = ["extension-module"]
+py-limited-api = true

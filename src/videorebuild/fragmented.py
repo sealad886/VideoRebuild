@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import struct
 
+from . import _native
 from .bmff import Box, FormatError, boxes, children, one, path, u32
 
 MAX_INIT = 1024 * 1024
@@ -241,27 +242,17 @@ def parse_initialization(data: bytes) -> Initialization:
 def nal_types(data: bytes, offset: int, size: int, track: FragmentTrack) -> tuple[int, ...]:
     if track.handler != 'vide':
         return ()
-    p, end, result = offset, offset+size, []
-    while p < end:
-        if p + track.nal_length > end:
-            raise FormatError('truncated_NAL_length')
-        n = int.from_bytes(data[p:p+track.nal_length], 'big')
-        p += track.nal_length
-        hevc = track.codec in ('hvc1', 'hev1')
-        if n < (2 if hevc else 1) or p+n > end:
-            raise FormatError('invalid_NAL_length')
-        if data[p] & 128 or (hevc and not data[p+1] & 7):
-            raise FormatError('invalid_NAL_header')
-        typ = ((data[p] >> 1) & 63) if hevc else (data[p] & 31)
-        if typ > (40 if hevc else 23) or (not hevc and typ == 0):
-            raise FormatError('unsupported_NAL_type')
-        result.append(typ)
-        if len(result) > 4096:
-            raise FormatError('too_many_NALs_in_sample')
-        p += n
-    if not result:
-        raise FormatError('empty_video_sample')
-    return tuple(result)
+    if offset < 0 or size < 0 or offset > len(data) or size > len(data)-offset:
+        raise FormatError('invalid_NAL_length')
+    # Rust releases the GIL while parsing. Snapshot only this sample when the
+    # caller supplies a mutable buffer/view; immutable fragments remain zero-copy.
+    if not isinstance(data, bytes):
+        data = bytes(memoryview(data)[offset:offset+size])
+        offset = 0
+    try:
+        return tuple(_native.fragment_nal_types(data, track.codec.encode(), track.nal_length, offset, size))
+    except ValueError as error:
+        raise FormatError(str(error)) from error
 
 
 def parse_fragment(data: bytes, pos: int, init: Initialization, *, sample_budget: int | None = None) -> Fragment:

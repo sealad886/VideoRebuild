@@ -43,6 +43,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument('--no-progress', action='store_true', help='Disable progress feedback; errors and warnings remain visible')
     subs = p.add_subparsers(dest='command', required=True)
     subs.add_parser('doctor', help='Check FFmpeg/ffprobe and print exact versions')
+    comparison = subs.add_parser('compare', help='Compare recovered videos against an archive recursively',
+        description='Find recovered videos without a confirmed encoded-video match in an archive. Inputs are read-only; uncertain visual matches remain in the missing-candidate report.')
+    comparison.add_argument('--recovered', required=True, type=Path, help='Recovered-video directory (A); searched recursively')
+    comparison.add_argument('--archive', required=True, type=Path, help='Transferred-video directory (B); searched recursively')
+    comparison.add_argument('--output', required=True, type=Path, help='Comparison reports and cache, outside both input directories')
+    comparison.add_argument('--visual', action='store_true', help='Also suggest visually similar videos using FFmpeg; suggestions require review')
+    comparison.add_argument('--timeout', type=positive_float, default=60.0, help='Seconds per visual FFmpeg subprocess (default: 60)')
     terminal = subs.add_parser('tui', help='Open keyboard-driven recovery menus or watch an existing case read-only',
         description='Keyboard-driven recovery menus. Review a command before running it, or watch a case without controlling its process.',
         epilog='Examples: videorebuild tui; videorebuild tui --case /healthy/case --watch. Use arrow keys and Enter; Q returns or quits.')
@@ -110,6 +117,15 @@ def _execute(args, feedback, argv: list[str]) -> int:
         print('ERROR: This release supports macOS and Linux; use WSL on Windows.', file=sys.stderr)
         return 2
     try:
+        if args.command == 'compare':
+            from .comparison import compare_directories
+            summary = compare_directories(args.recovered, args.archive, args.output,
+                                          visual=args.visual, timeout=args.timeout)
+            print(json.dumps(summary, indent=2))
+            root = args.output.expanduser().resolve()
+            print(f'Missing candidates: {root / "missing.csv"}')
+            print(f'Comparison summary: {root / "summary.md"}')
+            return 0 if summary['complete'] else 1
         if args.command == 'migrate-case':
             from .migration import migrate_case
             print(json.dumps(migrate_case(args.case), indent=2))
@@ -190,7 +206,10 @@ def _execute(args, feedback, argv: list[str]) -> int:
         # statuses in the report are the authoritative machine-readable result.
         return 0
     except KeyboardInterrupt:
-        print('\nInterrupted. Re-run the same command to resume completed source scans and attempts.', file=sys.stderr)
+        if args.command == 'compare':
+            print('\nInterrupted. Re-run the same comparison to reuse completed indexing and visual fingerprints.', file=sys.stderr)
+        else:
+            print('\nInterrupted. Re-run the same command to resume completed source scans and attempts.', file=sys.stderr)
         return 130
     except (SafetyError, OSError, ValueError, sqlite3.Error, ParseError) as e:
         LOG.error('%s', e)

@@ -1,0 +1,109 @@
+name: native-wheel-consumers
+on:
+  workflow_call:
+    inputs:
+      revision:
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            platform: linux-x86_64
+            build: cp313-manylinux_x86_64
+          - os: macos-26
+            platform: macos-arm64
+            build: cp313-macosx_arm64
+          - os: macos-26-intel
+            platform: macos-x86_64
+            build: cp313-macosx_x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: '2'
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: python313
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: python314
+        with:
+          python-version: '3.14'
+          update-environment: false
+      - name: Install build and codec tools
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --require-hashes -r requirements-build.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup override set 1.99.1
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          else
+            brew install ffmpeg
+            echo "$(brew --prefix ffmpeg)/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Build complete source distribution
+        id: source
+        run: |
+          python -c 'from setuptools.build_meta import build_sdist; build_sdist("source-dist")'
+          python -c 'import os,pathlib; p,=pathlib.Path("source-dist").glob("*.tar.gz"); print("path=" + str(p))' >> "$GITHUB_OUTPUT"
+      - name: Build portable native wheel from source distribution
+        uses: pypa/cibuildwheel@b9e566a2b284570af229f6c2a33673410d0389a3 # v4.3.4
+        with:
+          package-dir: ${{ steps.source.outputs.path }}
+          output-dir: candidate
+          python-path: ${{ steps.python313.outputs.python-path }}
+        env:
+          CIBW_BUILD: ${{ matrix.build }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT: CARGO_BUILD_JOBS=2
+          CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH" CARGO_BUILD_JOBS=2
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/videorebuild-rustup.sh
+            && sh /tmp/videorebuild-rustup.sh -y --profile minimal --default-toolchain 1.99.1
+          CIBW_TEST_COMMAND: python -I -c "import videorebuild._native; from videorebuild.bmff import valid_sample; assert valid_sample(bytes.fromhex('000000026578'), b'avc1', 4)"
+      - name: Verify matching standalone and both interpreter consumers
+        env:
+          PYTHON313: ${{ steps.python313.outputs.python-path }}
+          PYTHON314: ${{ steps.python314.outputs.python-path }}
+        run: |
+          cp source-dist/*.tar.gz candidate/
+          for wheel in candidate/*.whl; do
+            standalone="${wheel%.whl}.pyz"
+            python tools/build_zipapp.py --no-progress --wheel "$wheel" --output "$standalone"
+            python tools/check_consumers.py --python "$PYTHON313" --wheel "$wheel" --zipapp "$standalone"
+            python tools/check_consumers.py --python "$PYTHON314" --wheel "$wheel" --zipapp "$standalone"
+          done
+          VERSION="$(PYTHONPATH=src python -c 'import videorebuild; print(videorebuild.__version__)')"
+          python tools/check_release.py --dist candidate --version "$VERSION"
+      - name: Retain verified platform assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-${{ matrix.platform }}
+          path: |
+            candidate/*.whl
+            candidate/*.pyz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain canonical source archive
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-source
+          path: source-dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14

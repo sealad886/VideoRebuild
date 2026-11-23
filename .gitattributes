@@ -1,0 +1,2 @@
+# Preserve verbatim upstream license text, including its whitespace.
+native/THIRD_PARTY_NOTICES.md -whitespace

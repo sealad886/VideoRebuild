@@ -2,7 +2,7 @@
 
 VideoRebuild reconstructs supported AVC/HEVC MP4 video from recovered files, raw disk images and mapped image extents. It matches surviving container metadata to encoded media bytes, rebuilds ordinary MP4 containers, and recovers contiguous fragmented-MP4 prefixes or independently usable later sections.
 
-It runs locally on macOS and Linux with Python 3.13+ and no third-party Python runtime dependencies. Your original inputs remain read-only. Put the case/output directory on healthy storage outside every input tree.
+It runs locally on macOS and Linux with CPython 3.13+. A bundled Rust extension handles CPU-intensive matching and sample validation; there are no third-party Python runtime packages. Your original inputs remain read-only. Put the case/output directory on healthy storage outside every input tree.
 
 - **Indexed matching:** shared payload-origin and structural indexes avoid repeating candidate scans across recordings and restarts.
 - **Resumable cases:** source indexes, search coverage, attempts, publications and reports stay together in one case.
@@ -12,24 +12,28 @@ It runs locally on macOS and Linux with Python 3.13+ and no third-party Python r
 
 ## Install
 
-Download the wheel from [GitHub Releases](https://github.com/sealad886/VideoRebuild/releases), then install it in a virtual environment:
+The 0.6.0 native migration is in preparation; the currently published stable release is 0.5.0. Check [GitHub Releases](https://github.com/sealad886/VideoRebuild/releases) for available artifacts and use the instructions for that release. Native 0.6.0 artifacts are platform-specific: choose a wheel matching your operating system and processor. A `cp313-abi3` wheel supports the standard CPython 3.13 and 3.14 builds. Free-threaded CPython and PyPy are not qualified.
+
+With exactly one matching wheel downloaded into the current directory, install it in a virtual environment:
 
 ```bash
 python3.13 -m venv .venv
 source .venv/bin/activate
-python -m pip install /path/to/videorebuild-0.5.0-py3-none-any.whl
+python -m pip install ./videorebuild-*.whl
 videorebuild tui
 ```
 
 For a command available from any directory, install the downloaded wheel with `pipx` or `uv`:
 
 ```bash
-pipx install --python python3.13 /path/to/videorebuild-0.5.0-py3-none-any.whl
+pipx install --python python3.13 ./videorebuild-*.whl
 # Or:
-uv tool install --python 3.13 /path/to/videorebuild-0.5.0-py3-none-any.whl
+uv tool install --python 3.13 ./videorebuild-*.whl
 ```
 
-To install from a checkout, use `python -m pip install .` in your virtual environment. All interfaces use the same `videorebuild` entry point. Install FFmpeg and ffprobe 8+ separately if you want codec validation; reconstruction-only mode does not require either tool.
+Installing a native wheel does not require Rust. A source-distribution or checkout install (`python -m pip install .` in your virtual environment) requires Rust/Cargo and a platform C linker; pip installs the declared Python build dependencies in an isolated build environment. Cargo obtains the locked Rust dependencies, so an uncached source build needs network access. Install FFmpeg and ffprobe 8+ separately for codec validation; reconstruction-only mode does not require either tool. PyPI publication is not configured.
+
+Standalone `.pyz` archives also carry a platform-specific native library. Use the archive for your operating system and processor with CPython 3.13+; the former universal pure-Python archive is no longer the 0.6.0 distribution. Native code is unpacked into a private temporary directory for that invocation. It does not download code or use a persistent native cache. See [release artifacts and source builds](docs/RELEASING.md).
 
 ## Quick start
 
@@ -52,6 +56,23 @@ videorebuild report --case /healthy/case
 Re-run the recovery command after interruption. Completed source scans, preliminary matching, deferred deep-search work and reusable search coverage remain in the case. The durable queue resumes unfinished deep jobs without repeating completed preliminary matching, including when `--retry` is present. Completed deep jobs are retained across an interrupted pass; an unfinished deep job may be repeated. After a fully completed pass, `--retry` revisits nonmatched results, reusing completed preliminary work for deferred jobs. Changes to the matching revision or search policy cause affected decisions to be re-evaluated while retaining indexed evidence and published media. Recovery appends to `CASE/run.log`, including the reason when recovery fails.
 
 Resume automatically restores missing generated candidate and reconstructed MP4 files before reusing accepted results. It first uses a surviving verified case copy, then rebuilds from retained source provenance when needed. Restored media must match the previously accepted SHA-256; matching, validation labels and saved search progress remain intact. Fragmented manifests and validation documents can also be recreated from committed job evidence. Missing or changed original sources, changed existing outputs, unsafe paths and insufficient reconstruction proof still stop recovery. Ordinary source mappings must remain available in a candidate or publication sidecar when both media copies are missing.
+
+## Compare recovered videos with an archive
+
+Compare any recovered-video directory **A** with a transferred-video directory **B**, including their subdirectories:
+
+```bash
+videorebuild compare \
+  --recovered /recovery/videos \
+  --archive /transferred/videos \
+  --output /healthy/video-comparison
+```
+
+Open `OUTPUT/missing.csv` for recovered videos without a confirmed match. The command compares encoded video samples, so container metadata and file names may differ, and a recovered clip can match a segment inside a longer archived video. It checks the whole recovered video before excluding it from the list. Both inputs stay read-only.
+
+Add `--visual` to look for visually similar re-encoded copies using FFmpeg. Visual suggestions remain in `missing.csv` for review; fixed-camera scenes can look alike across different recordings. No match found is a candidate for further investigation, rather than proof that footage is absent. Unreadable or unsupported inputs are reported explicitly. Matching concerns video content; it does not establish audio equivalence, original chronology or recovery completeness.
+
+Reports include JSON, CSV and a Markdown summary, with a reusable cache for repeated comparisons. See [comparison usage and result meanings](docs/COMPARISON.md).
 
 ## Terminal interface
 
@@ -211,7 +232,7 @@ Use `--search-workers 1..8` for bounded concurrent discovery across independent 
 videorebuild recover --case /healthy/case --deep --reconstruct-only --search-workers 2
 ```
 
-Additional workers can overlap I/O but may contend for the same disk or CPU. Ambiguous assemblies can still require many comparisons; indexed matching does not guarantee linear time for every input. See [matching complexity](docs/MATCHING.md) and [performance evidence](docs/PERFORMANCE.md).
+Additional workers can overlap I/O and native parsing but may contend for the same disk or CPU. Ambiguous assemblies can still require many comparisons; indexed matching does not guarantee linear time for every input. See [matching complexity](docs/MATCHING.md), [Rust ownership](docs/RUST_CORE.md) and [performance evidence](docs/PERFORMANCE.md).
 
 Candidate, padding, hit, assembly, anchor-check and fragmented-start cutoffs are disabled by default. Use `recover --help` for explicit budgets such as `--max-candidates`, `--max-hits`, `--max-assemblies`, `--max-anchor-checks` and `--max-segments`. Reaching a budget records an incomplete search. `--max-groups` sets batch capacity without dropping later jobs; `--limit` bounds the number of new or invalidated metadata records processed. Per-output size and fragmented-section buffer ceilings also apply.
 
@@ -228,15 +249,17 @@ videorebuild report --case /healthy/case
 
 ## Development
 
-From a checkout, create the project environment and install the editable package:
+From a checkout with Rust/Cargo and a platform linker available, create the project environment and build the editable package:
 
 ```bash
 python3.13 -m venv .venv
 .venv/bin/python -m pip install -e .
 .venv/bin/videorebuild --version
 .venv/bin/python -m unittest discover -s tests -v
+CARGO_BUILD_JOBS=2 cargo test --manifest-path native/Cargo.toml --locked
+CARGO_BUILD_JOBS=2 cargo clippy --manifest-path native/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Tests generate synthetic media locally and cover encoded-byte preservation, source immutability, ambiguity, malformed inputs, resource bounds and interruption/resume. The full validation suite requires FFmpeg/ffprobe 8+. Package builds use the pinned requirements in `requirements-build.txt`.
+Tests generate synthetic media locally and cover encoded-byte preservation, source immutability, ambiguity, malformed inputs, resource bounds and interruption/resume. The full validation suite requires FFmpeg/ffprobe 8+. Package builds use the pinned requirements in `requirements-build.txt`. Rebuild the extension after Rust changes; importing directly from `src` requires that built extension too.
 
-See [architecture](docs/ARCHITECTURE.md), [matching design](docs/MATCHING.md), [validation evidence](TEST_REPORT.md), [release procedure](docs/RELEASING.md) and [0.5.0 release notes](docs/RELEASE_NOTES_0.5.0.md). VideoRebuild is distributed under the [MIT license](LICENSE).
+See [architecture](docs/ARCHITECTURE.md), [matching design](docs/MATCHING.md), [validation evidence](TEST_REPORT.md), [release procedure](docs/RELEASING.md) and [0.6.0 preparation notes](docs/RELEASE_NOTES_0.6.0.md). VideoRebuild is distributed under the [MIT license](LICENSE).

@@ -2,6 +2,12 @@
 
 ## Canonical data path
 
+The bundled `videorebuild._native` Rust extension owns bounded NAL discovery,
+encoded-sample checks and physical-domain support computation. Python retains
+the recovery models, checked ReaderPool I/O, index/coverage policy, orchestration,
+publication and reports. See [Rust core](RUST_CORE.md) for the FFI boundary and
+equivalence gates. Native parsing does not open sources or authorize reads.
+
 Recovered files and optional image/map/DFXML → physical source catalogue → logical extent maps → streaming atom discovery → ordinary or fragmented reconstruction plan → structural assembly checks → optional strict packet/timing/full-decode validation → publication and typed job evidence.
 
 `storage.Case` owns one SQLite database (`case.sqlite3`), lock, source catalogue, settings bindings, jobs, attempts and events. `ReaderPool` is the canonical recovery read path. It resolves logical offsets through `ranges.Extent` to checked regular physical sources, overlays acquisition maps and rejects unavailable ranges. Descriptor count is bounded. No missing range is zero-filled or removed to shift subsequent offsets.

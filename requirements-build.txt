@@ -1,4 +1,10 @@
-# Build only; runtime has no third-party Python dependencies.
+# Build only; installed wheels need no third-party Python packages or Rust toolchain.
 setuptools==84.1.0 \
     --hash=sha256:23657205b63d4d31395ab917815247f694aafad28cd21316bf5fd45a51048ea0 \
     --hash=sha256:5231689c6ac8156cd155cfb98c3fd6fb252c3e7e9bd3d78b64d3c55f132624c9
+setuptools-rust==1.13.0 \
+    --hash=sha256:666439c4d90e968bb625bcf87ec0aa02b4f49e599d2f5dc255c633a04e8eca99 \
+    --hash=sha256:f2afcf4baeee689910ce49cfa8aad4e08cce72f417449bcc32891b8664fdc726
+semantic-version==2.10.0 \
+    --hash=sha256:de78a3b8e0feda74cabc54aab2da702113e33ac9d9eb9d2389bcf1f58b7d9177 \
+    --hash=sha256:bdabb6d336998cbb378d4b9db3a4b56a1e3235701dc05ea2690d9a997ed5041c

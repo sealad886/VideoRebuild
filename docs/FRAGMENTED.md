@@ -46,6 +46,10 @@ One shared case lock prevents concurrent writers. Initialization jobs checkpoint
 
 The per-section buffer defaults to 16 MiB and is capped at 256 MiB. This is not a cumulative read quota or a limit on how far later indexed starts may occur. Initialization is capped at 1 MiB; moof at 4 MiB. Each fragment and retained prefix have explicit sample budgets (200,000); samples are at most 64 MiB, and NAL counts are capped at 4,096 per sample. First-tier candidate starts, including rejected starts, have no default count cutoff; `--max-segments` optionally sets one. Prefilter bytes are reused during assembly. Allocation and acquisition masks split available spans; a section never bridges an excluded span. Budget stops retain validated clips and report search_limited. Subprocess timeouts and output-spooling bounds remain enforced. Hitting a limit is not proof that later media is absent.
 
-Candidate plus publication can consume about twice retained encoded bytes, with additional evidence/log space. There is no total-case quota or automatic retention deletion. Use healthy output storage with capacity for attempted alternatives.
+Ordinary publications use case-internal hard links to candidates, or publish the
+validated candidate path when hard links are unavailable. Fragmented sections
+retain their own scoped output paths. Search indexes, retained alternatives and
+evidence/logs also need space. There is no total-case quota or automatic retention
+deletion; use healthy output storage with capacity for attempted alternatives.
 
 Missing-initialization reconstruction, automatic cross-recording association, arbitrary cluster permutation, absolute tfhd addressing, encryption/CENC, external references, edit lists/auxiliary/proprietary tracks, Annex-B conversion, timestamp OCR and wall-clock joining remain unsupported. Explicit raw filesystem extent imports support physical fragmentation without claiming a general proprietary filesystem recovery engine.

@@ -1,4 +1,10 @@
 include README.md LICENSE TEST_REPORT.md requirements-build.txt
+include setup.cfg native/Cargo.toml native/Cargo.lock native/build.rs
+include native/THIRD_PARTY_NOTICES.md
+recursive-include native/src *.rs
+recursive-include native/tests *.rs
+prune native/target
+global-exclude .DS_Store *.so
 exclude videorebuild.pyz
 include run-macos.command recover-interactive.command
 recursive-include docs *.md *.png
