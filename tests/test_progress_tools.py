@@ -48,10 +48,14 @@ class ToolProgressTests(unittest.TestCase):
     def test_build_progress_preserves_archive_bytes_and_stdout_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            shutil.copytree(self.repo/'src', root/'src', ignore=shutil.ignore_patterns('__pycache__'))
+            shutil.copytree(self.repo/'src', root/'src', ignore=shutil.ignore_patterns('__pycache__', '.DS_Store'))
             (root/'tools').mkdir()
             script = root/'tools/build_zipapp.py'
             shutil.copy2(self.repo/'tools/build_zipapp.py', script)
+            shutil.copy2(self.repo/'tools/zipapp_main.py', root/'tools/zipapp_main.py')
+            shutil.copy2(self.repo/'LICENSE', root/'LICENSE')
+            (root/'native').mkdir()
+            shutil.copy2(self.repo/'native/THIRD_PARTY_NOTICES.md', root/'native/THIRD_PARTY_NOTICES.md')
             enabled = self.invoke(script)
             self.assertEqual(enabled.returncode, 0, enabled.stderr)
             self.assert_progress(enabled)

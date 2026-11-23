@@ -67,6 +67,8 @@ def stream_source_scans(pool, tasks, scan, opt, task, workers,
             def wanted(length):
                 return bool(bits[length >> 3] & (1 << (length & 7)))
 
+            wanted.native_bits = bits
+
             with pool.fork((sid,)) as reader:
                 batch = []
                 for location in scan(reader, maximum + 4, wanted, opt, state,

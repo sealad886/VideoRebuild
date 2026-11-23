@@ -1,5 +1,37 @@
 # Executed validation — VideoRebuild
 
+## Native matching integration — November 23, 2026
+
+The Rust migration was reapplied to the initial AVC pruning tree
+`98d59e77a4146ab0f33d24f5e54b134bf15c3f5f`, retaining current deep
+association receipts, sample certificates, and strict validation. Builds and
+tests ran in a disposable source export with isolated Python environments
+and the locked Cargo dependencies.
+
+Both CPython 3.13.18 and 3.14.10 ran 641 tests with 639 passes and two
+optional `fiwalk` tests skipped. FFmpeg and ffprobe were version 9.0.2.
+Rust 1.100.0 passed formatting, five Rust tests, and Clippy with warnings
+denied. A wheel built from the sdist and its matching standalone archive
+passed package verification and clean consumer checks on both CPython
+versions on macOS arm64. These local checks cover the wheel's macOS 27.0
+deployment tag. Older macOS, Linux, macOS Intel, and Rust 1.83 were outside
+this local run.
+
+Five synthetic trials per scenario compared the same source baseline before
+and after the Rust migration. Assertions confirmed equivalent outputs and
+posting sets where applicable.
+
+| Scenario | Python median | Native median |
+| --- | ---: | ---: |
+| Validate 100,000 small samples | 111.036 ms | 1.845 ms |
+| Sparse structural discovery with one worker | 127.721 ms | 29.955 ms |
+| Whole-payload matching through publication | 111.163 ms | 24.186 ms |
+| Scattered recovery plus completed resume | 56.362 ms | 52.727 ms |
+
+These measurements use synthetic fixtures and warm OS caches. The scattered
+case differs by only a few milliseconds. Performance on live recovery
+volumes was outside the test scope.
+
 ## Missing generated-file restoration — November 4, 2026
 
 Pending source version **0.6.0**, local branch
@@ -35,6 +67,109 @@ mapping-bearing sidecar proof when both media copies are absent. On filesystems
 without hard links, forced termination during exclusive copy fallback can leave
 a partial generated destination; it remains an integrity error on resume.
 No commit, push, release, installation or external publication was performed.
+
+## Rust matching core, local 0.6.0 preparation — November 2, 2026
+
+Baseline released v0.5.0 at `e257562a0194cec863bb89eb74d76a2c0847f844` has
+the same tree as local `43671fdf4ecb20419fa0e47df9d494ffbe615f81`. A safely
+archived baseline passed **456 tests in 62.222 s, zero skips**. Implementation
+uses local branch `codex/rust-core` in the existing checkout; no worktree was
+created. The frozen recovery archive and interpreter executable were unchanged.
+The final ownership audit found that the recovery run card names the project
+`.venv/bin/python`: build dependencies and editable package metadata had already
+been installed into that shared environment before this was checked. This
+violated the requested environment-isolation boundary. No package-removal or
+environment-restoration attempt was made during the active recovery. This caveat
+is separate from the passing code, synthetic recovery and artifact checks below.
+
+The final integrated source suite passed **470 tests in 89.184 s on CPython
+3.13.18** and **470 in 89.611 s on CPython 3.14.10**, with no failures or skips.
+These two suites ran concurrently in separate generated fixtures, so durations
+are validation evidence rather than comparative throughput. FFmpeg/ffprobe
+checks used only generated synthetic media. Rust 1.99.1 tests passed five unit
+cases and doc-test execution; `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings` and whitespace checks passed. Rust's declared 1.83 floor was
+not executed locally.
+
+Rust now owns complete NAL framing/SEI checks, ordinary full-sample window batches,
+resumable structural discovery, shared point-origin chain rules and bounded
+physical support propagation. Python retains checked source reads, allocation /
+acquisition and identity gates, tier policy, durable indexes/receipts, SQLite
+coordination, lazy global assignment, encoded-byte reconstruction, provenance
+and publication. Superseded algorithms live only in a test oracle frozen from
+the exact baseline; no Python production fallback competes with native code.
+
+Correctness evidence includes:
+
+- 12,000 deterministic encoded-sample mutations comparing ordinary classifications
+  and fragmented NAL results/errors against the released Python oracle.
+- 600 generated scanner comparisons covering unaligned/overlapping starts,
+  multi-NAL chains, availability holes, counters and explicit limits.
+- 1,200 generated physical-domain cases comparing baseline output/counters and
+  every exhaustive feasible assignment; zero-width ranges, aliases, alternative
+  witnesses and budget fallback remain represented.
+- Independent review added 56 scanner comparisons, 1,296 exhaustive physical
+  cases, 130-choice bitset/budget-boundary probes and 20 mutable/immutable
+  fragmented-buffer comparisons. All nine frozen oracle function bodies were
+  independently checked against baseline ASTs.
+- Existing full-suite regressions protect hard-link publication, candidate-path
+  fallback without a second payload, two distinct movies with `limit=1` followed
+  by resume, immutable completed manifests, scope-qualified coverage, `.DS_Store`
+  exclusions, worker cancellation, source aliases and ordered output evidence.
+
+The first integrated run exposed a mutable-buffer boundary defect: fragmented
+callers supplying bytearray input reached a bytes-only FFI and raised TypeError.
+The correction checks bounds and snapshots only the selected sample before
+releasing the GIL. All 65 fragmented tests and the new buffer regression passed,
+then both complete suites above passed. Obsolete pure-Python launcher/progress
+archive fixtures were updated to use the actual native bootstrap while retaining
+their behavior assertions. No failing test was waived.
+
+Seven-trial synthetic comparisons preserve exact discovery posting sets,
+invariant counters, candidate counts and encoded-media hashes where applicable.
+Complete validation improved 42.72× for tiny samples and 8.26× for larger samples;
+dense one-worker discovery improved 5.99×, support pruning 5.01× and whole-payload
+matching through publication 4.32×. Initial reconstruction and scattered-operation
+medians were slower; three balanced ABBA blocks did not reproduce a regression:
+64 MiB reconstruction was effectively unchanged, scattered recovery plus resume
+improved 19.0%, and whole-payload matching improved 4.18×. The original slower rows
+remain in [PERFORMANCE.md](docs/PERFORMANCE.md), with memory and host/I/O caveats.
+No private/live-corpus throughput or recovery-yield claim is made.
+
+Package preparation uses pinned setuptools / setuptools-rust build dependencies,
+locked Rust dependencies, stable CPython ABI wheels and matching platform-specific
+standalone archives. Native and Python bytes, source Rust inputs and bundled
+license notices are checked. Tests reject missing/mutated native bytes, mismatched
+tags/platforms and missing notices. Standalone normal return and synthetic SIGTERM
+cleanup pass. Local wheel-from-sdist / standalone consumers passed on CPython
+3.13 and 3.14 outside the checkout, with scoped pipx (3.13) and uv tool (3.14)
+installation/doctor checks. Final artifact refresh receipts live with the logs
+below; package success must be tied to those artifact hashes.
+
+The local Homebrew interpreter conservatively tags the wheel `macosx_27_0_arm64`
+even with deployment target 11.0; Mach-O inspection records minimum OS 11.0.
+The tag was preserved rather than relabelled. That local consumer result does
+not qualify older macOS, Linux or Intel. Configured CI builds and consumes
+manylinux_2_28 x86_64, macOS arm64 and macOS x86_64 wheels/archives, plus the
+Linux/macOS CPython 3.13/3.14 integration matrix. Hosted jobs were not run here.
+Actionlint syntax/expression checks pass; optional shellcheck/pyflakes analyzers
+were disabled, and the installed linter's stale Ubuntu 26.04 label warning was
+checked against current GitHub runner documentation.
+
+Readiness: local implementation, synthetic equivalence/performance and macOS
+arm64 interpreter qualification are complete. A published 0.6.0 release remains
+gated on hosted supported-platform artifacts/consumers, required review/CI and
+explicit publication authorization. No push, PR, merge, tag, publication,
+deployment, active-case write, recovered-file decoding/playback or media move
+occurred. The existing local `videorebuild.pyz` was preserved.
+
+Local evidence: ignored `test-results/rust-migration/` contains archived baseline
+source/provenance, `baseline-unittest.log`, `final-python313.log`,
+`final-python314.log`, `baseline-final.json`, `after.json`, `balanced.json`,
+`ffi-crossings.json`, profiles, package-build/consumer logs and
+`PERFORMANCE_ADJUDICATION.md`. [RUST_CORE.md](docs/RUST_CORE.md) records the design;
+[0.6.0 notes](docs/RELEASE_NOTES_0.6.0.md) and
+[RELEASING.md](docs/RELEASING.md) describe installation and release gates.
 
 ## Indexed matching and incremental reconstruction — November 2, 2026
 

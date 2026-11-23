@@ -3,6 +3,129 @@
 The first assessment below ran on 1 November 2026. Later assessments appear in
 dated sections; each retains its own baseline and evidence limits.
 
+## Rust matching core — 2026-11-02
+
+Baseline: released v0.5.0 at `e257562a0194cec863bb89eb74d76a2c0847f844`,
+tree-identical to archived local source `43671fdf4ecb20419fa0e47df9d494ffbe615f81`.
+Native implementation: local `codex/rust-core`, source version 0.6.0. Measurements
+ran on macOS 27.2 arm64, CPython 3.13.18 and Rust 1.99.1 / PyO3 0.29.2.
+All fixtures are synthetic. Recovery and SpeechForge processes were not signaled
+or restarted; the frozen recovery archive and interpreter executable were not
+changed. The shared-environment mutation found in the final audit is disclosed
+in [TEST_REPORT.md](../TEST_REPORT.md). Application indexes were cold on their first pass; the
+operating-system file cache was warm. No privileged cache flushing was used.
+
+The baseline profile selected complete encoded-sample validation, structural NAL
+discovery and physical-domain support propagation. Python classification consumed
+78% of the small-sample validation profile and about 90% of profiled whole-payload
+matching. Python NAL traversal/callbacks consumed about 80% of dense discovery.
+The migrated kernels preserve indexed nominations, full validation and all
+feasible physical witnesses. See [ownership and invariants](RUST_CORE.md).
+
+The same harness ran seven timing trials per workload in isolated subprocesses.
+Allocation and cProfile runs were separate from the timing trials. Recovery and
+discovery scenarios check their expected candidate/posting sets and encoded-media
+hashes where applicable. Parser and support probes check framing validity,
+domains and counters. The comparison also verifies discovery digests and
+invariant work counters.
+
+| Synthetic workload | Python baseline median | Native median | Baseline / native |
+| --- | ---: | ---: | ---: |
+| Validate 100,000 × 8-byte samples | 84.54 ms | 1.98 ms | 42.72× |
+| Validate 16 MiB / 16,384 samples | 21.60 ms | 2.61 ms | 8.26× |
+| Dense discovery, four sources, 1 worker | 338.30 ms | 56.52 ms | 5.99× |
+| Dense discovery, 2 workers | 338.86 ms | 61.63 ms | 5.50× |
+| Dense discovery, 4 workers | 344.59 ms | 88.44 ms | 3.90× |
+| Sparse discovery, 16 MiB, 1 worker | 168.85 ms | 34.19 ms | 4.94× |
+| Sparse discovery, 2 workers | 205.43 ms | 27.44 ms | 7.49× |
+| Sparse discovery, 4 workers | 132.78 ms | 25.14 ms | 5.28× |
+| Support pruning, 20 × 120 choices | 28.36 ms | 5.66 ms | 5.01× |
+| Whole-payload matching through publication, 100,000 samples | 103.35 ms | 23.95 ms | 4.32× |
+| Scattered full recovery plus completed resume | 57.38 ms | 59.34 ms | 0.97× |
+| Reconstruct / hash / sync 64 MiB | 94.43 ms | 107.25 ms | 0.88× |
+
+### Investigation of end-to-end variation
+
+The last two results were investigated before acceptance. A bounded balanced
+experiment alternated baseline → native → native → baseline in three blocks,
+with three timing trials in each child: 18 timings per implementation per path.
+It preserved the original measurements rather than replacing unfavorable rows.
+
+| Balanced whole operation | Baseline median | Native median | Result |
+| --- | ---: | ---: | --- |
+| 64 MiB reconstruction | 119.45 ms | 119.24 ms | 0.18% difference; effectively unchanged |
+| Scattered full recovery plus resume | 81.16 ms | 65.70 ms | 19.0% lower elapsed time; faster in all three blocks |
+| Whole-payload matching through publication | 133.54 ms | 31.95 ms | 4.18× faster |
+
+Reconstruction, range validation, mapping-range traversal and the entire
+ReaderPool have identical ASTs between the measured revisions. Both reconstruction
+profiles perform 16 reads, 19 writes and 51 hash updates. The initial native run
+spent about 22 ms in buffered writes versus 10 ms in the baseline. Balanced runs
+did not reproduce that slowdown; this is evidence of host/I/O variation in the
+initial comparison, not a demonstrated optimization of byte copying.
+
+The baseline 64 MiB profile spent approximately 57% in native hashing, 34% in
+buffered writes and 7% in native reads, leaving less than 2% in Python work.
+Moving that orchestration into Rust was not justified by these measurements.
+Scattered recovery was dominated by SQL and identity gates; global assignment
+was absent from its top 20 costs. Python therefore retains the lazy global
+assignment search and checked reconstruction I/O. No result establishes a
+universal complexity or speed bound for dense ambiguous assignments.
+
+### FFI, worker counts and memory
+
+An explicit 100,000-sample FFI probe took 14.11 ms with individual native calls
+versus 1.65 ms using the batch API, including sample-size transfer: 8.55× lower
+crossing/dispatch cost. Complete validation uses batches rather than one call
+per ordinary sample. Sparse screens retain narrow reads. Native discovery
+returns bounded batches and asks Python for any header outside its authorized
+buffer; it cannot open evidence files itself.
+
+More workers are not uniformly faster. The small dense fixture runs best with
+one native worker; its coordinator/SQLite overhead exceeds parallel gains.
+Sparse discovery benefits from 2–4 workers in these trials. The default remains
+one; results depend on storage and candidate density. Warm durable queries avoid
+source reads and retain their source/scope-qualified coverage checks.
+
+Peak process RSS includes fixture setup, all trials and the separate profile /
+allocation run. It is not isolated kernel memory. Representative baseline →
+native values were 33.16 → 36.08 MB for tiny-sample validation, 49.53 → 47.42 MB
+for one-worker dense discovery, 41.35 → 38.31 MB for support pruning and
+176.70 → 176.85 MB for reconstruction. The native module and transferred sample
+metadata have a cost; there is no across-the-board process-memory reduction.
+Support pruning's traced Python allocation peak falls sharply because its graph
+now lives in Rust; traced Python allocations exclude Rust and SQLite allocations.
+
+### Reproduction and evidence limits
+
+```bash
+PYTHONPATH=/path/to/archived-baseline/src .venv/bin/python tools/benchmark_rust_core.py \
+  --trials 7 --output /tmp/videorebuild-rust-baseline.json
+PYTHONPATH=src .venv/bin/python tools/benchmark_rust_core.py \
+  --trials 7 --output /tmp/videorebuild-rust-after.json \
+  --profile-dir /tmp/videorebuild-rust-profiles \
+  --compare /tmp/videorebuild-rust-baseline.json
+PYTHONPATH=src .venv/bin/python tools/benchmark_rust_core.py \
+  --scenario ffi-crossings --trials 7 --output /tmp/videorebuild-rust-ffi.json
+```
+
+The harness fingerprints Python and native module bytes, records all elapsed/CPU
+samples, mean intervals, peak RSS, Python allocations, I/O block counts, parser
+and search counters, output counts and encoded hashes. `.DS_Store` is excluded
+from its inventory. Local raw evidence is retained under ignored
+`test-results/rust-migration/`: `baseline-final.json`, `after.json`,
+`balanced.json`, `ffi-crossings.json`, `baseline-provenance.json` and their profile
+directories/logs. Earlier baseline JSON files are superseded by `baseline-final`.
+
+These results demonstrate improvement on the migrated synthetic paths and the
+tested whole-payload operation. They do not establish throughput, yield or
+practical completion on a private/live image, nor a speedup for strict FFmpeg
+decoding. Background workload and filesystem variation limit small wall-time
+comparisons. Correctness and package evidence are recorded in
+[TEST_REPORT.md](../TEST_REPORT.md).
+
+## Earlier Python optimization — 2026-11-01
+
 ## Scope and acceptance
 
 Audit all runtime modules and existing tools for avoidable CPU, I/O, and Python

@@ -2,7 +2,7 @@
 
 VideoRebuild has one release unit: the `videorebuild` Python CLI application in
 `src/videorebuild`, distributed together as a wheel, source distribution and
-standalone `videorebuild.pyz`. The distribution identity is `videorebuild`; the
+platform-specific standalone `.pyz` archives. The distribution identity is `videorebuild`; the
 publication destination is the GitHub Releases page for
 `sealad886/VideoRebuild`. PyPI publication is not configured.
 
@@ -10,7 +10,8 @@ publication destination is the GitHub Releases page for
 
 The authorized agent owns version assessment and writes exactly one version
 literal: `src/videorebuild/__init__.py::__version__`. Setuptools 84.1.0 reads that
-literal through `[tool.setuptools.dynamic].version`; wheel and sdist metadata,
+literal through `[tool.setuptools.dynamic].version`; setuptools-rust builds the
+bundled PyO3 extension. Wheel and sdist metadata,
 runtime displays, reports and zipapp code derive from it. Build tools and CI
 validate versions but never bump them. Do not introduce Release Please,
 Changesets, tag-derived versioning or a second editable version field for this
@@ -26,10 +27,10 @@ determine compatibility.
 
 The verified current baseline is GitHub release `v0.5.0`, published
 2 November 2026 at commit `e257562a0194cec863bb89eb74d76a2c0847f844`.
-The next pending version is 0.6.0: measured phase progress bars extend the TUI
-under the pre-1.0 feature policy. See `RELEASE_NOTES_0.6.0.md`. This preparation
-does not include the separately developed Rust migration. Publication requires
-the checks and authorization below.
+The pending 0.6.0 release includes measured TUI progress and the bundled Rust
+matching core. The native core changes platform and source-build requirements.
+See `RELEASE_NOTES_0.6.0.md` and `RUST_CORE.md`. Publication requires the
+checks and authorization below.
 
 While below 1.0, features and intentional breaking changes increment the minor
 component; compatible fixes increment patch. Compute a pending version from
@@ -64,6 +65,9 @@ and verify:
 
 - `main` protections and required `test-and-package` checks for the Linux/macOS,
   Python 3.13/3.14 matrix, plus the agreed PR review requirement.
+  Keep the existing `macos-latest` check names while the matching branch
+  protection rules are in force. The native wheel matrix separately checks
+  Linux x86-64, macOS arm64, and macOS x86-64.
 - A `release` environment restricted to `main`, with the agreed required
   reviewers. A workflow reference alone does not create those protections.
 - GitHub Actions access to the pinned actions, 14-day artifact retention and
@@ -78,15 +82,21 @@ that hosted approval, publishing or immutability settings are effective.
 
 Use the project's existing `.venv` (Python 3.13+) and the hash-pinned
 `requirements-build.txt`. Installation is confined to that environment.
+Rust/Cargo and a platform linker must be available for native source builds;
+the crate declares its minimum Rust version in `native/Cargo.toml`.
 FFmpeg/ffprobe 8+ must be on PATH for the full tests and `doctor`.
 
 ```bash
 .venv/bin/python -m pip install --require-hashes -r requirements-build.txt
+CARGO_BUILD_JOBS=2 .venv/bin/python -m pip install --no-build-isolation --no-deps -e .
+PYO3_PYTHON="$PWD/.venv/bin/python" CARGO_BUILD_JOBS=2 cargo test --manifest-path native/Cargo.toml --locked
+PYO3_PYTHON="$PWD/.venv/bin/python" CARGO_BUILD_JOBS=2 cargo clippy --manifest-path native/Cargo.toml --locked --all-targets -- -D warnings
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
-.venv/bin/python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
-.venv/bin/python tools/build_zipapp.py --no-progress
-cp videorebuild.pyz dist/
+CARGO_BUILD_JOBS=2 .venv/bin/python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir dist
+for native_wheel in dist/*.whl; do
+  .venv/bin/python tools/build_zipapp.py --no-progress --wheel "$native_wheel" --output "${native_wheel%.whl}.pyz"
+done
 VERSION="$(PYTHONPATH=src .venv/bin/python -c 'import videorebuild; print(videorebuild.__version__)')"
 .venv/bin/python tools/check_release.py --dist dist --version "$VERSION"
 ```
@@ -94,19 +104,52 @@ VERSION="$(PYTHONPATH=src .venv/bin/python -c 'import videorebuild; print(videor
 Run builds in a disposable source copy with an empty `dist` so stale artifacts
 cannot be mixed into the candidate. The checker rejects extra distributions,
 version/name mismatches and differences between the checked-out package code
-and wheel, sdist or zipapp contents. Install the wheel built from the sdist into
+and wheel, sdist or zipapp contents. It also checks native wheel/archive byte
+identity, stable-ABI metadata and source-distribution Rust inputs. Install the wheel built from the sdist into
 a disposable environment, change outside the checkout, and require
 `importlib.metadata.version("videorebuild") == videorebuild.__version__` before
 CLI/TUI-help and `doctor` checks. Run the zipapp's `--version` and `doctor` too.
 The ordinary CI matrix performs these checks; the release workflow repeats
-tests and consumer checks on its exact selected revision.
+tests and consumer checks on its exact selected revision. A local macOS build
+does not qualify Linux or another processor architecture. Native library bytes
+must come from the verified wheel for that platform; do not substitute an
+unidentified extension found in a development directory.
 
-`tools/build_zipapp.py` overwrites the ignored local `videorebuild.pyz`.
+Without `--output`, `tools/build_zipapp.py` overwrites the ignored local
+`videorebuild.pyz`. Release builds use the wheel-derived platform filename and
+leave an existing local archive intact.
 Setuptools and pip execute the repository's declared build backend; they do not
 commit, tag or publish. `tools/check_release.py` reads package archives without
 importing their contents. Its `--write-evidence --revision FULL_SHA` option
 writes `SHA256SUMS.txt` and `source-revision.txt` only in the selected artifact
 directory; the caller must first verify that SHA is the checked-out revision.
+
+## Native artifact and installation contract
+
+The release set contains one source distribution plus matching native wheel /
+standalone pairs for each qualified platform. Wheels use the `cp313-abi3` stable
+CPython ABI for the standard CPython 3.13/3.14 matrix. Free-threaded CPython and
+PyPy are not qualified. Linux wheel compatibility must be established with a
+manylinux build and audit; a wheel tagged only `linux_x86_64` from a recent build
+host does not establish broad Linux compatibility. macOS artifacts must identify
+their processor architecture and minimum deployment target.
+
+`pip`, `pipx` and `uv tool install` can consume a downloaded matching wheel
+without Rust. Installing the source archive or a checkout builds the extension
+and needs Rust/Cargo, a platform linker, declared Python build dependencies and
+uncached locked Cargo dependencies. Do not promise that a native wheel exists
+for a platform until the corresponding artifact is built and verified. PyPI
+publication remains unconfigured.
+
+A standalone archive contains the same native bytes as its matching wheel.
+The bootstrap checks the interpreter/platform and embedded digest, then loads
+one bounded native library from a private temporary directory for the command's
+lifetime. Normal return and ordinary cancellation clean up that directory.
+There is no downloaded extension, persistent native cache or Python algorithm
+fallback. Forced process termination can leave operating-system temporary
+storage; it does not modify source evidence or require writing to a case to
+start the CLI. The archive still requires a matching CPython interpreter and
+platform runtime libraries.
 
 ## Authorized GitHub release
 
@@ -128,7 +171,8 @@ retention policy. Failed retention blocks publication.
 The publication job downloads those bytes, verifies checksums and revision,
 and fails on any existing exact tag or release, including a partial draft.
 It creates a new tag at the verified SHA and a draft GitHub release, uploads
-all five assets, checks GitHub asset digests and downloaded bytes, then
+all nine assets (three wheels, three matching standalone archives, one source
+archive and two evidence files), checks GitHub asset digests and downloaded bytes, then
 publishes the completed draft. Draft publication supports immutable GitHub
 releases without replacing assets after publication. No package registry
 credentials or PyPI publisher are used.
