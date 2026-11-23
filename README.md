@@ -101,6 +101,20 @@ The PhotoRec report verifies reported headers against image bytes. A ddrescue ma
 
 For filesystem-guided recovery, supply a DFXML report containing raw byte-run extents through `--extents`. VideoRebuild validates the mappings and reconstructs the mapped logical files. See [source and range architecture](docs/ARCHITECTURE.md) for DFXML, coordinate transforms and acquisition checks.
 
+### Salvage video around damaged regions
+
+For an ordinary MP4 with a surviving sample table, salvage can export standalone video clips from intact groups of pictures on either side of damage. Index the mapped image first. Include the matching ddrescue mapfile when you have one.
+
+```sh
+videorebuild scan --case /healthy/case --image /images/disk.img \
+  --extents /images/filesystem.xml --mapfile /images/disk.map
+videorebuild salvage --case /healthy/case
+```
+
+Look in `CASE/salvaged` and the case report. Each excerpt starts at a verified AVC1 or HVC1 IDR picture, keeps the selected encoded video and local media timing, and passes strict decoding. Audio is omitted. The JSON sidecar records omitted sample intervals by bounding each clip, the original `moov` and physical extents. Filesystem mapping and playback can establish where the copied bytes came from and that the clip decodes. Historical recording identity remains uncertain when a deleted file's extents have been reused.
+
+Salvage only examines mapped logical files with a complete indexed ordinary `moov` and readable top-level MP4 headers. It skips affected GOPs as units and keeps gaps between clips. Run `recover` for complete videos and audio. For oversized tracks, it can emit bounded excerpts without having validated the complete track. Each candidate is limited to 256 MiB, and samples larger than 16 MiB are excluded. Use `salvage --retry --max-attempts 128 --timeout 600 --case /healthy/case` to revisit validation limits and retain clips already accepted. See the [image recovery release plan](docs/IMAGE_RECOVERY_RELEASE_PLAN.md) for coverage, qualification and remaining work.
+
 ### Restrict reconstruction to unallocated image space
 
 Image indexing without filesystem extents scans available bytes, including allocated space. To restrict an existing image case to verified unallocated ranges, provide an image-bound allocation policy during recovery:

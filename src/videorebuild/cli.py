@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import platform
@@ -29,6 +30,13 @@ def positive_int(text: str) -> int:
     return n
 
 
+def positive_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError('must be finite and positive')
+    return value
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog='videorebuild', description='Reconstruct supported MP4 recordings from recovered files and mapped image byte ranges.')
     p.add_argument('--version', action='version', version=f'VideoRebuild {__version__}')
@@ -42,6 +50,11 @@ def parser() -> argparse.ArgumentParser:
     terminal.add_argument('--watch', action='store_true', help='Open the read-only case viewer directly; requires --case')
     migration = subs.add_parser('migrate-case', help='Back up and explicitly migrate an older case')
     migration.add_argument('--case', required=True, type=Path)
+    salvage = subs.add_parser('salvage', help='Extract independently decodable video from damaged, filesystem-mapped MP4s')
+    salvage.add_argument('--case', required=True, type=Path, help='Existing case indexed with scan --image --extents')
+    salvage.add_argument('--timeout', type=positive_float, default=300.0, help='Seconds per FFmpeg or ffprobe validation subprocess')
+    salvage.add_argument('--max-attempts', type=positive_int, default=64, help='Validation attempts per recording (default: 64)')
+    salvage.add_argument('--retry', action='store_true', help='Continue recordings that previously reached a validation limit')
     for name in ('scan', 'recover', 'run', 'report'):
         q = subs.add_parser(name, help={'scan':'Index recovered files and disk images read-only',
                                        'recover':'Reconstruct indexed media', 'run':'Scan, reconstruct, and report',
@@ -115,6 +128,8 @@ def _execute(args, feedback, argv: list[str]) -> int:
         if args.case.expanduser().is_symlink():
             raise SafetyError('Case root must not be a symlink')
         root = args.case.expanduser().resolve()
+        if args.command == 'salvage' and not (root / 'case.sqlite3').is_file():
+            raise SafetyError('Salvage needs an existing case indexed from image extents')
         if args.command in ('scan', 'run'):
             for source in args.input:
                 source = source.expanduser().resolve()
@@ -149,6 +164,9 @@ def _execute(args, feedback, argv: list[str]) -> int:
                 if args.command in ('recover', 'run'):
                     from .workflow import reconstruct
                     reconstruct(case, args)
+                if args.command == 'salvage':
+                    from .ordinary_salvage import salvage_ordinary
+                    salvage_ordinary(case, args.timeout, args.max_attempts, args.retry)
                 summary = report(case)
                 print(json.dumps(summary, indent=2))
                 print(f'Report: {case.root / "reports" / "index.html"}')
