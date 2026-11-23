@@ -62,7 +62,8 @@ class OrdinarySalvageTests(unittest.TestCase):
         if damage == 'map_and_framing':
             stream[overwritten:overwritten + 4] = b'\xff' * 4
         elif damage == 'decoder':
-            stop = overwritten + int(self.samples[40]['size'])
+            overwritten = int(self.samples[4]['pos'])
+            stop = overwritten + int(self.samples[4]['size'])
             offset = overwritten
             changed = False
             for nal in iter_sample_nals(self.pristine[overwritten:stop], b'avc1', 4):
@@ -206,9 +207,22 @@ class OrdinarySalvageTests(unittest.TestCase):
                           for path in (case / 'salvaged').iterdir()}, saved)
         self.assertEqual({path: sha(path) for path in before}, before)
 
-    def test_pristine_mapped_video_does_not_publish_salvage_derivative(self):
+    def test_pristine_mapped_video_can_retry_interrupted_validation_without_exporting(self):
         case, _, _, before = self.fixture()
-        self.cli('salvage', '--case', case, '--timeout', 30)
+        real_tool = validation.run_tool
+
+        def interrupt_decode(argv, *args, **kwargs):
+            if Path(argv[0]).name == 'ffmpeg' and '-xerror' in argv:
+                return {'returncode': -9, 'timeout': False, 'stderr': ''}
+            return real_tool(argv, *args, **kwargs)
+
+        with patch.object(validation, 'run_tool', side_effect=interrupt_decode):
+            self.cli('salvage', '--case', case, '--timeout', 30)
+        results = json.loads((case / 'reports' / 'results.json').read_text())
+        self.assertEqual([job['status'] for job in results['jobs']
+                          if job['kind'] == 'ordinary_salvage'], ['salvage_search_limited'])
+
+        self.cli('salvage', '--case', case, '--timeout', 30, '--retry')
         self.assertFalse(list((case / 'salvaged').glob('*.mp4')))
         results = json.loads((case / 'reports' / 'results.json').read_text())
         self.assertEqual([job['status'] for job in results['jobs']
@@ -227,24 +241,22 @@ class OrdinarySalvageTests(unittest.TestCase):
             return result
 
         with patch.object(validation, 'run_tool', side_effect=observe_tool):
-            self.cli('salvage', '--case', case, '--timeout', 30, '--max-attempts', 1)
-
-        self.assertEqual(len(decode_codes), 1)
-        self.assertNotEqual(decode_codes[0], 0, 'strict decoder must reject the full framed input')
-        self.assertFalse(list((case / 'salvaged').glob('*.mp4')))
-        results = json.loads((case / 'reports' / 'results.json').read_text())
-        self.assertEqual([job['status'] for job in results['jobs']
-                          if job['kind'] == 'ordinary_salvage'], ['salvage_search_limited'])
-
-        self.cli('salvage', '--case', case, '--timeout', 30, '--retry')
-        results = json.loads((case / 'reports' / 'results.json').read_text())
-        self.assertEqual([job['status'] for job in results['jobs']
-                          if job['kind'] == 'ordinary_salvage'], ['salvaged_segments'])
+            for attempt in range(5):
+                retry = ['--retry'] if attempt else []
+                self.cli('salvage', '--case', case, '--timeout', 30, '--max-attempts', 1, *retry)
+                self.assertEqual(len(decode_codes), attempt + 1)
+                self.assertEqual(decode_codes[-1] != 0, attempt < 3)
+                results = json.loads((case / 'reports' / 'results.json').read_text())
+                expected = 'salvage_search_limited' if attempt < 4 else 'salvaged_segments'
+                self.assertEqual([job['status'] for job in results['jobs']
+                                  if job['kind'] == 'ordinary_salvage'], [expected])
+                if attempt < 3:
+                    self.assertFalse(list((case / 'salvaged').glob('*.mp4')))
         disk = image.read_bytes()
         verified = []
         for output in (case / 'salvaged').glob('ordinary-*.mp4'):
             evidence = json.loads(output.with_suffix('.json').read_text())
             self.assert_segment(output, evidence, image, disk, None)
             verified.extend(range(evidence['sample_start'], evidence['sample_stop']))
-        self.assertCountEqual(verified, [*range(36), *range(48, 60)])
+        self.assertCountEqual(verified, range(12, 60))
         self.assertEqual({path: sha(path) for path in before}, before)

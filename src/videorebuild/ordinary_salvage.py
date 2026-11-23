@@ -16,6 +16,7 @@ from .storage import ReaderPool, SafetyError, _candidate_header, file_sha256, wr
 from .validate import VALIDATION_REVISION, doctor, validate
 
 KIND = 'ordinary_salvage'
+SEARCH_REVISION = 1
 MAX_CLIP_BYTES = 256 * 1024**2
 MAX_SAMPLE_BYTES = 16 * 1024**2
 
@@ -137,6 +138,16 @@ def _saved_result(case, sid):
     return prior
 
 
+def _deterministic_rejection(result):
+    if result['reason'] == 'strict_decode_failed':
+        decode = result['decode']
+        # POSIX keeps the low byte of FFmpeg's AVERROR_INVALIDDATA exit code.
+        return (decode['returncode'] == 183
+                and 'Invalid data found when processing input' in decode['stderr'])
+    return result['reason'] in {'clip_geometry_rejected', 'track_count_mismatch',
+                                'stream_or_sample_count_mismatch', 'decoded_video_frame_count_mismatch'}
+
+
 def _export(case, pool, sid, clip, metadata_extent, first, stop, movie, tools, timeout, *, full):
     mapping = {(chunk.track, chunk.index): (sid, chunk.offset) for chunk in movie.chunks}
     work = safe_case_path(case, 'work')
@@ -145,8 +156,7 @@ def _export(case, pool, sid, clip, metadata_extent, first, stop, movie, tools, t
         proof = reconstruct(movie, mapping, pool, stage, MAX_CLIP_BYTES)
         result = validate(stage, movie, tools, timeout)
         if not result['ok'] or full:
-            timed_out = any(result.get(name, {}).get('timeout') for name in ('decode', 'probe'))
-            return None, result['reason'], timed_out
+            return None, result
 
         stem = f'ordinary-{sid}-{clip.source_digest}-{first}-{stop}'
         target = f'salvaged/{stem}.mp4'
@@ -170,7 +180,7 @@ def _export(case, pool, sid, clip, metadata_extent, first, stop, movie, tools, t
                               peers=(stage.relative_to(case.root),))
         ensure_generated_file(case, manifest, manifest_sha256, peers=(manifest_stage.relative_to(case.root),))
         return {'path': target, 'sha256': proof['sha256'], 'bytes': proof['bytes'], 'manifest': manifest,
-                'manifest_sha256': manifest_sha256, 'sample_start': first, 'sample_stop': stop}, 'decode_checked', False
+                'manifest_sha256': manifest_sha256, 'sample_start': first, 'sample_stop': stop}, result
 
 
 def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
@@ -188,14 +198,23 @@ def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
         case.result(str(sid), 'salvage_blocked', {**detail, 'reason': str(error)}, kind=KIND)
         return
     detail['original_video_samples'] = clip.track.sample_count
+    context = {'search_revision': SEARCH_REVISION, 'validation_revision': VALIDATION_REVISION,
+               'source_moov_sha256': clip.source_digest, 'track_id': clip.track.track_id}
+    detail['rejection_context'] = context
+    detail['rejected_intervals'] = []
     if previous:
-        detail['segments'] = previous['detail']['segments']
+        prior = previous['detail']
+        detail['segments'] = prior['segments']
         detail['outputs'] = [item['path'] for item in detail['segments']]
+        if prior.get('rejection_context') == context and prior.get('tools') == tools:
+            detail['rejected_intervals'] = prior.get('rejected_intervals', [])
+    rejected = {tuple(interval) for interval in detail['rejected_intervals']}
     saved = {(item['sample_start'], item['sample_stop']) for item in detail['segments']}
     runs = _runs(_good_gops(clip, pool, sid, detail), clip.metadata_bytes)
     pending = []
     complete_video = False
     exhausted = False
+    interrupted_attempt = False
     while True:
         run = pending.pop() if pending else next(runs, None)
         if run is None:
@@ -204,11 +223,11 @@ def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
         first, stop = run[0][0], run[-1][1]
         if (first, stop) in saved:
             continue
-        if len(run) > 1 and any(first <= a < b <= stop for a, b in saved):
-            # On resume, descend to the same validated children before trying
-            # any new combinations, preserving already published intervals.
-            middle = len(run) // 2
-            pending.extend((run[middle:], run[:middle]))
+        if (first, stop) in rejected or (len(run) > 1 and any(first <= a < b <= stop for a, b in saved)):
+            # Revisit the children without decoding a parent that already failed or overlaps saved clips.
+            if len(run) > 1:
+                middle = len(run) // 2
+                pending.extend((run[middle:], run[:middle]))
             continue
         if detail['attempts'] >= max_attempts:
             break
@@ -218,10 +237,19 @@ def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
             movie = clip.project(first, stop, sync_samples=(gop[0] for gop in run))
             if movie.media_size + len(movie.data) + 1024 > MAX_CLIP_BYTES:
                 raise FormatError('clip exceeds output limit')
-            entry, reason, timed_out = _export(case, pool, sid, clip, metadata_extent, first, stop, movie,
-                                               tools, timeout, full=full)
+            entry, result = _export(case, pool, sid, clip, metadata_extent, first, stop, movie,
+                                    tools, timeout, full=full)
         except FormatError:
-            entry, reason, timed_out = None, 'clip_geometry_rejected', False
+            entry, result = None, {'reason': 'clip_geometry_rejected'}
+        reason = result['reason']
+        decode, probe = result.get('decode', {}), result.get('probe', {})
+        timed_out = bool(decode.get('timeout') or probe.get('timeout'))
+        interrupted = decode.get('returncode', 0) < 0 or probe.get('returncode', 0) < 0
+        # FFmpeg handles some signals itself and returns 255.
+        interrupted |= decode.get('returncode') == 255
+        if not (timed_out or interrupted) and _deterministic_rejection(result):
+            rejected.add((first, stop))
+            detail['rejected_intervals'].append((first, stop))
         if full and reason == 'decode_checked':
             complete_video = True
         if entry is not None:
@@ -229,20 +257,25 @@ def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
             detail['outputs'].append(entry['path'])
             saved.add((first, stop))
             case.result(str(sid), 'salvage_in_progress', detail, kind=KIND)
-        elif reason != 'decode_checked' and len(run) > 1 and not timed_out:
+        elif reason != 'decode_checked' and len(run) > 1 and not (timed_out or interrupted):
             middle = len(run) // 2
             pending.extend((run[middle:], run[:middle]))
         detail['timed_out'] |= timed_out
+        interrupted_attempt |= interrupted and not timed_out
 
     detail['samples_salvaged'] = sum(item['sample_stop'] - item['sample_start'] for item in detail['segments'])
     if complete_video:
         status, reason = 'salvage_not_needed', 'the mapped video track decodes in full'
+    elif interrupted_attempt:
+        status, reason = 'salvage_search_limited', 'validation process interrupted'
     elif not exhausted or detail['timed_out']:
         status, reason = 'salvage_search_limited', 'validation attempt or time limit reached'
     elif detail['outputs']:
         status, reason = 'salvaged_segments', 'independently decoded video excerpts; source gaps and identity remain unresolved'
     else:
         status, reason = 'salvage_unresolved', 'no bounded, independently decoded video excerpt found'
+    if status != 'salvage_search_limited':
+        del detail['rejection_context'], detail['rejected_intervals']
     pool.check(sid)
     case.result(str(sid), status, {**detail, 'reason': reason}, kind=KIND)
 
