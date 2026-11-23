@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 
@@ -19,9 +20,9 @@ class RuntimeTests(unittest.TestCase):
         self.archive = Path(self.temp.name)/'videorebuild.pyz'
         spec = importlib.util.spec_from_file_location(
             'build_zipapp', self.source.parent / 'tools/build_zipapp.py')
-        builder = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(builder)
-        builder.build_archive(self.archive)
+        self.builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.builder)
+        self.builder.build_archive(self.archive)
 
     def run_isolated(self, script):
         return subprocess.run([sys.executable, '-I', '-c', script],
@@ -57,6 +58,14 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(command=result.args):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(__version__, result.stdout)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS platform tag')
+    def test_standalone_from_universal2_python_runs_on_macos(self):
+        with patch('sysconfig.get_platform', return_value='macosx-10.13-universal2'):
+            self.builder.build_archive(self.archive)
+        result = subprocess.run([sys.executable, '-I', str(self.archive), '--version'],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_standalone_rejects_unsafe_paths_and_platform_mismatch_before_extraction(self):
         with zipfile.ZipFile(self.archive) as archive:

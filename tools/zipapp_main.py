@@ -23,8 +23,11 @@ def main():
             raise RuntimeError('Invalid standalone native module path')
         tag, machine = metadata['platform'], platform.machine().lower()
         expected_os = 'darwin' if tag.startswith('macosx_') else 'linux' if 'linux' in tag else None
-        expected_machine = 'arm64' if tag.endswith('_arm64') else 'aarch64' if tag.endswith('_aarch64') else 'x86_64' if tag.endswith('_x86_64') else None
-        if (expected_os != sys.platform or expected_machine != machine
+        compatible_machine = machine in {'arm64', 'aarch64', 'x86_64'} and tag.endswith('_' + machine)
+        if expected_os == 'darwin' and tag.endswith('_universal2'):
+            # The native loader still checks the actual Mach-O architecture.
+            compatible_machine = machine in {'arm64', 'x86_64'}
+        if (expected_os != sys.platform or not compatible_machine
                 or metadata['python'] != 'cp313' or metadata['abi'] != 'abi3'):
             raise RuntimeError(f'VideoRebuild standalone platform {tag} does not match this interpreter')
         if archive.getinfo(name).file_size > 64 * 1024 * 1024:
