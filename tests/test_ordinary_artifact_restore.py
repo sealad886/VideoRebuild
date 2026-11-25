@@ -145,6 +145,55 @@ class OrdinaryArtifactRestoreTests(unittest.TestCase):
                 self.assertFalse(candidate.exists())
                 self.assertFalse(output.exists())
 
+    def test_committed_attempt_resumes_interrupted_candidate_publication(self):
+        for interrupt_at in ('attempt receipt', 'candidate manifest', 'modified staged manifest'):
+            with self.subTest(interrupt_at=interrupt_at), tempfile.TemporaryDirectory() as directory:
+                case, movie, _, sid, _ = self.fixture(Path(directory), alternative=True)
+                options = engine.Options()
+                tools = {}
+                mapping = {(chunk.track, chunk.index): (sid, chunk.offset) for chunk in movie.chunks}
+                validation = {'ok': True, 'reason': 'test_decode_passed', 'decode_checked': True}
+                record_attempt, replace = engine._record_attempt, engine.os.replace
+
+                def save_attempt(*args):
+                    record_attempt(*args)
+                    if interrupt_at != 'candidate manifest':
+                        raise KeyboardInterrupt
+
+                def publish(source, destination):
+                    if (interrupt_at == 'candidate manifest' and destination.parent.name == 'candidates'
+                            and destination.suffix == '.json'):
+                        raise KeyboardInterrupt
+                    return replace(source, destination)
+
+                with ReaderPool(case.sources(), physical_sources=case.physical_sources()) as pool:
+                    with patch.object(engine, 'validate', return_value=validation), \
+                            patch.object(engine, '_record_attempt', side_effect=save_attempt), \
+                            patch.object(engine.os, 'replace', side_effect=publish):
+                        with self.assertRaises(KeyboardInterrupt):
+                            engine.attempt(case, movie, mapping, pool, tools, options, 'whole_mdat')
+                    attempts = list(case.db.execute('SELECT * FROM attempts'))
+                    self.assertEqual(len(attempts), 1)
+                    self.assertIsNone(case.job('ordinary', movie.digest))
+                    with patch.object(engine, 'validate', side_effect=AssertionError('validation repeated')), \
+                            patch.object(engine, 'reconstruct', side_effect=AssertionError('reconstruction repeated')):
+                        if interrupt_at == 'modified staged manifest':
+                            staged, = (case.root / 'work').glob('*.json')
+                            original = staged.read_bytes()
+                            staged.write_bytes(original + b' ')
+                            with self.assertRaisesRegex(SafetyError, 'Generated case file changed'):
+                                engine.attempt(case, movie, mapping, pool, tools, options, 'whole_mdat')
+                            self.assertFalse(list((case.root / 'candidates').iterdir()))
+                            staged.write_bytes(original)
+                        accepted = engine.attempt(case, movie, mapping, pool, tools, options, 'whole_mdat')
+                    candidate = case.root / accepted['path']
+                    self.assertEqual(hashlib.sha256(candidate.read_bytes()).hexdigest(), accepted['sha256'])
+                    manifest = json.loads(candidate.with_suffix('.json').read_text())
+                    self.assertEqual(manifest['validation'], validation)
+                    self.assertTrue(manifest['provenance']['chunks'])
+                    self.assertEqual(list(case.db.execute('SELECT * FROM attempts')), attempts)
+                    self.assertFalse(list((case.root / 'work').iterdir()))
+
     def test_cached_orphan_attempt_recreates_absent_candidate_without_new_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             case, movie, _, sid, options = self.fixture(Path(directory))

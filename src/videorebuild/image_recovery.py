@@ -264,6 +264,7 @@ def restore_fragmented_job(case, pool, job):
         segment = segments.get(entry['path'], {})
         if not output.exists():
             sid, ranges = _fragment_replay_ranges(pool, updated, segment, entry)
+            pending = updated.get('pending_install', {})
             def replay(path):
                 pool.check(sid)
                 with path.open('xb') as stream:
@@ -275,6 +276,7 @@ def restore_fragmented_job(case, pool, job):
                             length -= count
                 pool.check(sid)
             ensure_generated_file(case, entry['path'], entry['sha256'],
+                                  peers=(pending['candidate'],) if pending.get('output') == entry['path'] else (),
                                   expected_size=entry['size'], rebuild=replay)
         manifest_name = entry.get('manifest_path')
         if manifest_name and not safe_case_path(case, manifest_name).exists():
@@ -416,17 +418,10 @@ def check_options(options) -> None:
         raise SafetyError('--max-segments must be a positive integer when supplied')
 
 
-def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> bool:
+def _bind_search_policy(case, tools, options, retry: bool, policy: dict) -> bool:
     """Keep evidence settings immutable; permit explicit search expansion on retry."""
     immutable = {'version': __version__, 'max_record_bytes': options.max_record_bytes,
                  'timeout': options.timeout, 'tools': tools}
-    reconstruct_only = bool(getattr(options, 'reconstruct_only', False))
-    policy = {'max_segments': options.max_segments, 'indexed_starts': 'through_next_initialization',
-              'allocation_scope': allocation_scope}
-    policy['candidate_tiers'] = 'unclaimed_first'
-    policy['include_recovered'] = bool(getattr(options, 'include_recovered', False))
-    if reconstruct_only:
-        policy['reconstruct_only'] = True
     row = case.db.execute("SELECT value FROM settings WHERE name='fragmented_settings'").fetchone()
     prior = json.loads(row[0]) if row else None
     legacy = prior is not None and 'max_segments' in prior
@@ -435,7 +430,7 @@ def _bind_search_policy(case, tools, options, retry: bool, allocation_scope) -> 
     if legacy:
         old_policy = {'max_segments': prior['max_segments'], 'indexed_starts': 'bounded_record_window'}
         prior = {key: value for key, value in prior.items() if key != 'max_segments'}
-    mode_changed = old_policy is not None and bool(old_policy.get('reconstruct_only', False)) != reconstruct_only
+    mode_changed = old_policy is not None and old_policy.get('reconstruct_only', False) != policy.get('reconstruct_only', False)
     if prior is not None and prior != immutable:
         stable = lambda value: {key: item for key, item in value.items() if key != 'tools'}
         if not (retry and mode_changed and stable(prior) == stable(immutable)):
@@ -616,15 +611,15 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
     verify_completed(case)
     _backfill_fragment_manifests(case, pool)
     allocation_scope = pool.allocation_scope.digest if pool.allocation_scope is not None else None
-    policy_changed = _bind_search_policy(case, tools, options, retry, allocation_scope)
-    tiers = CandidateTiers(case, pool)
-    fragment_cache = FragmentCache()
     search_policy = {'max_segments': max_segments, 'indexed_starts': 'through_next_initialization',
                      'allocation_scope': allocation_scope}
     search_policy['candidate_tiers'] = 'unclaimed_first'
     search_policy['include_recovered'] = include_recovered
     if reconstruct_only:
         search_policy['reconstruct_only'] = True
+    policy_changed = _bind_search_policy(case, tools, options, retry, search_policy)
+    tiers = CandidateTiers(case, pool)
+    fragment_cache = FragmentCache()
     if policy_changed:
         for saved in case.get_jobs('fragmented'):
             prior = saved['detail']
@@ -647,9 +642,16 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
             old = case.job('fragmented', key)
             if old is not None:
                 job_task.advance()
-            job_policy_changed = (old is not None and not old['detail'].get('historical_validation') and
-                                  old['detail'].get('search_policy') != search_policy)
-            if old is not None and not (policy_changed or job_policy_changed or retry and
+            prior = old['detail'] if old is not None else {}
+            historical = prior.get('historical_validation')
+            job_policy_changed = old is not None and not historical and prior.get('search_policy') != search_policy
+            # Legacy per-publication receipts had a successful DB status, but
+            # only the final receipt recorded the overall status and counters.
+            pending_publication = old is not None and (old['status'] == 'in_progress' or (
+                old['status'] in {'decoded_prefix', 'decoded_segment', 'reconstructed_prefix', 'reconstructed_segment'}
+                and prior.get('outputs') and not historical and not job_policy_changed
+                and 'status' not in prior and 'candidate_starts_considered' not in prior))
+            if old is not None and not (policy_changed or job_policy_changed or pending_publication or retry and
                     _fragment_retry_pending(old, reconstruct_only)):
                 pool.check(sid)
                 continue
@@ -686,14 +688,19 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                                        'uniqueness_scope': 'searched_tiers_only'}}
             # Existing validated clips are immutable. Retry searches uncovered
             # starts without replacing a previously published bounded section.
-            if old is not None and old['detail'].get('outputs'):
+            if prior.get('outputs'):
                 for name in ('outputs', 'output_evidence', 'segments', 'gaps'):
-                    detail[name] = list(old['detail'].get(name, []))
+                    detail[name] = list(prior.get(name, []))
                 for name in ('historical_allocation_scope', 'current_allocation_scope', 'historical_outputs'):
-                    if name in old['detail']:
-                        detail[name] = old['detail'][name]
-            read_bytes = 0
-            parse_stats_before = dict(fragment_cache.stats)
+                    if name in prior:
+                        detail[name] = prior[name]
+            resume_segment = None
+            if pending_publication and not (policy_changed or job_policy_changed):
+                resume_segment = next((segment for segment in reversed(detail['segments']) if segment.get('output')), None)
+            read_bytes = prior.get('media_read_bytes_charged', 0) if resume_segment else 0
+            prior_parse = prior.get('parse_counters', {}) if resume_segment else {}
+            parse_stats_before = {name: value-prior_parse.get(name, 0)
+                                  for name, value in fragment_cache.stats.items()}
 
             def read_section(at: int, size: int) -> bytes:
                 nonlocal read_bytes
@@ -704,11 +711,18 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                 section_task.heartbeat(read_bytes=read_bytes, starts_considered=considered)
                 return raw
 
-            considered = 0
+            considered = prior.get('candidate_starts_considered', 0) if resume_segment else 0
+            resume_tier = resume_segment.get('candidate_tier', 1) if resume_segment else 1
+            # Early receipts omitted charges for rejected starts, so their
+            # remaining finite budget cannot be recovered from saved segments.
+            legacy_budget_unknown = (resume_segment is not None and not retry and max_segments is not None
+                                     and 'candidate_starts_considered' not in prior)
             with phase('Fragmented section starts considered', unit='candidates') as section_task:
                 for tier in (1, 2):
+                    if tier < resume_tier:
+                        continue
                     if tier == 2:
-                        if not include_recovered or detail['outputs'] or detail.get('limit_reason'):
+                        if resume_tier != 2 and (not include_recovered or detail['outputs'] or detail.get('limit_reason')):
                             break
                         detail['search_tiers']['searched'].append(2)
                         detail['search_tiers']['second_tier_unsearched'] = False
@@ -721,7 +735,13 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                     intervals = iter(media_pool.available_ranges(sid, init_end, end))
                     interval = next(intervals, None)
                     consumed = init_end
+                    start_after = None
+                    if resume_segment and tier == resume_tier:
+                        start_after = resume_segment['logical_start']
+                        consumed = resume_segment['logical_end']
                     for start in _candidate_starts(case, sid, init_end, end):
+                        if start_after is not None and start <= start_after:
+                            continue
                         # A view must not pin the previous full read window
                         # while a later candidate allocates its own window.
                         retained = None
@@ -739,6 +759,9 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                         if start < interval[0]:
                             detail['gaps'].append({'start': start, 'end': interval[0], 'reason': 'unavailable_source_bytes'})
                             continue
+                        if legacy_budget_unknown:
+                            detail['limit_reason'] = 'legacy_segment_attempt_count_unavailable'
+                            break
                         if max_segments is not None and considered >= max_segments:
                             detail['limit_reason'] = 'segment_attempt_budget'
                             break
@@ -849,22 +872,16 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                             continue
                         output = case.root / 'reconstructed' / f'fragment-{sid}-{offset}-{start}.mp4'
                         digest = hashlib.sha256(retained).hexdigest()
-                        if output.exists() or output.is_symlink():
-                            if output.is_symlink() or not output.is_file() or file_sha256(output) != digest:
-                                raise SafetyError(f'Conflicting existing fragmented output: {output}')
-                        else:
-                            with phase('Publish fragmented section', total=len(retained), unit='bytes') as publish_task, output.open('xb') as stream:
-                                stream.write(retained)
-                                publish_task.update(len(retained))
-                                stream.flush()
-                                os.fsync(stream.fileno())
+                        relative = str(output.relative_to(case.root))
+                        existing = output.exists() or output.is_symlink()
+                        if existing:
+                            ensure_generated_file(case, relative, digest, expected_size=len(retained))
                         manifest = _fragment_manifest(pool, sid, offset, start, retained, prefix)
                         manifest['decode_checked'] = not reconstruct_only
                         manifest['validation_scope'] = 'structural_reconstruction_only' if reconstruct_only else 'strict_decode'
                         manifest['source_sha256'] = source.get('sha256')
                         sidecar = _fragment_manifest_path(output)
                         write_json(sidecar, manifest)
-                        relative = str(output.relative_to(case.root))
                         segment.update(status=('reconstructed_segment' if later else 'reconstructed_prefix') if reconstruct_only else
                                               ('decoded_segment' if later else 'decoded_prefix'),
                                        reason='structural_reconstruction_only' if reconstruct_only else 'packet_hashes_timing_and_decode_passed',
@@ -885,13 +902,25 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                                                                'manifest_sha256': file_sha256(sidecar)})
                         detail['segments'].append(segment)
                         consumed = max(consumed, segment['logical_end'])
-                        # Commit publication evidence before it can demote candidate references.
+                        # Commit exact-byte proof before installation, so an
+                        # interrupted publication can be restored without validation.
                         detail['search_policy'] = search_policy
+                        detail['candidate_starts_considered'] = considered
+                        detail['media_read_bytes_charged'] = read_bytes
+                        detail['parse_counters'] = {name: value-parse_stats_before[name]
+                                                    for name, value in fragment_cache.stats.items()}
+                        candidate_path = str(candidate.relative_to(case.root))
+                        detail['pending_install'] = {'output': relative, 'candidate': candidate_path}
                         publication = attempt / f'publication-{start}.json'
                         detail['detail_path'] = str(publication.relative_to(case.root))
                         write_json(publication, detail)
                         detail['evidence_sha256'] = file_sha256(publication)
-                        case.result(key, segment['status'], detail, kind='fragmented')
+                        case.result(key, 'in_progress', detail, kind='fragmented')
+                        if not existing:
+                            with phase('Publish fragmented section', total=len(retained), unit='bytes') as publish_task:
+                                ensure_generated_file(case, relative, digest, expected_size=len(retained),
+                                                      peers=(candidate_path,))
+                                publish_task.update(len(retained))
                         tiers.refresh(('fragmented', key))
                 if detail.get('limit_reason'):
                     section_task.outcome('limited', detail=detail['limit_reason'])
@@ -902,6 +931,7 @@ def recover_fragmented(case, pool, tools: dict, options, limit=None, retry: bool
                                         for name, value in fragment_cache.stats.items()}
             detail['section_window_bytes'] = max_bytes
             detail['search_policy'] = search_policy
+            detail.pop('pending_install', None)
             if detail.get('limit_reason'):
                 status = 'search_limited'
             elif detail['outputs']:
