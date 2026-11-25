@@ -12,9 +12,11 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from helpers import generate, movie_from, sha
+from videorebuild import ordinary_salvage
 from videorebuild import validate as validation
 from videorebuild.bmff import iter_sample_nals, valid_sample
 from videorebuild.cli import main
+from videorebuild.storage import Case
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),
@@ -44,11 +46,11 @@ class OrdinarySalvageTests(unittest.TestCase):
             raise AssertionError(result.stderr.decode(errors='replace'))
         return json.loads(result.stdout)
 
-    def cli(self, *args):
+    def cli(self, *args, expected_status=0):
         output, error = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
             status = main(['--no-progress', *map(str, args)])
-        self.assertEqual(status, 0, error.getvalue() + output.getvalue())
+        self.assertEqual(status, expected_status, error.getvalue() + output.getvalue())
 
     def fixture(self, *, damage=None):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -206,6 +208,76 @@ class OrdinarySalvageTests(unittest.TestCase):
         self.assertEqual({path.name: (sha(path), path.stat().st_mtime_ns)
                           for path in (case / 'salvaged').iterdir()}, saved)
         self.assertEqual({path: sha(path) for path in before}, before)
+
+    def test_interrupted_publication_resumes_validated_segment_without_decoding_again(self):
+        install = ordinary_salvage.ensure_generated_file
+        for suffix in ('.mp4', '.json'):
+            with self.subTest(interrupt_before=suffix):
+                case, _, _, before = self.fixture(damage='map_and_framing')
+
+                def interrupt(case, path, *args, **kwargs):
+                    if Path(path).suffix == suffix:
+                        raise KeyboardInterrupt
+                    return install(case, path, *args, **kwargs)
+
+                with patch.object(ordinary_salvage, 'ensure_generated_file', side_effect=interrupt):
+                    self.cli('salvage', '--case', case, '--timeout', 30, expected_status=130)
+
+                with Case(case) as reopened:
+                    job, = list(reopened.get_jobs(ordinary_salvage.KIND))
+                    self.assertEqual(job['status'], 'salvage_in_progress')
+                    self.assertEqual(job['detail']['outputs'], [])
+                    pending = job['detail']['pending_segment']
+                    entry = pending['entry']
+                    staging = case / pending['stage']
+                    self.assertTrue((staging / 'clip.mp4').is_file())
+                    self.assertTrue((staging / 'clip.json').is_file())
+                media = case / entry['path']
+                self.assertEqual(media.exists(), suffix == '.json')
+                published = media.stat() if media.exists() else None
+                self.assertFalse((case / entry['manifest']).exists())
+
+                with patch.object(ordinary_salvage, 'validate', wraps=ordinary_salvage.validate) as validate:
+                    self.cli('salvage', '--case', case, '--timeout', 30)
+                self.assertEqual(validate.call_count, 2)
+                self.assertEqual(sha(media), entry['sha256'])
+                if published is not None:
+                    self.assertEqual((media.stat().st_ino, media.stat().st_mtime_ns),
+                                     (published.st_ino, published.st_mtime_ns))
+                self.assertEqual(sha(case / entry['manifest']), entry['manifest_sha256'])
+                self.assertEqual(len(list((case / 'salvaged').glob('ordinary-*.mp4'))), 3)
+                self.assertEqual(len(list((case / 'salvaged').glob('ordinary-*.json'))), 3)
+                self.assertFalse(staging.exists())
+                self.assertEqual({path: sha(path) for path in before}, before)
+
+    def test_published_segment_is_reported_if_next_validation_interrupts(self):
+        real_validate = ordinary_salvage.validate
+        for replay in (False, True):
+            with self.subTest(replay=replay):
+                case, _, _, _ = self.fixture(damage='map_and_framing')
+                if replay:
+                    with patch.object(ordinary_salvage, 'ensure_generated_file', side_effect=KeyboardInterrupt):
+                        self.cli('salvage', '--case', case, '--timeout', 30, expected_status=130)
+                validations = 0
+
+                def interrupt_later(*args, **kwargs):
+                    nonlocal validations
+                    validations += 1
+                    if replay or validations == 2:
+                        raise KeyboardInterrupt
+                    return real_validate(*args, **kwargs)
+
+                with patch.object(ordinary_salvage, 'validate', side_effect=interrupt_later):
+                    self.cli('salvage', '--case', case, '--timeout', 30, expected_status=130)
+                self.assertEqual(validations, 1 if replay else 2)
+                report = json.loads((case / 'reports' / 'results.json').read_text())
+                job, = [job for job in report['jobs'] if job['kind'] == ordinary_salvage.KIND]
+                self.assertEqual(job['status'], 'salvage_in_progress')
+                entry, = job['detail']['segments']
+                self.assertEqual(job['detail']['outputs'], [entry['path']])
+                self.assertNotIn('pending_segment', job['detail'])
+                self.assertEqual(sha(case / entry['path']), entry['sha256'])
+                self.assertEqual(sha(case / entry['manifest']), entry['manifest_sha256'])
 
     def test_pristine_mapped_video_can_retry_interrupted_validation_without_exporting(self):
         case, _, _, before = self.fixture()

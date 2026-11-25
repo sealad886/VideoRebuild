@@ -384,6 +384,58 @@ def _translation_key(movie, sid, translation, pool):
     return hashlib.sha256(json_text(descriptor).encode()).hexdigest(), descriptor
 
 
+def _attempt_stage(case, digest, result):
+    context = [result[key] for key in ('validation_revision', 'reconstruct_only', 'tools', 'timeout', 'stage')]
+    suffix = hashlib.sha256(json_text(context).encode()).hexdigest()[:24]
+    return safe_case_path(case, f"work/{digest}-{result['mapping_digest']}-{suffix}.mp4")
+
+
+def _install_attempt_candidate(case, digest, result, temp, manifest_hash, *, verify_staged=True):
+    """Finish a committed attempt using its exact staged bytes and sidecar."""
+    staged = safe_case_path(case, temp.with_suffix('.json').relative_to(case.root))
+    if not staged.exists():
+        return False
+    if verify_staged:
+        ensure_generated_file(case, staged.relative_to(case.root), manifest_hash)
+    target = safe_case_path(case, result['path'])
+    sidecar = safe_case_path(case, target.with_suffix('.json').relative_to(case.root))
+    if target.exists():
+        ensure_generated_file(case, result['path'], result['sha256'])
+    else:
+        if verify_staged:
+            ensure_generated_file(case, temp.relative_to(case.root), result['sha256'])
+        for row in case.db.execute("SELECT detail FROM attempts WHERE movie_digest=? AND status='valid'", (digest,)):
+            prior = json.loads(row['detail'])
+            if prior.get('sha256') != result['sha256'] or prior['path'] == result['path']:
+                continue
+            duplicate = safe_case_path(case, prior['path'])
+            if duplicate.is_file() and file_sha256(duplicate) == result['sha256']:
+                try:
+                    os.link(duplicate, target)
+                except OSError as error:
+                    if not _link_unavailable(error):
+                        raise
+                else:
+                    break
+        if not target.exists():
+            try:
+                os.replace(temp, target)
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                ensure_generated_file(case, result['path'], result['sha256'],
+                                      peers=(temp.relative_to(case.root),))
+    temp.unlink(missing_ok=True)
+    try:
+        os.replace(staged, sidecar)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        write_json(sidecar, json.loads(staged.read_text()))
+        staged.unlink()
+    return True
+
+
 def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools: dict,
             opt: Options, stage: str) -> dict:
     if not _tier_eligible(movie, mapping, pool):
@@ -477,6 +529,10 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
             except FormatError as error:
                 return {'status': 'rejected', 'mapping_digest': md, 'stage': stage, 'reason': str(error)}
         if same_tools and old.get('status') == 'valid':
+            manifest_hash = old.pop('staged_manifest_sha256', None)
+            if manifest_hash and _install_attempt_candidate(
+                    case, movie.digest, old, _attempt_stage(case, movie.digest, old), manifest_hash):
+                return old
             _restore_ordinary_candidate(case, pool, movie.digest, old, movie=movie, mapping=mapping)
             return old
         if same_tools and old.get('status') == 'rejected':
@@ -484,14 +540,9 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
     result = {'status': 'rejected', 'mapping_digest': md, 'stage': stage,
               'tools': tools, 'timeout': opt.timeout, 'validation_revision': VALIDATION_REVISION,
               'reconstruct_only': opt.reconstruct_only}
-    temp = case.root / 'work' / f'{movie.digest}-{md}.mp4'
-    target = case.root / 'candidates' / f'{movie.digest[:24]}-{md[:24]}.mp4'
-    if temp.exists() or temp.is_symlink():
-        if temp.is_symlink():
-            raise SafetyError('Work artifact is a symlink')
-        # This exact deterministic file is our interrupted temporary output.
-        temp.unlink()
+    temp = staged = None
     cacheable = True
+    keep_staged = False
     try:
         quick_ok = (prechecked_quick if prechecked_quick is not None else
                     check_samples(movie, mapping, pool, quick=True, unavailable_raises=True))
@@ -503,6 +554,13 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
         if quick_ok and not check_samples(movie, mapping, pool):
             result.update(reason='some_NAL_samples_do_not_match', content_evaluated=True)
         elif quick_ok:
+            temp = _attempt_stage(case, movie.digest, result)
+            staged = safe_case_path(case, temp.with_suffix('.json').relative_to(case.root))
+            target = safe_case_path(case, f'candidates/{movie.digest[:24]}-{md[:24]}.mp4')
+            # Older runs used an uncommitted work file without a context suffix.
+            safe_case_path(case, f'work/{movie.digest}-{md}.mp4').unlink(missing_ok=True)
+            temp.unlink(missing_ok=True)
+            staged.unlink(missing_ok=True)
             proof = reconstruct(movie, mapping, pool, temp, opt.max_output_bytes)
             checked = ({'ok': True, 'reason': 'structural_reconstruction_only',
                         'decode_checked': False, 'scope': 'structural_reconstruction_only'}
@@ -511,34 +569,18 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
             result['content_evaluated'] = True
             result['reason'] = checked['reason']
             if checked['ok']:
-                if target.exists():
-                    if target.is_symlink() or file_sha256(target) != proof['sha256']:
-                        raise SafetyError(f'Existing candidate does not match: {target}')
-                    temp.unlink()
-                else:
-                    duplicate = None
-                    for row in case.db.execute("SELECT detail FROM attempts WHERE movie_digest=? AND status='valid'", (movie.digest,)):
-                        prior = json.loads(row['detail'])
-                        if prior.get('sha256') == proof['sha256']:
-                            p = case.root / prior['path']
-                            if p.is_file() and not p.is_symlink() and file_sha256(p) == proof['sha256']:
-                                duplicate = p
-                                break
-                    if duplicate:
-                        try:
-                            os.link(duplicate, target)
-                            temp.unlink()
-                        except OSError as e:
-                            if not _link_unavailable(e):
-                                raise
-                            LOG.warning('Hard links unavailable; keeping an independent duplicate candidate: %s', target)
-                            os.replace(temp, target)
-                    else:
-                        os.replace(temp, target)
+                if target.exists() and (not target.is_file() or file_sha256(target) != proof['sha256']):
+                    raise SafetyError(f'Existing candidate does not match: {target}')
                 result.update(status='valid', path=str(target.relative_to(case.root)),
                               sha256=proof['sha256'], media_sha256=proof['media_sha256'])
-                write_json(target.with_suffix('.json'), {'version': __version__, 'stage': stage,
-                            'movie': movie.summary(), 'provenance': proof, 'ordered_fragments': proof['ordered_fragments'], 'search_tiers': _search_scope(case), 'validation': checked})
+                write_json(staged, {'version': __version__, 'stage': stage, 'movie': movie.summary(),
+                                    'provenance': proof, 'ordered_fragments': proof['ordered_fragments'],
+                                    'search_tiers': _search_scope(case), 'validation': checked})
+                manifest_hash = file_sha256(staged)
+                keep_staged = True
+                _record_attempt(case, movie, md, stage, dict(result, staged_manifest_sha256=manifest_hash))
+                _install_attempt_candidate(case, movie.digest, result, temp, manifest_hash, verify_staged=False)
+                return result
             elif checked.get('probe', {}).get('timeout') or checked.get('decode', {}).get('timeout'):
                 result['status'] = 'limited'
     except FormatError as e:
@@ -547,8 +589,11 @@ def attempt(case: Case, movie: Movie, mapping: Mapping, pool: ReaderPool, tools:
         result['reason'] = str(e)
         cacheable = False
     finally:
-        if temp.exists():
-            temp.unlink()
+        if not keep_staged:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+            if staged is not None:
+                staged.unlink(missing_ok=True)
     if not cacheable:
         return result
     _record_attempt(case, movie, md, stage, result)
@@ -836,7 +881,6 @@ def _publish(case: Case, movie: Movie, successes: list[dict], status: str) -> li
             LOG.warning('Hard links unavailable; publishing the accepted candidate without copying: %s', candidate)
             return [successes[0]['path']]
         storage_mode = 'case_internal_hardlink'
-    evidence = _backfill_candidate_manifest(case, successes[0])
     write_json(sidecar, {'status': status, 'candidate': successes[0]['path'], 'storage_mode': storage_mode,
                          'sha256': successes[0]['sha256'], 'provenance': evidence.get('provenance', {}),
                          'ordered_fragments': evidence.get('ordered_fragments', evidence.get('provenance', {}).get('ordered_fragments', [])),
@@ -865,27 +909,13 @@ def finish(case: Case, movie: Movie, candidates: list[dict], limited: bool,
         status = 'reconstructed' if good[0].get('reconstruct_only') else 'matched'
     else:
         status = 'unresolved'
-    previous = case.job('ordinary', movie.digest)
-    history = list(previous['detail'].get('historical_publications', [])) if previous else []
-    if previous and previous['detail'].get('outputs') and len(previous['detail'].get('candidates', [])) == 1:
-        candidate = previous['detail']['candidates'][0]
-        for path in previous['detail']['outputs']:
-            entry = {'path': path, 'sha256': candidate['sha256'], 'candidate': candidate['path']}
-            if entry not in history:
-                history.append(entry)
     outputs = _publish(case, movie, good, status)
     detail = {'run_key': run_key, 'stage': stage, 'candidates': good, 'search_limited': limited,
               'outputs': outputs,
               'decode_checked': bool(good) and all(not c.get('reconstruct_only', False) for c in good),
               'scope': 'Uniqueness applies only to the documented, completed hypotheses searched.'}
-    retained = [entry for entry in history if entry['path'] not in outputs]
-    if retained:
-        detail['historical_publications'] = retained
-        detail['historical_outputs'] = [entry['path'] for entry in retained]
     if extra:
         detail.update(extra)
-    if _search_scope(case) is not None:
-        detail['search_tiers'] = dict(_search_scope(case))
     _scoped_result(case, movie.digest, status, detail)
     _refresh_tiers(case, owner=('ordinary', movie.digest))
     LOG.info('%s %s: %d byte-distinct candidates (%s)', movie.digest[:12], status, len(good),

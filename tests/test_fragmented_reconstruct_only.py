@@ -101,6 +101,100 @@ class FragmentedReconstructOnlyTests(unittest.TestCase):
                     validate.assert_not_called()
                     self.assertFalse(next(case.get_jobs('fragmented'))['detail']['outputs'])
 
+    def test_default_resume_finishes_a_partially_published_initialization(self):
+        from videorebuild import image_recovery
+
+        pair = self.movie[len(self.initialization):]
+        later = len(self.movie)+3
+        for interrupted_at in ('installation', 'next_validation', 'legacy_checkpoint', 'legacy_finite', 'tier_two'):
+            with self.subTest(interrupted_at=interrupted_at):
+                case_root = self.root / interrupted_at
+                options = self.options(False)
+                options.include_recovered = interrupted_at == 'tier_two'
+                options.max_segments = 4 if options.include_recovered else 2
+                legacy_checkpoint = interrupted_at in {'legacy_checkpoint', 'legacy_finite'}
+                if interrupted_at == 'legacy_checkpoint':
+                    options.max_segments = None
+                elif interrupted_at == 'legacy_finite':
+                    options.max_segments = 1
+                with Case(case_root) as case:
+                    sid = self.index(case, self.movie+b'gap'+pair)
+                    real_install = image_recovery.ensure_generated_file
+                    real_result = case.result
+                    validations = 0
+
+                    def validate(*args):
+                        nonlocal validations
+                        validations += 1
+                        if options.include_recovered and validations <= 2:
+                            return {'ok': False, 'reason': 'mocked_first_tier_failure'}
+                        if interrupted_at not in {'installation', 'legacy_finite'} and validations == (options.max_segments or 2):
+                            raise KeyboardInterrupt
+                        return {'ok': True, 'reason': 'mocked_strict_gate'}
+
+                    def install(*args, **kwargs):
+                        if interrupted_at == 'installation' and kwargs.get('peers'):
+                            raise KeyboardInterrupt
+                        installed = real_install(*args, **kwargs)
+                        if interrupted_at == 'legacy_finite' and kwargs.get('peers'):
+                            raise KeyboardInterrupt
+                        return installed
+
+                    def commit(key, status, detail, **kwargs):
+                        if legacy_checkpoint and status == 'in_progress':
+                            detail = {name: value for name, value in detail.items()
+                                      if name not in {'candidate_starts_considered', 'media_read_bytes_charged',
+                                                      'parse_counters', 'pending_install'}}
+                            evidence = case.root/detail['detail_path']
+                            image_recovery.write_json(evidence, detail)
+                            detail['evidence_sha256'] = file_sha256(evidence)
+                            status = 'decoded_prefix'
+                        return real_result(key, status, detail, **kwargs)
+
+                    with ReaderPool(case.sources()) as pool, \
+                            patch.object(image_recovery, 'validate_prefix', side_effect=validate), \
+                            patch.object(image_recovery, 'ensure_generated_file', side_effect=install), \
+                            patch.object(case, 'result', side_effect=commit):
+                        with self.assertRaises(KeyboardInterrupt):
+                            recover_fragmented(case, pool, {}, options)
+                    checkpoint = case.job('fragmented', f'{sid}:0')
+                    first = case_root/checkpoint['detail']['outputs'][0]
+                    self.assertEqual(first.exists(), interrupted_at != 'installation')
+                    first_stat = first.stat() if first.exists() else None
+
+                with Case(case_root) as case, ReaderPool(case.sources()) as pool, \
+                        patch.object(pool, 'read', wraps=pool.read) as reads, \
+                        patch.object(image_recovery, 'validate_prefix',
+                                     return_value={'ok': True, 'reason': 'mocked_strict_gate'}) as validate:
+                    self.assertEqual(recover_fragmented(case, pool, {}, options), 1)
+                    self.assertEqual(recover_fragmented(case, pool, {}, options), 0)
+                    if interrupted_at == 'legacy_finite':
+                        validate.assert_not_called()
+                        limited = case.job('fragmented', f'{sid}:0')
+                        self.assertEqual(limited['status'], 'search_limited')
+                        self.assertEqual(limited['detail']['reason'], 'legacy_segment_attempt_count_unavailable')
+                        self.assertEqual(limited['detail']['outputs'], checkpoint['detail']['outputs'])
+                        self.assertEqual(recover_fragmented(case, pool, {}, options, retry=True), 1)
+                    validate.assert_called_once()
+                    for call in reads.call_args_list:
+                        _, offset, size = call.args
+                        self.assertTrue(offset+size <= len(self.initialization) or offset >= later,
+                                        f'Resumed first-section media read at {offset}')
+                    result = case.job('fragmented', f'{sid}:0')
+                    self.assertEqual(result['status'], 'decoded_segments')
+                    if not legacy_checkpoint:
+                        self.assertEqual(result['detail']['candidate_starts_considered'], options.max_segments)
+                    self.assertEqual(result['detail']['search_tiers']['searched'],
+                                     [1, 2] if options.include_recovered else [1])
+                    self.assertCountEqual(result['detail']['outputs'], [
+                        str(first.relative_to(case_root)), f'reconstructed/fragment-{sid}-0-{later}.mp4'])
+                    self.assertEqual(len(list((case_root/'reconstructed').glob('*.mp4'))), 2)
+                    self.assertTrue(all((case_root/name).read_bytes() == self.movie
+                                        for name in result['detail']['outputs']))
+                    if first_stat:
+                        self.assertEqual((first.stat().st_ino, first.stat().st_mtime_ns),
+                                         (first_stat.st_ino, first_stat.st_mtime_ns))
+
     def test_default_strict_mode_still_requires_quality_gate(self):
         with Case(self.root/'case') as case:
             self.index(case)

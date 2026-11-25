@@ -19,6 +19,7 @@ KIND = 'ordinary_salvage'
 SEARCH_REVISION = 1
 MAX_CLIP_BYTES = 256 * 1024**2
 MAX_SAMPLE_BYTES = 16 * 1024**2
+STAGE_PREFIX = 'ordinary-salvage-'
 
 
 def _locate(case, pool, sid):
@@ -128,13 +129,51 @@ def _runs(gops, metadata_bytes):
         yield run
 
 
+def _publish_segment(case, entry, staging=None):
+    if staging is not None:
+        relative = Path(staging)
+        if (len(relative.parts) != 2 or relative.parts[0] != 'work'
+                or not relative.name.startswith(STAGE_PREFIX)):
+            raise SafetyError('Invalid ordinary salvage staging path')
+    stage_files = []
+    for name, destination, digest, size in (
+            ('clip.mp4', entry['path'], entry['sha256'], entry['bytes']),
+            ('clip.json', entry['manifest'], entry['manifest_sha256'], None)):
+        peers = (relative / name,) if staging is not None else ()
+        published = ensure_generated_file(case, destination, digest, peers=peers, expected_size=size)
+        if peers:
+            stage_file = safe_case_path(case, peers[0])
+            if stage_file.exists():
+                if not stage_file.samefile(published):
+                    ensure_generated_file(case, peers[0], digest, expected_size=size)
+                stage_files.append(stage_file)
+    if staging is not None:
+        for path in stage_files:
+            path.unlink()
+        try:
+            safe_case_path(case, relative).rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def _complete_publication(case, sid, detail, pending):
+    entry = pending['entry']
+    _publish_segment(case, entry, pending['stage'])
+    detail['segments'].append(entry)
+    detail['outputs'].append(entry['path'])
+    case.result(str(sid), 'salvage_in_progress', detail, kind=KIND)
+
+
 def _saved_result(case, sid):
     prior = case.job(KIND, str(sid))
     if prior is None:
         return None
-    for entry in prior['detail'].get('segments', []):
-        ensure_generated_file(case, entry['path'], entry['sha256'], expected_size=entry['bytes'])
-        ensure_generated_file(case, entry['manifest'], entry['manifest_sha256'])
+    detail = prior['detail']
+    for entry in detail.get('segments', []):
+        _publish_segment(case, entry)
+    pending = detail.pop('pending_segment', None)
+    if pending is not None:
+        _complete_publication(case, sid, detail, pending)
     return prior
 
 
@@ -151,17 +190,19 @@ def _deterministic_rejection(result):
 def _export(case, pool, sid, clip, metadata_extent, first, stop, movie, tools, timeout, *, full):
     mapping = {(chunk.track, chunk.index): (sid, chunk.offset) for chunk in movie.chunks}
     work = safe_case_path(case, 'work')
-    with tempfile.TemporaryDirectory(prefix='ordinary-salvage-', dir=work) as temp:
-        stage = Path(temp) / 'clip.mp4'
+    temp = Path(tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=work))
+    stage = temp / 'clip.mp4'
+    manifest_stage = temp / 'clip.json'
+    staged = False
+    try:
         proof = reconstruct(movie, mapping, pool, stage, MAX_CLIP_BYTES)
         result = validate(stage, movie, tools, timeout)
         if not result['ok'] or full:
-            return None, result
+            return None, result, None
 
         stem = f'ordinary-{sid}-{clip.source_digest}-{first}-{stop}'
         target = f'salvaged/{stem}.mp4'
         manifest = f'salvaged/{stem}.json'
-        manifest_stage = Path(temp) / 'clip.json'
         write_json(manifest_stage, {
             **proof, 'schema': 1, 'kind': KIND, 'clip': target,
             'source_moov_sha256': clip.source_digest, 'source_moov_extent': metadata_extent,
@@ -176,11 +217,15 @@ def _export(case, pool, sid, clip, metadata_extent, first, stop, movie, tools, t
         })
         manifest_sha256 = file_sha256(manifest_stage)
         pool.check(sid)
-        ensure_generated_file(case, target, proof['sha256'], expected_size=proof['bytes'],
-                              peers=(stage.relative_to(case.root),))
-        ensure_generated_file(case, manifest, manifest_sha256, peers=(manifest_stage.relative_to(case.root),))
-        return {'path': target, 'sha256': proof['sha256'], 'bytes': proof['bytes'], 'manifest': manifest,
-                'manifest_sha256': manifest_sha256, 'sample_start': first, 'sample_stop': stop}, result
+        staged = True
+        entry = {'path': target, 'sha256': proof['sha256'], 'bytes': proof['bytes'], 'manifest': manifest,
+                 'manifest_sha256': manifest_sha256, 'sample_start': first, 'sample_stop': stop}
+        return entry, result, str(temp.relative_to(case.root))
+    finally:
+        if not staged:
+            stage.unlink(missing_ok=True)
+            manifest_stage.unlink(missing_ok=True)
+            temp.rmdir()
 
 
 def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
@@ -237,8 +282,8 @@ def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
             movie = clip.project(first, stop, sync_samples=(gop[0] for gop in run))
             if movie.media_size + len(movie.data) + 1024 > MAX_CLIP_BYTES:
                 raise FormatError('clip exceeds output limit')
-            entry, result = _export(case, pool, sid, clip, metadata_extent, first, stop, movie,
-                                    tools, timeout, full=full)
+            entry, result, staging = _export(case, pool, sid, clip, metadata_extent, first, stop, movie,
+                                             tools, timeout, full=full)
         except FormatError:
             entry, result = None, {'reason': 'clip_geometry_rejected'}
         reason = result['reason']
@@ -253,10 +298,11 @@ def _salvage(case, pool, sid, tools, timeout, max_attempts, retry):
         if full and reason == 'decode_checked':
             complete_video = True
         if entry is not None:
-            detail['segments'].append(entry)
-            detail['outputs'].append(entry['path'])
+            # Keep validated staging until the committed receipt can publish both files.
+            publication = {'entry': entry, 'stage': staging}
+            case.result(str(sid), 'salvage_in_progress', {**detail, 'pending_segment': publication}, kind=KIND)
+            _complete_publication(case, sid, detail, publication)
             saved.add((first, stop))
-            case.result(str(sid), 'salvage_in_progress', detail, kind=KIND)
         elif reason != 'decode_checked' and len(run) > 1 and not (timed_out or interrupted):
             middle = len(run) // 2
             pending.extend((run[middle:], run[:middle]))
